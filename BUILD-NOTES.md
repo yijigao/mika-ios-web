@@ -47,3 +47,7 @@ PASS: local form submit handler includes entered name and email without network
 - 未执行 match 签名、归档、TestFlight 上传、processingState=VALID、内部组挂载或 ASC 回读；现有发布配置保持原样。
 - 无 ChatGPT OAuth（规格明确不做）；无跨 App、后台或定时执行、多标签 Agent；未送审、未上架。
 - DOM 关键词安全检查不是交易语义识别器；复杂 iframe、Shadow DOM、验证码和站点反自动化机制可能需要人工操作。模型服务兼容性、网络可用性和 React 站点交互效果仍需实测。
+
+## 分发链增补（2026-11-01 晚，阿仁执行）
+
+上文「未做与不确定项」中的 CI/签名/TestFlight 项已于当晚完成：GitHub Actions CI Run 41322207705 success；match 签名（复用团队分发证书 B48Z8JJ458＋本 App 独立描述文件）；Release Run 41322679361 上传成功；构建 202611011544 processingState=VALID 并挂 Internal 内部组。全链证据见 TESTFLIGHT-LOG.md。仍未做：真机两站成功率验证、真实模型端到端自检（需真机装好并填 Key 后实测）。
