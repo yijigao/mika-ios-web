@@ -9,17 +9,18 @@ struct MikaWebApp: App {
     @StateObject private var panel: FloatingPanelStore
     @StateObject private var diagnostics: DiagnosticStore
     init() {
+        let debugConfig = DebugSwitches.launchConfig
         let web = WebController()
         let settings = SettingsStore()
         _web = StateObject(wrappedValue: web)
         _settings = StateObject(wrappedValue: settings)
         let engine = AgentEngine(web: web, settings: settings)
         let conversation = AgentConversationStore()
-        let panel = FloatingPanelStore()
+        let panel = FloatingPanelStore(initiallyExpanded: debugConfig.panelSink ? debugConfig.panelState : true, lockExpanded: !debugConfig.panelSink)
         let diagnostics = DiagnosticStore()
-        conversation.bind(to: engine)
-        panel.bind(to: engine)
-        diagnostics.start()
+        if debugConfig.convSink { conversation.bind(to: engine) }
+        if debugConfig.panelSink { panel.bind(to: engine) }
+        if debugConfig.diag { diagnostics.start() }
         _engine = StateObject(wrappedValue: engine)
         _conversation = StateObject(wrappedValue: conversation)
         _panel = StateObject(wrappedValue: panel)

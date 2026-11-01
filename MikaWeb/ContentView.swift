@@ -8,14 +8,23 @@ struct ContentView: View {
     @ObservedObject var diagnostics: DiagnosticStore
     @ObservedObject private var pending = PendingTaskStore.shared
     @FocusState private var inputFocused: Bool
+    private let debugConfig = DebugSwitches.launchConfig
     var body: some View {
         NavigationStack {
             GeometryReader { geometry in
                 BrowserView(controller: web)
-                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .frame(width: debugConfig.geo ? geometry.size.width : nil, height: debugConfig.geo ? geometry.size.height : nil)
                     .overlay(alignment: .bottom) {
                         if panel.expanded {
-                            AgentChatView(engine: engine, settings: settings, conversation: conversation, panel: panel, inputFocused: $inputFocused)
+                            Group {
+                                if !debugConfig.observe {
+                                    StaticChatView()
+                                } else if !debugConfig.chat {
+                                    DebugChatPlaceholder()
+                                } else {
+                                    AgentChatView(engine: engine, settings: settings, conversation: conversation, panel: panel, inputFocused: $inputFocused)
+                                }
+                            }
                                 .frame(width: geometry.size.width, height: min(geometry.size.height * 0.55, max(240, geometry.size.height - 12)))
                                 .background(.regularMaterial, in: UnevenRoundedRectangle(topLeadingRadius: 20, topTrailingRadius: 20))
                                 .shadow(radius: 12)
