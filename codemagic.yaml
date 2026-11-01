@@ -1,0 +1,26 @@
+workflows:
+  ios-simulator-build:
+    name: Mika Web · iOS Simulator
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+    scripts:
+      - name: Static project validation
+        script: python3 scripts/validate_project.py
+      - name: Build without signing
+        script: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project MikaWeb.xcodeproj \
+            -scheme MikaWeb \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/SimulatorBuild.xcresult \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/xcodebuild.log
+    artifacts:
+      - build/xcodebuild.log
+      - build/SimulatorBuild.xcresult
+      - build/DerivedData/Build/Products/Debug-iphonesimulator/*.app

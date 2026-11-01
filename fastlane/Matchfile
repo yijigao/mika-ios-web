@@ -1,0 +1,4 @@
+git_url("git@github.com:yijigao/mikaweb-certs.git")
+storage_mode("git")
+type("appstore")
+app_identifier(["com.jigaoyi.mikaweb"])

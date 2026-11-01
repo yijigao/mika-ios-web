@@ -1,0 +1,10 @@
+Mika Web
+Copyright 2026 Mika Web contributors
+
+本项目为非官方衍生实现：产品概念与交互设计参考 wangzan101/Mika（安卓端侧 AI 助理）：
+https://github.com/wangzan101/Mika
+上游采用 Apache License, Version 2.0。
+
+本项目未获上游背书，不是 Mika 官方发布；未复制上游安卓端代码，
+iOS 端的网页 Agent 子集为独立实现。Mika 名称仅用于说明来源与概念参考。
+本项目按 Apache License, Version 2.0 许可，全文见 LICENSE。

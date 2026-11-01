@@ -1,0 +1,5 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地表单</title>
+<style>body{font:20px system-ui;margin:24px}label,input,button{display:block;margin:16px 0;font:inherit}input{max-width:95%}</style>
+<h1>本地报名表</h1><form id="form"><label>姓名<input name="name" placeholder="姓名" required></label><label>邮箱<input name="email" type="email" placeholder="邮箱" required></label><button type="submit">提交</button></form><p id="result" role="status"></p>
+<script>document.getElementById('form').addEventListener('submit',function(e){e.preventDefault();document.getElementById('result').textContent='提交成功：姓名 '+this.elements.name.value+'，邮箱 '+this.elements.email.value;});</script></html>

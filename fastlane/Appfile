@@ -1,0 +1,2 @@
+app_identifier("com.jigaoyi.mikaweb")
+team_id(ENV.fetch("APNS_TEAM_ID", "6566672L5G"))
