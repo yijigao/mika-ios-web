@@ -5,16 +5,29 @@ struct MikaWebApp: App {
     @StateObject private var web: WebController
     @StateObject private var settings: SettingsStore
     @StateObject private var engine: AgentEngine
+    @StateObject private var conversation: AgentConversationStore
+    @StateObject private var panel: FloatingPanelStore
+    @StateObject private var diagnostics: DiagnosticStore
     init() {
         let web = WebController()
         let settings = SettingsStore()
         _web = StateObject(wrappedValue: web)
         _settings = StateObject(wrappedValue: settings)
-        _engine = StateObject(wrappedValue: AgentEngine(web: web, settings: settings))
+        let engine = AgentEngine(web: web, settings: settings)
+        let conversation = AgentConversationStore()
+        let panel = FloatingPanelStore()
+        let diagnostics = DiagnosticStore()
+        conversation.bind(to: engine)
+        panel.bind(to: engine)
+        diagnostics.start()
+        _engine = StateObject(wrappedValue: engine)
+        _conversation = StateObject(wrappedValue: conversation)
+        _panel = StateObject(wrappedValue: panel)
+        _diagnostics = StateObject(wrappedValue: diagnostics)
     }
     var body: some Scene {
         WindowGroup {
-            ContentView(web: web, settings: settings, engine: engine)
+            ContentView(web: web, settings: settings, engine: engine, conversation: conversation, panel: panel, diagnostics: diagnostics)
                 .onChange(of: scenePhase, initial: true) { _, phase in engine.setForeground(phase == .active) }
         }
     }

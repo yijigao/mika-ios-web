@@ -26,6 +26,15 @@ enum ModelProvider: String, CaseIterable, Identifiable {
         case .custom: return ""
         }
     }
+    var suggestedModels: [String] {
+        switch self {
+        case .deepseek: return ["deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro"]
+        case .openai: return ["gpt-4o-mini", "gpt-4o"]
+        case .openrouter: return ["openai/gpt-4o-mini"]
+        case .custom: return []
+        }
+    }
+    var exampleModel: String { suggestedModels.first ?? "你的网关支持的模型名" }
     var keyGuide: String {
         switch self {
         case .deepseek: return "获取 Key：打开 platform.deepseek.com，登录后进入「API Keys」创建。"
@@ -35,13 +44,35 @@ enum ModelProvider: String, CaseIterable, Identifiable {
         }
     }
 }
+struct ModelNameValidationIssue {
+    enum Kind { case empty, providerTitle }
+    let kind: Kind
+    let message: String
+}
 @MainActor final class SettingsStore: ObservableObject {
     @Published var baseURL = UserDefaults.standard.string(forKey: "baseURL") ?? "https://api.openai.com/v1" { didSet { UserDefaults.standard.set(baseURL, forKey: "baseURL") } }
     @Published var model = UserDefaults.standard.string(forKey: "model") ?? "gpt-4o-mini" { didSet { UserDefaults.standard.set(model, forKey: "model") } }
-    @Published var maxSteps = UserDefaults.standard.object(forKey: "maxSteps") as? Int ?? 25 { didSet { UserDefaults.standard.set(min(50, max(5, maxSteps)), forKey: "maxSteps") } }
+    @Published var maxSteps: Int { didSet {
+        let normalized = min(50, max(5, maxSteps))
+        if maxSteps != normalized { maxSteps = normalized; return }
+        UserDefaults.standard.set(normalized, forKey: "maxSteps")
+    } }
     @Published private(set) var provider: ModelProvider
     @Published private(set) var hasKey = !Keychain.read().isEmpty
+    static func validateModelName(_ rawValue: String, provider: ModelProvider) -> ModelNameValidationIssue? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let extra = provider == .custom ? " 请以你的网关支持的模型名为准。" : ""
+        if value.isEmpty { return ModelNameValidationIssue(kind: .empty, message: "请填写模型名。例如：\(provider.exampleModel)。\(extra)") }
+        if ModelProvider.allCases.contains(where: { $0.title.compare(value, options: .caseInsensitive) == .orderedSame }) {
+            return ModelNameValidationIssue(kind: .providerTitle, message: "这看起来是服务商的名字，不是模型名。请填写具体模型名，例如：\(provider.exampleModel)。\(extra)")
+        }
+        return nil
+    }
     init() {
+        let savedSteps = UserDefaults.standard.object(forKey: "maxSteps") as? Int ?? 25
+        let normalizedSteps = min(50, max(5, savedSteps))
+        maxSteps = normalizedSteps
+        if savedSteps != normalizedSteps { UserDefaults.standard.set(normalizedSteps, forKey: "maxSteps") }
         if let raw = UserDefaults.standard.string(forKey: "provider"), let saved = ModelProvider(rawValue: raw) {
             provider = saved
         } else {
@@ -69,6 +100,7 @@ enum ModelProvider: String, CaseIterable, Identifiable {
 }
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
+    var diagnostics: DiagnosticStore? = nil
     @State private var key = ""
     @State private var testing = false
     @State private var testSuccess = ""
@@ -105,6 +137,12 @@ struct SettingsView: View {
                     Text("模型名已按 \(settings.provider.title) 预填，一般不用改；接口地址由服务商决定，不可改。需要完全自定义时选「自定义」。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if settings.provider == .custom { Text("请以你的网关支持的模型名为准。").font(.caption).foregroundStyle(.secondary) }
+                else {
+                    ScrollView(.horizontal) { HStack { ForEach(settings.provider.suggestedModels, id: \.self) { name in Button(name) { settings.model = name } .buttonStyle(.bordered) } } }
+                    Text("快捷填写；是否可用以服务商或网关为准。").font(.caption).foregroundStyle(.secondary)
+                }
+                if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { Text(issue.message).font(.caption).foregroundStyle(.red) }
             } header: { Text("模型与接口地址") }
             Section {
                 SecureField("粘贴 API Key", text: $key).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -133,14 +171,17 @@ struct SettingsView: View {
                 }
             } header: { Text("第二步 · 填 Key 并测试") }
             Section {
-                Stepper("最大步数：\(settings.maxSteps)", value: $settings.maxSteps, in: 5...50)
+                HStack { Text("最大步数"); Spacer(); Text("\(settings.maxSteps)").monospacedDigit().fontWeight(.semibold); Stepper("最大步数", value: $settings.maxSteps, in: 5...50).labelsHidden() }
+                Text("达到上限后暂停，可继续任务。").font(.caption).foregroundStyle(.secondary)
                 Text("任务执行时，网页内容及你的任务会发送至所选模型服务。任务只在 App 前台内执行，切到后台会暂停。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("任务") }
+            if let diagnostics { Section { NavigationLink("崩溃报告") { CrashReportsView(store: diagnostics) } } }
         }.navigationTitle("设置")
     }
     private func saveAndTest() async {
         testSuccess = ""; testFailure = ""
+        if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { testFailure = issue.message; return }
         let pasted = key.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             if !pasted.isEmpty {

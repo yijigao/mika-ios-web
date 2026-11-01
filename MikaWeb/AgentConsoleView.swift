@@ -2,6 +2,7 @@ import SwiftUI
 struct AgentConsoleView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
+    private var isQuestionWaiting: Bool { if case .some(.question(_, _)) = engine.waitingInput { return true }; return false }
     private var confirming: Binding<Bool> {
         Binding(get: { if case .waitingConfirm = engine.status { return true }; return false }, set: { _ in })
     }
@@ -21,7 +22,8 @@ struct AgentConsoleView: View {
                 Button("开始") { engine.start() }.disabled(!engine.active)
                 Button("停止") { engine.stop() }.disabled(!engine.busy)
                 switch engine.status {
-                case .paused, .waitingManual, .failed: Button("继续") { engine.resume() }.disabled(!engine.active)
+                case .paused, .failed: Button("继续") { engine.resume() }.disabled(!engine.active || isQuestionWaiting)
+                case .waitingManual: Button("继续") { engine.resume() }.disabled(!engine.active || isQuestionWaiting)
                 default: EmptyView()
                 }
                 Spacer()
