@@ -51,3 +51,9 @@
 - 构建 **202611011747**（0.1.0）：CI Run 41333114322 success、Release Run 41333235827 success；ASC 回读 processingState=**VALID**、expired=false、出口合规已补答、已挂 Internal 组（组内回读 [202611011747, 202611011652, 202611011544]）。代码提交 `d6b873d`（Astra 规划 PLAN-V02-ASTRA.md、Sol 实现、阿仁验收发版）。
 - 内容：对话式主界面（聊天流＋过程条目＋助手结论）＋应用内悬浮面板（悬浮球/55% 面板、执行动作自动收起、位置记忆）；ask_user 对话内作答注入 prompt 续跑；waitingConfirm 对话内卡片；模型名防呆拦截＋常用模型 chips；MetricKit 崩溃诊断本地回收（最近 5 份，设置页可分享导出）；maxSteps 数字直显与初始化归一化。引擎循环语义与 SafetyPolicy 等七个安全相关文件零改动。详见 UX-LOG-2026-11-02.md。
 - Joey 在 TestFlight 更新到 202611011747 后按 UX-LOG 的真机验收重点复测即可。
+
+## 增补（2026-11-02）：v0.2.1 紧急修复（展开面板触摸网页必崩），新构建已上
+
+- 构建 **202611011811**（0.1.0）：CI Run 41335174142 success、Release Run 41335309286 success；ASC 回读 processingState=**VALID**、expired=false、出口合规已补答、已挂 Internal 组（组内回读 [202611011811, 202611011747, 202611011652, 202611011544]）。代码提交 `aa3a3bb`（Astra 定界 PLAN-V021-ASTRA.md、Sol 实现、编排方验收发版）。
+- 内容：悬浮层触摸架构重做——删除全屏 GeometryReader＋ZStack＋.position 覆盖层，面板/球改为 .overlay(alignment:) 受限挂载；删除聊天 ScrollView 的 simultaneousGesture 写状态、跟随滚动去动画；FloatingPanelStore 加同值保护。基线中「球体手势统一化」与「Store sink 全面异步化」两条经 Astra 定界推翻、按更保守裁决暂缓（理由见 FIX-LOG-V021-2026-11-02.md 分歧节）。根因机制未证实（无崩溃栈），结论分层级如实记录；SafetyPolicy 等安全文件与引擎语义零改动。
+- Joey 在 TestFlight 更新到 202611011811 后按 FIX-LOG-V021 的复测清单验证（重点：展开面板触摸/滚动网页不崩）。
