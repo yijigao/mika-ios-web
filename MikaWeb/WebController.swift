@@ -49,7 +49,8 @@ import WebKit
     func state() async throws -> PageState {
         try await ready()
         guard let json = try await evaluate(PageScript.extract) as? String else { throw MikaError("无法抽取页面状态") }
-        return try JSONDecoder().decode(PageState.self, from: Data(json.utf8))
+        do { return try JSONDecoder().decode(PageState.self, from: Data(json.utf8)) }
+        catch { throw MikaError("页面状态解析失败，请刷新页面后重试") }
     }
     func execute(_ action: AgentAction, expected: PageElement? = nil, approved: Bool = false) async throws {
         switch action.action {
@@ -77,7 +78,9 @@ import WebKit
             if(a.action==='click'){e.click();return true;}
             if(e.tagName==='INPUT'||e.tagName==='TEXTAREA'||e.tagName==='SELECT'){
               const p=e.tagName==='INPUT'?HTMLInputElement.prototype:e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLSelectElement.prototype;
-              Object.getOwnPropertyDescriptor(p,'value').set.call(e,a.text);
+              const desc=Object.getOwnPropertyDescriptor(p,'value');
+              if(!desc||typeof desc.set!=='function')throw new Error('该元素不支持自动填写');
+              desc.set.call(e,a.text);
             }else if(e.isContentEditable){e.textContent=a.text;}else{throw new Error('目标不是可填写元素');}
             e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return true;})()
             """)

@@ -11,6 +11,7 @@ struct PageState: Codable {
 enum PageScript {
     static let extract = #"""
     (() => {
+      if(!document.body){return JSON.stringify({url:location.href,title:document.title||'',text:'',elements:[]});}
       document.querySelectorAll('[data-mika-idx]').forEach(e=>e.removeAttribute('data-mika-idx'));
       const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
       const elements=[...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')].filter(visible).map((e,index)=>{

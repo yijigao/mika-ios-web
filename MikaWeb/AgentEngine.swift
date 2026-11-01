@@ -28,6 +28,7 @@ struct AgentStep: Identifiable {
     private var generation = UUID()
     private var goal = ""
     private var limit = 25
+    private var stepSeq = 0
     private var pending: (AgentAction, PageElement, String, Int)?
     init(web: WebController, settings: SettingsStore) { self.web = web; self.settings = settings }
     var busy: Bool {
@@ -36,10 +37,10 @@ struct AgentStep: Identifiable {
     func start(local: String? = nil, task: String? = nil) {
         stop()
         guard active else { status = .paused("任务只能在前台执行"); return }
-        guard settings.hasKey else { status = .failed("未配置 API Key，请打开设置页"); return }
+        guard settings.hasKey else { status = .failed("未配置 API Key：点控制台下方的橙色提示进入设置页，选服务商、粘贴 Key、测试连接后再开始"); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
-        goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []
+        goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0
         do { if let local { try web.loadLocal(local) } } catch { status = .failed(error.localizedDescription); return }
         launch()
     }
@@ -50,13 +51,13 @@ struct AgentStep: Identifiable {
     }
     func resume() {
         guard active, !goal.isEmpty else { return }
-        guard settings.hasKey else { status = .failed("未配置 API Key，请打开设置页"); return }
+        guard settings.hasKey else { status = .failed("未配置 API Key：请先在设置页配置并测试连接"); return }
         pending = nil; launch()
     }
     func confirm(execute: Bool) {
         guard active, let saved = pending else { return }
         pending = nil
-        if !execute { steps.append(AgentStep(id: steps.count + 1, action: "skip", reason: "用户跳过：\(saved.0.reason)")); launch(); return }
+        if !execute { appendStep("skip", "用户跳过：\(saved.0.reason)"); launch(); return }
         launch(confirmed: saved)
     }
     private func launch(confirmed: (AgentAction, PageElement, String, Int)? = nil) {
@@ -115,5 +116,9 @@ struct AgentStep: Identifiable {
         }
     }
     private func check(_ token: UUID) throws { try Task.checkCancellation(); guard active, token == generation else { throw CancellationError() } }
-    private func record(_ action: AgentAction, suffix: String = "") { steps.append(AgentStep(id: steps.count + 1, action: action.action, reason: action.reason + suffix)) }
+    private func appendStep(_ action: String, _ reason: String) {
+        stepSeq += 1
+        steps.append(AgentStep(id: stepSeq, action: action, reason: reason))
+    }
+    private func record(_ action: AgentAction, suffix: String = "") { appendStep(action.action, action.reason + suffix) }
 }
