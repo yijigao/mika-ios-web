@@ -57,3 +57,10 @@
 - 构建 **202611011811**（0.1.0）：CI Run 41335174142 success、Release Run 41335309286 success；ASC 回读 processingState=**VALID**、expired=false、出口合规已补答、已挂 Internal 组（组内回读 [202611011811, 202611011747, 202611011652, 202611011544]）。代码提交 `aa3a3bb`（Astra 定界 PLAN-V021-ASTRA.md、Sol 实现、编排方验收发版）。
 - 内容：悬浮层触摸架构重做——删除全屏 GeometryReader＋ZStack＋.position 覆盖层，面板/球改为 .overlay(alignment:) 受限挂载；删除聊天 ScrollView 的 simultaneousGesture 写状态、跟随滚动去动画；FloatingPanelStore 加同值保护。基线中「球体手势统一化」与「Store sink 全面异步化」两条经 Astra 定界推翻、按更保守裁决暂缓（理由见 FIX-LOG-V021-2026-11-02.md 分歧节）。根因机制未证实（无崩溃栈），结论分层级如实记录；SafetyPolicy 等安全文件与引擎语义零改动。
 - Joey 在 TestFlight 更新到 202611011811 后按 FIX-LOG-V021 的复测清单验证（重点：展开面板触摸/滚动网页不崩）。
+
+## 增补（2026-11-02）：v0.2.2 开关版（按栈定界后交付，非修复版）
+
+- 构建 **202611011920**（0.1.0）：CI Run 41341136126 success、Release Run 41341240021 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false、已挂 Internal 组（组内回读 [202611011920, 202611011811, 202611011747, 202611011652, 202611011544]）。代码提交 `03daf50`（Astra 定界 PLAN-V022-ASTRA.md、Sol 实现、编排方验收发版）。
+- 背景：Joey 发回 4 份 MetricKit 崩溃报告（证据 STACK-EVIDENCE-2026-11-02.md）——异常签名一致（NSInvalidArgumentException，-[__NSArrayM insertObject:atIndex:] 插入 nil），**1747 与 1811 已证同源**；异常由 UIKitCore 在触摸后的 SwiftUI UpdateCycle 内抛出，抛出路径无 App 业务帧。
+- Astra 定界（effort high）结论 **NOT_LOCKED**：能锁定故障层级、锁不住单一触发构造，此时删 `.focused` 仍属盲修。按硬性分流纪律本轮改发 CRASH-HUNT §4 开关版：设置页新增「诊断开关」区（10 个 UserDefaults 开关、冷启动读取、全开＝1811 行为），供 Joey 按 FIX-LOG-V022-2026-11-02.md §5 的序列单因素定位（F_FOCUS → F_INPUT → F_SCROLL → F_CHAT → F_PANELSTATE → 其余）。
+- 红线复核：安全与网页层文件全部零改动（git diff 实查）；validate_project.py 全 PASS。
