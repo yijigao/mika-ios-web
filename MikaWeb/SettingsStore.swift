@@ -176,7 +176,6 @@ struct SettingsView: View {
                 Text("任务执行时，网页内容及你的任务会发送至所选模型服务。任务只在 App 前台内执行，切到后台会暂停。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("任务") }
-            DebugSwitchesSection()
             if let diagnostics { Section { NavigationLink("崩溃报告") { CrashReportsView(store: diagnostics) } } }
         }.navigationTitle("设置")
     }

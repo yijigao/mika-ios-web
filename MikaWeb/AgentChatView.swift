@@ -4,10 +4,7 @@ struct AgentChatView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
     @ObservedObject var conversation: AgentConversationStore
-    @ObservedObject var panel: FloatingPanelStore
-    let inputFocused: FocusState<Bool>.Binding
     @State private var followLatest = true
-    private let debugConfig = DebugSwitches.launchConfig
     private var questionID: UUID? {
         guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
         switch engine.status { case .waitingManual, .paused: return id; default: return nil }
@@ -15,7 +12,7 @@ struct AgentChatView: View {
     private var isNewTask: Bool {
         switch engine.status { case .idle, .done, .failed: return true; case .paused: return questionID == nil; default: return false }
     }
-    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil) && debugConfig.input }
+    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil) }
     var body: some View {
         VStack(spacing: 8) {
             HStack {
@@ -25,53 +22,32 @@ struct AgentChatView: View {
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Spacer()
-                Button { panel.collapse(reason: .user) } label: { Image(systemName: "chevron.down").frame(width: 44, height: 44) }
-                    .accessibilityLabel("收起助手")
             }
-            if debugConfig.scroll {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(conversation.entries) { entry in
-                                entryView(entry).id(entry.id)
-                            }
-                            if case .waitingConfirm(let action) = engine.status {
-                                ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID)
-                            }
-                            if case .waitingManual = engine.status, case .some(.manual(_, _)) = engine.waitingInput {
-                                Text("请在网页完成处理，然后点击下方「已处理，继续」。").font(.callout).padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-                            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(conversation.entries) { entry in
+                            entryView(entry).id(entry.id)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 4)
+                        if case .waitingConfirm(let action) = engine.status {
+                            ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID)
+                        }
+                        if case .waitingManual = engine.status, case .some(.manual(_, _)) = engine.waitingInput {
+                            Text("请在网页完成处理，然后点击下方「已处理，继续」。").font(.callout).padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                        }
                     }
-                    .onChange(of: conversation.entries.count) { _, _ in
-                        if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
                 }
-            } else {
-                Text("消息区已停用（诊断）")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxHeight: 240)
+                .onChange(of: conversation.entries.count) { _, _ in
+                    if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
             }
             HStack(alignment: .bottom, spacing: 6) {
-                if debugConfig.input {
-                    if debugConfig.focus {
-                        TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
-                            .lineLimit(1...3).textFieldStyle(.roundedBorder).focused(inputFocused)
-                    } else {
-                        TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
-                            .lineLimit(1...3).textFieldStyle(.roundedBorder)
-                    }
-                } else {
-                    Text("输入已停用（诊断）")
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(8)
-                        .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
-                }
+                TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
+                    .lineLimit(1...3).textFieldStyle(.roundedBorder)
                 Button(questionID != nil ? "回答并继续" : (isNewTask && isPaused ? "新任务" : "发送")) { send() }
                     .disabled(!canSend).buttonStyle(.borderedProminent)
             }
