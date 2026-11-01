@@ -44,9 +44,8 @@ struct AgentChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
                 }
-                .simultaneousGesture(DragGesture().onChanged { _ in followLatest = false })
                 .onChange(of: conversation.entries.count) { _, _ in
-                    if followLatest, let last = conversation.entries.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                    if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
             HStack(alignment: .bottom, spacing: 6) {

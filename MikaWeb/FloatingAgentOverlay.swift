@@ -1,55 +1,37 @@
 import SwiftUI
 
-struct FloatingAgentOverlay: View {
+struct FloatingBallView: View {
     @ObservedObject var panel: FloatingPanelStore
-    @ObservedObject var conversation: AgentConversationStore
     @ObservedObject var engine: AgentEngine
-    @ObservedObject var settings: SettingsStore
-    @FocusState private var inputFocused: Bool
+    let availableSize: CGSize
     @State private var dragOffset: CGSize = .zero
     @State private var dragging = false
     var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            let height = geometry.size.height
-            let radius: CGFloat = 30
-            let margin: CGFloat = 20
-            let y = radius + margin + panel.verticalFraction * max(0, height - 2 * (radius + margin))
-            ZStack(alignment: .topLeading) {
-                if panel.expanded {
-                    AgentChatView(engine: engine, settings: settings, conversation: conversation, panel: panel, inputFocused: $inputFocused)
-                        .frame(width: width, height: min(height * 0.55, max(240, height - 12)))
-                        .background(.regularMaterial, in: UnevenRoundedRectangle(topLeadingRadius: 20, topTrailingRadius: 20))
-                        .shadow(radius: 12)
-                        .position(x: width / 2, y: height - min(height * 0.55, max(240, height - 12)) / 2)
-                } else {
-                    Button { if !dragging { panel.expand() } } label: {
-                        ZStack(alignment: .bottomTrailing) {
-                            Circle().fill(.regularMaterial).frame(width: 60, height: 60).shadow(radius: 5)
-                            Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(.primary).frame(width: 60, height: 60)
-                            statusMark.frame(width: 24, height: 24).background(.regularMaterial, in: Circle()).offset(x: 2, y: 2)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("展开助手，\(engine.status.label)")
-                    .accessibilityAction(named: "展开") { panel.expand() }
-                    .position(x: (panel.edge == .left ? radius + margin : width - radius - margin) + dragOffset.width,
-                              y: y + dragOffset.height)
-                    .gesture(DragGesture(minimumDistance: 10)
-                        .onChanged { value in dragging = true; dragOffset = value.translation }
-                        .onEnded { value in
-                            let finalX = (panel.edge == .left ? radius + margin : width - radius - margin) + value.translation.width
-                            let finalY = min(height - radius - margin, max(radius + margin, y + value.translation.height))
-                            panel.commitPosition(edge: finalX < width / 2 ? .left : .right,
-                                verticalFraction: (finalY - radius - margin) / max(1, height - 2 * (radius + margin)))
-                            dragOffset = .zero
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { dragging = false }
-                        })
-                }
+        Button { if !dragging { panel.expand() } } label: {
+            ZStack(alignment: .bottomTrailing) {
+                Circle().fill(.regularMaterial).frame(width: 60, height: 60).shadow(radius: 5)
+                Image(systemName: "bubble.left.and.bubble.right.fill").foregroundStyle(.primary).frame(width: 60, height: 60)
+                statusMark.frame(width: 24, height: 24).background(.regularMaterial, in: Circle()).offset(x: 2, y: 2)
             }
-            .frame(width: width, height: height)
         }
-        .onChange(of: panel.expanded) { _, expanded in if !expanded { inputFocused = false } }
+        .buttonStyle(.plain)
+        .accessibilityLabel("展开助手，\(engine.status.label)")
+        .accessibilityAction(named: "展开") { panel.expand() }
+        .offset(x: dragOffset.width, y: dragOffset.height)
+        .gesture(DragGesture(minimumDistance: 10)
+            .onChanged { value in dragging = true; dragOffset = value.translation }
+            .onEnded { value in
+                let width = availableSize.width
+                let height = availableSize.height
+                let committedX = panel.edge == .left ? 50 : width - 50
+                let committedY = 50 + panel.verticalFraction * max(0, height - 100)
+                let finalX = committedX + value.translation.width
+                let finalY = min(height - 50, max(50, committedY + value.translation.height))
+                panel.commitPosition(edge: finalX < width / 2 ? .left : .right,
+                    verticalFraction: (finalY - 50) / max(1, height - 100))
+                dragOffset = .zero
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { dragging = false }
+            })
     }
     private var statusMark: some View {
         let (symbol, color): (String, Color) = {

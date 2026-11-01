@@ -18,8 +18,8 @@ enum PanelEdge: String { case left, right }
         guard cancellable == nil else { return }
         cancellable = engine.$executionSerial.dropFirst().sink { [weak self] _ in self?.collapse(reason: .execution) }
     }
-    func expand() { expanded = true; collapseReason = nil }
-    func collapse(reason: PanelCollapseReason) { expanded = false; collapseReason = reason }
+    func expand() { guard !expanded else { return }; expanded = true; collapseReason = nil }
+    func collapse(reason: PanelCollapseReason) { guard expanded else { return }; expanded = false; collapseReason = reason }
     func commitPosition(edge: PanelEdge, verticalFraction: CGFloat) {
         self.edge = edge; self.verticalFraction = min(1, max(0, verticalFraction))
         UserDefaults.standard.set(edge.rawValue, forKey: "floatingEdge")
