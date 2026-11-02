@@ -99,3 +99,11 @@
 - 内容（Joey 13:27 亲令、13:33 批准；选型＝自研不引库，案卷 FLOATING-UI-IMPL-2026-11-02.md）：ContentView 改 ZStack——对话全屏常驻根层，浏览器坞盖其上双态（expanded 全屏／mini 约 0.44 等比缩放悬浮小窗，可拖动、松手按预测落点吸附左右边缘、停靠位跨启动记忆并钳制在输入栏之上）；保活靠「BrowserView 恒以展开尺寸布局＋scaleEffect 渲染缩放」，WKWebView frame 永不变化、不重排不重载；mini 态手势护盾拦截全部页面触摸（点按展开／拖动移动）；接 engine 既有信号自动展开（waitingConfirm＋确认卡片随坞底呈现、waitingManual 的 .manual 密码手输＋同口径「已处理，继续」）。
 - 红线复核：MikaWebApp.swift 持有形态、WebController/WebSurface/AgentEngine 全部零改动（git diff 实查）；安全边界与确认／手输语义不变。
 - 待 Joey 按案卷真机清单验收（重点：展开态点网页不崩回归、连续收放 30 次不重载、mini 态长任务持续运行、两类自动展开、键盘与位置记忆）；验收通过前不合 main。
+
+## 增补（2026-11-02）：悬浮窗两缺陷修复构建（真 resize＋输入注入硬化），新构建已上
+
+- 构建 **202611020602**（0.1.0），build id `65d0f392-91b7-4aab-9898-aa5b3d09baed`：分支 `feat/floating-browser-dock` 续提交 `736170e`（未合 main、未合 fix 分支）；CI Run 41397273588 success、Release Run 41397400728 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 回读确认、Internal 组挂载 POST 204 且组内回读居首；validate_project.py 全 PASS。
+- 背景：0540 真机验收（Joey 13:55）悬浮成功、无闪退，两缺陷：①内容不随窗口适配（旧实现只做渲染缩放、不重排）；②知乎答评论「找不到发表按钮」——13:55 截图＋Joey 判断定性为评论文字压根没真正打进编辑器（旧 contenteditable 写入用 textContent＋无 inputType 的普通事件，框架编辑器状态不更新），任务在展开态跑、与浮窗形态无关。
+- 内容（案卷 FLOATING-UI-FIX2-2026-11-02.md）：①BrowserDockView 落定真 resize——动画期渲染缩放过渡、落定后布局尺寸切当前态真实尺寸让页面响应式重排，同 WKWebView 实例不重载/不重建、拖动不触发、滚动比例存恢复，小窗默认尺寸适度调大；②输入注入重写——contenteditable 主路径 execCommand insertText、备用 Range＋InputEvent，写后回读硬校验（文本＋发布按钮禁用状态），不过关换路径重试、再失败如实报「没输入进去」；click 加禁用判定与约 3.6 秒等待重扫，失败口径分「按钮是灰的／找不到／没输入进去」，失败留截图＋DOM 摘要到既有诊断通道；PageElement 新增 disabled。
+- 红线复核：MikaWebApp.swift 持有形态、WebSurface/AgentEngine/SafetyPolicy 零改动；安全边界与确认/手输语义不变。
+- 待 Joey 按案卷复测清单验收（知乎评论展开/小窗各测一次、适配重排与滚动位置）；验收通过前不合 main。
