@@ -2,13 +2,31 @@ import SwiftUI
 import WebKit
 import Combine
 
+extension Notification.Name {
+    /// 页面发起通行密钥（WebAuthn）请求且被平台拒绝时，由 BrowserTab 发出、
+    /// AgentConversationStore 订阅并在对话区给人话降级提示（DOCK-NAV-PASSKEY-FIX）。
+    static let mikaWebAuthnBlocked = Notification.Name("MikaWeb.WebAuthnBlocked")
+}
+
+/// WKUserContentController 会强持有消息处理器；标签页经弱代理转发，避免
+/// 「标签页→WKWebView→配置→处理器→标签页」强引用环让关闭的标签页无法释放。
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var delegate: WKScriptMessageHandler?
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        delegate?.userContentController(userContentController, didReceive: message)
+    }
+}
+
 // 标签页会话（2026-11-02，案卷 TABS-IMPL-2026-11-02.md）：一个标签页＝一个独立 WKWebView
 // ＋独立历史／标题／加载状态。切换标签只是把当前页的 WKWebView 换入视图层级，离屏标签的
 // 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，按最后已知
 // 地址重载恢复该页（系统行为，见 webViewWebContentProcessDidTerminate）。
-@MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, Identifiable {
+@MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler, Identifiable {
     let id = UUID()
     let webView: WKWebView
+    /// 通行密钥探针的消息处理器弱代理（配置强持有代理、代理弱指本标签页，见类注释）；
+    /// init 中先以局部变量装进配置、super.init 后再由本属性强持有并回填 delegate。
+    private var webAuthnProxy: WeakScriptMessageHandler?
     @Published private(set) var urlString = ""
     @Published private(set) var title = ""
     @Published private(set) var estimatedProgress = 0.0
@@ -25,8 +43,12 @@ import Combine
     /// 弹窗请求由 WebKit 自行载入。
     init(configuration: WKWebViewConfiguration? = nil, loadStartPage: Bool = true) {
         let config = configuration ?? Self.makeConfiguration()
+        let probeProxy = WeakScriptMessageHandler()
+        Self.installWebAuthnProbe(into: config, handler: probeProxy)
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
+        webAuthnProxy = probeProxy
+        probeProxy.delegate = self
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         webView.navigationDelegate = self
         observations = [
@@ -45,6 +67,96 @@ import Combine
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         return config
+    }
+
+    // MARK: - 通行密钥（WebAuthn）探针与降级（DOCK-NAV-PASSKEY-FIX-2026-11-02）
+    //
+    // 平台事实（Apple entitlement 文档＋WebKit 行为，多源互证，详见案卷）：WebKit 会
+    // 自动处理 WKWebView 里的 WebAuthn，但宿主 App 只有持有受管 entitlement
+    // com.apple.developer.web-browser.public-key-credential（须组织账号 Account
+    // Holder 向 Apple 申请、审核后以 managed capability 下发并写进描述文件）时，
+    // 才能为**任意** relying party 弹出系统通行密钥确认框；没有它，内嵌 WKWebView
+    // 只能用 App 自己关联域名的通行密钥，第三方站点（如 x.com）的请求会被平台
+    // 直接拒绝（NotAllowedError、不呈现任何 UI）——与 Joey 在 X 登录页点通行密钥
+    // 「没有弹窗」的真机症状一致。本 App 不持有该 entitlement（申请是账号层动作，
+    // 不在本轮范围，路径与门槛记在案卷），故本轮落优雅降级：注入脚本只观察
+    // navigator.credentials 的 get／create 调用（原样透传调用与返回值、不改页面
+    // 语义、不碰任何凭据材料），被拒且非 conditional（自动填充）时通知对话区给
+    // 人话提示；全部尝试（含成功与 conditional）记 DiagnosticStore 同格式信封。
+
+    private static let webAuthnHandlerName = "mikaWebAuthn"
+
+    private static let webAuthnProbeScript = """
+    (function(){
+      if (window.__mikaWebAuthnProbe) return;
+      window.__mikaWebAuthnProbe = true;
+      var post = function(payload){ try { window.webkit.messageHandlers.mikaWebAuthn.postMessage(payload); } catch (e) {} };
+      var creds = null;
+      try { creds = navigator.credentials; } catch (e) { creds = null; }
+      if (!creds) return;
+      var wrap = function(kind){
+        var orig = creds[kind];
+        if (typeof orig !== 'function') return;
+        creds[kind] = function(options){
+          var conditional = false; var rp = '';
+          try {
+            conditional = !!(options && options.mediation === 'conditional');
+            var pk = options && options.publicKey;
+            if (pk) { rp = pk.rpId || (pk.rp && pk.rp.id) || ''; }
+          } catch (e) {}
+          var base = { kind: kind, rp: rp, conditional: conditional, href: '' };
+          try { base.href = location.href; } catch (e) {}
+          var p;
+          try { p = orig.call(creds, options); }
+          catch (err) {
+            var t = { kind: base.kind, rp: base.rp, conditional: base.conditional, href: base.href, event: 'throw', error: (err && err.name) || 'Error' };
+            post(t); throw err;
+          }
+          if (p && typeof p.then === 'function') {
+            p.then(function(){ post({ kind: base.kind, rp: base.rp, conditional: base.conditional, href: base.href, event: 'resolved' }); },
+                   function(err){ post({ kind: base.kind, rp: base.rp, conditional: base.conditional, href: base.href, event: 'rejected', error: (err && err.name) || 'Error' }); });
+          }
+          return p;
+        };
+      };
+      wrap('get'); wrap('create');
+    })();
+    """
+
+    private static func installWebAuthnProbe(into config: WKWebViewConfiguration, handler: WKScriptMessageHandler) {
+        let controller = config.userContentController
+        controller.addScriptMessageHandler(handler, contentWorld: .page, name: webAuthnHandlerName)
+        controller.addUserScript(WKUserScript(source: webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+    }
+
+    /// 探针消息处理：全量记诊断；仅「模态调用被拒／同步抛错」才通知对话区提示
+    /// （conditional 自动填充调用失败是常态静默路径，不打扰用户）。
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == Self.webAuthnHandlerName, let body = message.body as? [String: Any] else { return }
+        let event = body["event"] as? String ?? ""
+        let kind = body["kind"] as? String ?? ""
+        let rp = body["rp"] as? String ?? ""
+        let conditional = body["conditional"] as? Bool ?? false
+        let errorName = body["error"] as? String ?? ""
+        let href = body["href"] as? String ?? ""
+        let host = URL(string: href)?.host ?? webView.url?.host ?? rp
+        Self.recordWebAuthnDiagnostic(event: event, kind: kind, rp: rp, host: host, conditional: conditional, errorName: errorName, href: href)
+        guard event == "rejected" || event == "throw", !conditional else { return }
+        NotificationCenter.default.post(name: .mikaWebAuthnBlocked, object: nil, userInfo: ["host": host, "kind": kind])
+    }
+
+    /// 诊断留痕：与 captureFailureSnapshot 同目录、同信封格式（诊断页可见）；
+    /// 只记事件／站点／错误名等元数据——凭据材料既拿不到也不记录。
+    private static func recordWebAuthnDiagnostic(event: String, kind: String, rp: String, host: String, conditional: Bool, errorName: String, href: String) {
+        let payload: [String: Any] = ["kind": "webauthn-attempt", "event": event, "api": kind, "rp": rp, "host": host, "conditional": conditional, "error": errorName, "url": href]
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = UUID(), now = Date(), formatter = ISO8601DateFormatter()
+        let envelope: [String: Any] = ["schemaVersion": 1, "id": id.uuidString, "receivedAt": formatter.string(from: now), "types": ["通行密钥尝试"], "payload": payload]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]) else { return }
+        let name = formatter.string(from: now).replacingOccurrences(of: ":", with: "-") + "-" + id.uuidString + ".json"
+        try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
     }
 
     private func update() {

@@ -24,6 +24,19 @@ import SwiftUI
 // 点对话区介入卡上的「打开浏览器查看／打开浏览器」（经 ContentView 的 expandRequest
 // 令牌下传，仍是用户点击）。介入呈现改走对话区置顶卡片（InterventionPrompt），
 // 小窗坞只加橙点＋「等你处理」状态提示（纯视觉、不触发任何动作）。
+// 落定 resize 的触发源纪律（2026-11-02 晚，案卷 DOCK-NAV-PASSKEY-FIX-2026-11-02.md）：
+// 真机实证——任务在小窗态跑完后，页面在小窗里按约 155pt 真实重排成逐字窄列。根因是
+// 「会话终结」这一生命周期迁移（sessionActive ↓ → layoutMode 交还 .dockSize）触发的
+// settle 把视口缩到了小窗真实尺寸：它紧跟在任务的最后一次导航（发表跳转）之后约
+// 480ms 落定，用户席位上就读作「导航把布局弄坏了」。定版规则：**缩到 dockSize 的真
+// resize 只允许由用户显式展开／收起手势的收敛 settle 落定**（FIX2 的「用户收起落定后
+// 内容按小窗宽度重排可读」保留）；一切生命周期 settle（会话开始／终结、容器尺寸
+// 变化）只允许把布局往工作尺寸方向推（会话开始时从小窗真实尺寸一次长回工作尺寸，
+// 0645 视口锁定的迁移 #1 不变），**绝不缩**。会话终结时坞若是小窗态，布局保持工作
+// 尺寸＋缩放渲染，直到用户下一次显式收起手势才落定到小窗真实尺寸；页面导航本身
+// （整页／重定向／SPA 路由）从不直接触发 settle，本纪律把「导航刚结束就赶上会话
+// 终结」这条被动路径一并堵死。
+//
 // 视觉呈现（DisplayMode）由 mode（坞形态）×layoutMode（布局所有权）导出：
 // 布局缩放比 layoutScale 与视觉缩放比之商走 scaleEffect，组合真值表见案卷。
 // 位置几何走「中心点＋缩放比」模型：动画由 mode 驱动（弹簧、可被新手势打断重定向），
@@ -230,7 +243,8 @@ struct BrowserDockView: View {
                 if let current = miniCenter {
                     miniCenter = DockGeometry.clampedCenter(current, area: newSize, scale: DockGeometry.miniScale(area: newSize), bottomReserve: bottomReserve)
                 }
-                scheduleSettle()
+                // 容器尺寸变化是生命周期事件、不是收放手势：settle 只许往工作尺寸推、不许缩
+                scheduleSettle(userGesture: false)
             }
             .onChange(of: bottomReserve) { _, _ in
                 // 输入栏变高（草稿长到多行）时保留线随之下移，小窗若已越线则重钳回线之上
@@ -264,12 +278,16 @@ struct BrowserDockView: View {
                 // 介入场景（waitingConfirm／waitingManual）同样不自动展开（Joey
                 // 2026-11-02 16:01 定版）：只在对话里出卡提示，用户自己决定开不开。
                 layoutMode = .workingSize
-                scheduleSettle()
+                // 生命周期 settle：只许把布局从小窗真实尺寸长回工作尺寸（迁移 #1），不许缩
+                scheduleSettle(userGesture: false)
             } else {
-                // 会话终结（完成／失败／停止／切后台暂停）：所有权交还坞态；
-                // 坞若仍是小窗态，scheduleSettle 会补做落定 resize 到小窗真实尺寸。
+                // 会话终结（完成／失败／停止／切后台暂停）：所有权交还坞态，但**不再**
+                // 在此刻补做落定 resize 到小窗真实尺寸——那正是「任务一结束、发表跳转
+                // 后的页面就在小窗里挤成窄列」的成因（DOCK-NAV-PASSKEY-FIX）。坞若仍是
+                // 小窗态，布局保持工作尺寸＋缩放渲染；缩到小窗真实尺寸只等用户下一次
+                // 显式收起手势的 settle（collapse 的 userGesture 通道）。
                 layoutMode = .dockSize
-                scheduleSettle()
+                scheduleSettle(userGesture: false)
             }
         }
     }
@@ -355,12 +373,15 @@ struct BrowserDockView: View {
             dragDelta = .zero
             dragStartCenter = nil
         }
-        scheduleSettle()
+        // expand() 的调用点只剩用户动作（护盾点按、介入卡「打开浏览器」按钮），
+        // 其 settle 是允许落定真 resize 的用户手势通道
+        scheduleSettle(userGesture: true)
     }
 
     private func collapse() {
         withAnimation(spring) { mode = .mini }
-        scheduleSettle()
+        // 用户显式收起：FIX2 的落定真 resize（页面按小窗宽度重排可读）走这一条通道
+        scheduleSettle(userGesture: true)
     }
 
     /// 落定 resize 的目标布局缩放比：由布局所有权决定。
@@ -380,7 +401,14 @@ struct BrowserDockView: View {
     /// 拖动不改 mode、不调本方法，故拖动过程中绝不 resize。任务会话活跃期目标恒为
     /// 工作尺寸：若布局已在工作尺寸则直接返回（收起不触发任何 resize），若会话开始时
     /// 布局还停在小窗真实尺寸（闲时小窗浏览后直接发起任务），则在此一次切回工作尺寸。
-    private func scheduleSettle() {
+    ///
+    /// 触发源门（DOCK-NAV-PASSKEY-FIX）：userGesture=false 的生命周期 settle（会话
+    /// 开始／终结、容器尺寸变化）只允许「长回工作尺寸」方向的 resize；目标小于当前
+    /// layoutScale（＝缩到 dockSize）时直接放弃落定，布局保持现状（小窗态即工作尺寸
+    /// 布局＋缩放渲染）。缩到 dockSize 只允许 userGesture=true 的用户显式展开／收起
+    /// 手势 settle 落定。这样任何导航事件——包括紧跟任务终结的发表跳转——都无法再
+    /// 把活动视口被动缩到小窗真实尺寸。
+    private func scheduleSettle(userGesture: Bool) {
         settleTask?.cancel()
         let targetMode = mode
         let targetLayoutMode = layoutMode
@@ -390,6 +418,8 @@ struct BrowserDockView: View {
             guard !Task.isCancelled, mode == targetMode, layoutMode == targetLayoutMode, area.width > 0 else { return }
             let target = settleTargetScale()
             guard abs(layoutScale - target) > 0.001 else { return }
+            // 触发源门：非用户手势的 settle 不许缩（往 dockSize 方向一律放弃落定）
+            if !userGesture, target < layoutScale { return }
             let fraction = await scrollFraction()
             var transaction = Transaction()
             transaction.disablesAnimations = true

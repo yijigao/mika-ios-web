@@ -35,6 +35,9 @@ struct ChatEntry: Identifiable {
     private var batching = false
     private var batchedEntries: [ChatEntry] = []
     private var uiObservers: [NSObjectProtocol] = []
+    /// 通行密钥降级提示的节流状态（DOCK-NAV-PASSKEY-FIX）：同一站点短时间内只提示一次
+    private var lastWebAuthnNoticeHost: String?
+    private var lastWebAuthnNoticeAt: Date?
     func bind(to engine: AgentEngine) {
         guard !bound else { return }
         bound = true
@@ -44,6 +47,10 @@ struct ChatEntry: Identifiable {
             })
             uiObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.flushBatch() }
+            })
+            uiObservers.append(NotificationCenter.default.addObserver(forName: .mikaWebAuthnBlocked, object: nil, queue: .main) { [weak self] note in
+                let host = note.userInfo?["host"] as? String ?? ""
+                Task { @MainActor [weak self] in self?.webAuthnBlockedNotice(host: host) }
             })
         }
         engine.$conversationTaskID.sink { [weak self, weak engine] id in
@@ -79,6 +86,17 @@ struct ChatEntry: Identifiable {
         }.store(in: &cancellables)
     }
     func localFeedback(_ text: String) { append(ChatEntry(taskID: taskID, kind: .local, text: text, source: .localValidation)) }
+    /// 通行密钥降级提示（DOCK-NAV-PASSKEY-FIX）：页面发起 WebAuthn 被平台拒绝时由
+    /// BrowserTab 经通知送达。同一站点 120 秒内只提示一次（站点重试不刷屏；诊断侧
+    /// 全量记录不受此节流影响）。文案口径：只说清「这边弹不出来」与可走的替代路径，
+    /// 不声称支持通行密钥、更不提任何代填凭据的办法。
+    private func webAuthnBlockedNotice(host: String) {
+        let shownHost = host.isEmpty ? "这个网站" : host
+        if lastWebAuthnNoticeHost == shownHost, let at = lastWebAuthnNoticeAt, Date().timeIntervalSince(at) < 120 { return }
+        lastWebAuthnNoticeHost = shownHost
+        lastWebAuthnNoticeAt = Date()
+        localFeedback("提示：\(shownHost) 刚才想用通行密钥（passkey）登录，但 iOS 不允许在 Mika Web 的内置浏览器里弹出通行密钥确认框——只有 Safari 和拿到 Apple 专门授权的浏览器能调它，这边弹不出来。请改用密码在这里登录一次（在 Safari 里登录不会同步到 Mika Web，两边状态是分开的）。")
+    }
     func acceptedAnswer(_ text: String) { append(ChatEntry(taskID: taskID, kind: .userAnswer, text: text, source: .userAnswer)) }
     private func append(_ entry: ChatEntry) {
         if batching { batchedEntries.append(entry) } else { entries.append(entry) }
