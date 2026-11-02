@@ -42,7 +42,11 @@ jobs:
         if: always()
         run: |
           mkdir -p dsym-out
-          find . -name "*.dSYM" -type d -print -exec cp -R {} dsym-out/ \; || true
+          # gym 把 xcarchive 放在 ~/Library/Developer/Xcode/Archives 下（不在
+          # 工作区内），并把压缩好的 dSYM zip 放在工作区根目录——两处都收：
+          # 原始 .dSYM 目录（可直接 atos）＋ gym 的压缩包各一份。
+          find "$HOME/Library/Developer/Xcode/Archives" -name "*.dSYM" -type d -exec cp -R {} dsym-out/ \; 2>/dev/null || true
+          find . -name "*.app.dSYM.zip" -exec cp {} dsym-out/ \; || true
           ls -la dsym-out || true
       - name: Upload dSYM artifact
         if: always()
