@@ -3,7 +3,8 @@
 - 日期：2026-11-02（设计＋构建交付，待主聊转交 Joey 按阶真机测）
 - 触发：第二轮拆半结果——H3a（202611020217，仅 A 组）与 H3b（202611020221，A+B）经 Joey 2026-11-02 10:45 真机实测**均点击网页闪退**（案卷 CRASH-LADDER-2 §5/§6）。判读：**A 组（App 级对象图）单独即可触发，B 组（1652 布局＋控制台静态形态）与触发无关**（H3b 崩不构成对 B 的指控，A 已足以解释）。本轮自 H2 基线把 A 组拆为单件阶，逐件点名。
 - 基线：H2＝构建 202611020054 的源码状态（提交 `2e9a33d`，crash-ladder 分支尖端）——App 入口只装配 DiagnosticStore，WebController 由根视图（HarnessH2View）@StateObject 自持，无 SettingsStore、无 AgentEngine 对象存在。
-- 代码：分支 `crash-ladder-2`（续第二轮；main 生产分支未动）。实现方式：三阶共用同一套源码，构建间唯一差异是 `Harness.step` 取值（7→8→9）；各阶的 App 装配差异由 `MikaWebApp.init` 内的 step 分阶构造承载（该 switch 本身三阶恒定）。起始页、WebSurface/WebController/BrowserView 本体、DiagnosticStore＋MetricKit 导出包装（右下角圆钮）三阶恒定，未改。
+- 代码：分支 `crash-ladder-2`（续第二轮；main 生产分支未动）。实现方式：三阶共用同一套源码，构建间唯一差异是 `Harness.step` 取值（7→8→9）；各阶的 App 装配差异由 `HarnessObjectGraph`（Harness.swift）的 step 分阶构造表承载（该 switch 本身三阶恒定，对象在 App init 内构造）。起始页、WebSurface/WebController/BrowserView 本体、DiagnosticStore＋MetricKit 导出包装（右下角圆钮）三阶恒定，未改。
+- 实现注记（存储形态，判读时须知）：对象图由 App init 同步构造的持有者 `HarnessObjectGraph` 保活（App 以 @StateObject 持有该持有者），而非 H3a 当时的「App 直接以 @StateObject 逐个持有对象」。缘由：Optional 形态的 @StateObject 赋值在本工程 Release（archive）编译下报错（`cannot convert value of type 'AgentEngine?' to expected argument type 'AgentEngine'`；同一提交 CI 的 Debug 模拟器构建却通过——A-1 首个 Release Run 41379839097 实证，未上传构建，拟用构建号 202611020250 未被占用）。持有者形态与直接持有在**创建时机（App init 内）与生命周期（App 级）上等价**，差异仅在存储一层间接；若第三轮某阶结果与 H3a 预期矛盾，先考虑这一层差别再谈定位。
 - 红线遵守：未改起始页、未改 WebSurface/WebController 本体、未动 main；AgentEngine 在涉及其的阶中只创建、不执行、不发网络（其 init 仅存引用，无副作用，第二轮已源码实查）。
 
 ## 1. A 组单件可分性核查（源码实查，先于出阶）

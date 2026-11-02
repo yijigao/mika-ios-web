@@ -7,7 +7,7 @@ import WebKit
 // 第三轮阶梯定义（CRASH-LADDER-3-2026-11-02，step=7/8/9）：H3a/H3b 真机均崩、A 组单独可触发后，自 H2 基线（step=2 源码状态）把 A 组拆单件——
 //   step=7「A-1」只加 A1（App 级持有 WebController＋下传消费）；step=8「A-2」只加 A2（App 级创建 SettingsStore）；
 //   step=9「A-2+3」为 A3 的最小耦合阶（AgentEngine init 签名强制 web+settings 两实例，A3 不能独立，详见案卷 CRASH-LADDER-3 §1）。
-// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同（各阶 App 装配差异由 MikaWebApp.init 内的 step 分阶构造承载）。
+// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同（各阶 App 装配差异由 HarnessObjectGraph 的分阶构造表承载，对象在 App init 内构造）。
 // 三阶共同点：
 // 1. 起始页与生产 App 完全一致——startPageHTML 是 WebController.init 里 loadHTMLString 的原文，
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
@@ -26,6 +26,53 @@ enum Harness {
     }
     static let startPageHTML = "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>"
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+}
+
+// App 级对象图的持有者：由 MikaWebApp.init 同步构造、App 以 @StateObject 保活——对象创建时机在 App init 内、
+// 生命周期为 App 级，与「App 直接以 @StateObject 逐个持有」等价，差异仅在存储形态。
+// 为何不直接在 App 上写 Optional @StateObject：该写法在本工程 Release（archive）编译下报错
+//（StateObject(wrappedValue:) 解析到非 Optional 期望，MikaWebApp.swift 曾报 cannot convert AgentEngine? to AgentEngine；
+// 同一提交的 CI Debug 模拟器构建却通过——2026-11-02 A-1 首个 Release Run 实证），故以本持有者承载分阶构造。
+// 与第二轮 H3a 的已知实现差别：彼时对象图为 App 直接 @StateObject 持有，本轮为持有者保活（登记于案卷 CRASH-LADDER-3 §1）。
+// 分阶构造表（各阶差异只在「建哪些对象」，构造顺序恒为 web→settings→engine）：
+// - step 0/1/2（第一轮＋H2 基线）：全 nil——App 不建对象图（与 H2 基线提交 2e9a33d 的入口等价）；
+// - step 3/4/5/6（第二轮）：全建并下传（1652 形态对象图），与本分支此前提交行为一致；
+// - step 7（A-1）：只建 web（App 级持有、下传根视图消费＝A1＋A4），不建 settings/engine；
+// - step 8（A-2）：只建 settings（App 级持有、不下传消费），不建 web/engine；
+// - step 9（A-3 耦合阶 A2+A3）：建 settings＋engine；engine 的 web 参数仅为满足 AgentEngine.init(web:settings:)
+//   签名的依赖实例——不入本持有者的 web 槽（保持 nil）、不下传视图、仅由 engine 的 strong let 引用保活；
+//   BrowserView 实际消费的 controller 仍由根视图自持（A1/A4 缺席）。耦合关系详记案卷 CRASH-LADDER-3 §1。
+final class HarnessObjectGraph: ObservableObject {
+    let web: WebController?
+    let settings: SettingsStore?
+    let engine: AgentEngine?
+    init(step: Int) {
+        switch step {
+        case 3, 4, 5, 6:
+            let w = WebController()
+            let s = SettingsStore()
+            web = w
+            settings = s
+            engine = AgentEngine(web: w, settings: s)
+        case 7:
+            web = WebController()
+            settings = nil
+            engine = nil
+        case 8:
+            web = nil
+            settings = SettingsStore()
+            engine = nil
+        case 9:
+            let s = SettingsStore()
+            web = nil
+            settings = s
+            engine = AgentEngine(web: WebController(), settings: s)
+        default:
+            web = nil
+            settings = nil
+            engine = nil
+        }
+    }
 }
 
 // 裸 WKWebView 持有者：无 ObservableObject、无 @Published、无 navigationDelegate、无 KVO 观察。
@@ -56,7 +103,7 @@ struct HarnessBareSurface: UIViewRepresentable {
 }
 
 struct HarnessRootView: View {
-    // 对象图引用由 App 入口按 step 分阶传入，未建的对象为 nil（各阶实际建了哪些对象见 MikaWebApp.init 的分阶构造）：
+    // 对象图引用由 App 入口按 step 分阶传入，未建的对象为 nil（各阶实际建了哪些对象见 HarnessObjectGraph 的分阶构造表）：
     // step 0/1/2 三者皆 nil；step 3/4/5/6 三者皆非 nil；step 7 仅 web；step 8 仅 settings；step 9 为 settings＋engine
     //（其 engine 的 web 依赖实例不经此下传）。需要全对象图的视图分支均以 if let 解包，解包失败不挂载（按 init 分阶构造不会发生）。
     let web: WebController?
