@@ -207,3 +207,12 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线实查均 0 行）；无新第三方依赖；文案无「并行执行」；凭据不落盘。
 - 过程注记：旧提交 2b9a97c 的 CI run 41504342224 排队约 15 分钟未获 macOS runner、steps=0 后被取消（job 结论 cancelled、run 结论 failure）；定性为排队取消，既不算失败也不算通过；非我方主动取消，取消触发方 API 无留痕；新提交 run 创建时间晚于旧 run 完成时间，故不表述为「被新 run 取代」；最终 tip 验收只认 41506759409。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷第 7 节复测（第一条＝102 字专栏文章改约 1000 字，回文章页核对已替换而非追加）；验收通过前不合 main。
+- ASC 亲验（阿仁，2026-11-03 03:20 CST）：构建 202611021908 processingState=VALID（build id 1483a697-dc04-4c67-bf65-ae39384af99a），已 POST 挂 Internal 组并回读确认居首——**正式取代 1830 成为唯一复测目标**（含封面/弹窗修复与知乎专栏 paste 路线）。
+
+## 增补（2026-11-03）：VERIFY-1（动作后核验合约窄版试点，shadow 先行），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611021932**（0.1.0）：分支 `feat/verify-1`（基线＝feat/zhuanlan-fix2 tip 0ab1354，含构建 1908，未合 main），功能提交 `46c5b4a`；CI Run 41509603798 success（日志原文双核对：70 条 SwiftCompile、ActionVerification 在编译列、BUILD SUCCEEDED ×1、FAILED ×0；唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41510817410 success（agvtool 置号 202611021932、上传成功、dSYM artifact dsym-41510817410 4,554,759 字节实存）；validate_project.py 全 PASS（31 源、10 个 HTML 资源）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 VERIFY-1-IMPL-2026-11-03.md）：①取证采样器 settledCapture——台账落记的提交类动作后每 300ms 探一帧（签名＝就绪态/正文长度/正文哈希/节点数/文档高度，叠加 performance 网络空闲判据），签名连续 3 帧不变且网络空闲判 settled，有界超时 5 秒只记「证据未稳」不算成功，收口后以 state() 重新抽取（不用旧定位）。②三值判定 ActionVerifier（纯函数）：动作后新出现明确拒绝/失败文案→contradicted；提交内容前缀在正文出现次数增加（回读证据）→verified；页面跳转＋新出现成功文案→verified；toast/单独成功文案/单独跳转只记弱证据→unknown；证据未稳时 verified 降 unknown；本版不调模型核验（断言不 conclusive 即 unknown，避免同模型二次意见的核验表演）。③台账旁记录：每次台账落记随即核验（自主/确认两路共用挂钩），记录 append 落盘 verification-log.jsonl（关联台账条目 id、执行器自报对照面、diverged≡contradicted），步流在 outcome 步后补 verify 提示步；shadow 只记录与提示，不改台账状态、不阻断、不自动重提/重发。④自检十三＋新页 test-verify.html：四场景真实驱动（甲回读 verified／乙 toast-only unknown／丙明确拒绝 contradicted＋diverged／丁持续变化 settle 超时 unknown＋证据未稳），Tier A 含记录落盘往返（临时日志，不污染正式 shadow 账）与分歧统计核对；本机以 JS 等价移植＋jsdom 驱动同一合成页冒烟，四场景预检 ALL PASS。⑤案卷含 shadow 分歧统计口径（自动三值分布＋人工复核标注算假完成率/unknown 误杀率）与转正式阻断门的建议门槛（只建议：样本 ≥30、unknown 误杀 ≤5%、contradicted 精确率 ≥80%、verified 假阳性＝0；本单不自行转门）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线实查均 0 行）；无新第三方依赖；未合 main；文案无「并行执行」；核验记录只存证据引用，不存正文全文与凭据。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷第 8 节复测（第一条＝自检十三 Tier A；Tier B 与知乎专栏改长文、公众号发表两场景同程，看步流核验步与正式日志记录同页面实况对照）；验收通过前不合 main。
+- 附记：上一构建 1908 条目末尾的阿仁 ASC 亲验行此前未提交，随本次日志提交一并入库（非本单代记）。
