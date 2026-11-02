@@ -40,7 +40,8 @@ struct AgentChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
                 }
-                .frame(maxHeight: 240)
+                // 对话层改为全屏常驻根层（悬浮窗改造）：消息区不再受并屏时代的 240pt 上限约束
+                .frame(maxHeight: .infinity)
                 .onChange(of: conversation.entries.count) { _, _ in
                     if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
@@ -99,7 +100,8 @@ struct AgentChatView: View {
     }
 }
 
-private struct ConfirmCard: View {
+// 内部可见：浏览器坞展开态的确认浮层复用同一张卡片（同一 engine.confirm 路径与防重复守卫）
+struct ConfirmCard: View {
     @ObservedObject var engine: AgentEngine
     let action: AgentAction
     let taskID: UUID?
