@@ -10,7 +10,7 @@ import WebKit
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 5
+    static let step = 6
     static var stepName: String {
         switch step {
         case 5: return "H3a"
