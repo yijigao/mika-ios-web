@@ -8,12 +8,49 @@ extension Notification.Name {
     static let mikaWebAuthnBlocked = Notification.Name("MikaWeb.WebAuthnBlocked")
 }
 
-/// WKUserContentController 会强持有消息处理器；标签页经弱代理转发，避免
-/// 「标签页→WKWebView→配置→处理器→标签页」强引用环让关闭的标签页无法释放。
-private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
-    weak var delegate: WKScriptMessageHandler?
+/// 通行密钥探针的多路复用器（CRASH-1031-FIX）：全局唯一的消息处理器，按
+/// WKScriptMessage.webView 把消息路由回所属标签页处理。
+///
+/// 为什么必须复用（1031 崩溃机制）：WKUIDelegate createWebViewWith 收到的
+/// 配置是发起页配置的副本、与发起页**共享同一个 WKUserContentController**
+/// （脚本消息处理器在新窗口里继续工作正是靠这一点）。旧实现对每个标签页都
+/// 向其配置的 controller 注册同名 handler——在共享 controller 上重复
+/// `add(_:contentWorld:name:)` 同一名字会抛 NSInvalidArgumentException，
+/// 且该调用发生在 WebKit 的 UI 委托回调里，ObjC 异常无处可捕获、直接
+/// abort（1031 真机：知乎点「写文章」以新窗口打开编辑器时崩溃，SIGABRT）。
+/// 故：每个 controller 只装配一次（装配表弱持有、含 remove 同名旧注册的
+/// 双保险），处理器恒为本复用器单例；标签页与 webView 的对应关系在标签页
+/// 创建后登记（弱引用，条目在每次路由时顺手清理已释放者）。
+@MainActor private final class WebAuthnProbeMultiplexer: NSObject, WKScriptMessageHandler {
+    static let shared = WebAuthnProbeMultiplexer()
+    private var equippedControllers = NSHashTable<WKUserContentController>.weakObjects()
+    private var tabsByWebView: [ObjectIdentifier: WeakTabBox] = []
+    private final class WeakTabBox {
+        weak var tab: BrowserTab?
+        init(_ tab: BrowserTab) { self.tab = tab }
+    }
+
+    /// 给配置装探针：同一 controller 只装一次（脚本同理只注入一次；
+    /// 探针脚本自身另有页面级防重入标记，属第三重保险）。
+    func equip(_ controller: WKUserContentController) {
+        guard !equippedControllers.contains(controller) else { return }
+        controller.removeScriptMessageHandler(forName: BrowserTab.webAuthnHandlerName, in: .page)
+        controller.add(self, contentWorld: .page, name: BrowserTab.webAuthnHandlerName)
+        controller.addUserScript(WKUserScript(source: BrowserTab.webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        equippedControllers.add(controller)
+    }
+
+    func associate(tab: BrowserTab) {
+        tabsByWebView[ObjectIdentifier(tab.webView)] = WeakTabBox(tab)
+    }
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        delegate?.userContentController(userContentController, didReceive: message)
+        tabsByWebView = tabsByWebView.filter { $0.value.tab != nil }
+        if let webView = message.webView, let tab = tabsByWebView[ObjectIdentifier(webView)]?.tab {
+            tab.userContentController(userContentController, didReceive: message)
+        } else {
+            BrowserTab.handleUnroutedWebAuthnMessage(message)
+        }
     }
 }
 
@@ -21,12 +58,9 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 // ＋独立历史／标题／加载状态。切换标签只是把当前页的 WKWebView 换入视图层级，离屏标签的
 // 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，按最后已知
 // 地址重载恢复该页（系统行为，见 webViewWebContentProcessDidTerminate）。
-@MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler, Identifiable {
+@MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, Identifiable {
     let id = UUID()
     let webView: WKWebView
-    /// 通行密钥探针的消息处理器弱代理（配置强持有代理、代理弱指本标签页，见类注释）；
-    /// init 中先以局部变量装进配置、super.init 后再由本属性强持有并回填 delegate。
-    private var webAuthnProxy: WeakScriptMessageHandler?
     @Published private(set) var urlString = ""
     @Published private(set) var title = ""
     @Published private(set) var estimatedProgress = 0.0
@@ -43,12 +77,14 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     /// 弹窗请求由 WebKit 自行载入。
     init(configuration: WKWebViewConfiguration? = nil, loadStartPage: Bool = true) {
         let config = configuration ?? Self.makeConfiguration()
-        let probeProxy = WeakScriptMessageHandler()
-        Self.installWebAuthnProbe(into: config, handler: probeProxy)
+        // 探针装配走复用器：window.open 所给的配置与发起页共享同一
+        // WKUserContentController，逐标签重复注册同名 handler 会抛
+        // NSInvalidArgumentException 致 abort（CRASH-1031），复用器保证
+        // 每个 controller 只装一次、消息按 webView 路由回所属标签页。
+        WebAuthnProbeMultiplexer.shared.equip(config.userContentController)
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
-        webAuthnProxy = probeProxy
-        probeProxy.delegate = self
+        WebAuthnProbeMultiplexer.shared.associate(tab: self)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         webView.navigationDelegate = self
         observations = [
@@ -84,9 +120,9 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     // 语义、不碰任何凭据材料），被拒且非 conditional（自动填充）时通知对话区给
     // 人话提示；全部尝试（含成功与 conditional）记 DiagnosticStore 同格式信封。
 
-    private static let webAuthnHandlerName = "mikaWebAuthn"
+    static let webAuthnHandlerName = "mikaWebAuthn"
 
-    private static let webAuthnProbeScript = """
+    static let webAuthnProbeScript = """
     (function(){
       if (window.__mikaWebAuthnProbe) return;
       window.__mikaWebAuthnProbe = true;
@@ -123,24 +159,30 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     })();
     """
 
-    private static func installWebAuthnProbe(into config: WKWebViewConfiguration, handler: WKScriptMessageHandler) {
-        let controller = config.userContentController
-        controller.add(handler, contentWorld: .page, name: webAuthnHandlerName)
-        controller.addUserScript(WKUserScript(source: webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-    }
-
-    /// 探针消息处理：全量记诊断；仅「模态调用被拒／同步抛错」才通知对话区提示
+    /// 探针消息处理（由 WebAuthnProbeMultiplexer 按 webView 路由调用）：
+    /// 全量记诊断；仅「模态调用被拒／同步抛错」才通知对话区提示
     /// （conditional 自动填充调用失败是常态静默路径，不打扰用户）。
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == Self.webAuthnHandlerName, let body = message.body as? [String: Any] else { return }
+        Self.processWebAuthnBody(body, fallbackHost: webView.url?.host)
+    }
+
+    /// 路由不到所属标签页的探针消息（标签页已关闭等极少数情形）：仍按
+    /// 消息自带的 href 记诊断并发通知，不因路由缺失丢掉降级提示。
+    static func handleUnroutedWebAuthnMessage(_ message: WKScriptMessage) {
+        guard message.name == webAuthnHandlerName, let body = message.body as? [String: Any] else { return }
+        processWebAuthnBody(body, fallbackHost: nil)
+    }
+
+    private static func processWebAuthnBody(_ body: [String: Any], fallbackHost: String?) {
         let event = body["event"] as? String ?? ""
         let kind = body["kind"] as? String ?? ""
         let rp = body["rp"] as? String ?? ""
         let conditional = body["conditional"] as? Bool ?? false
         let errorName = body["error"] as? String ?? ""
         let href = body["href"] as? String ?? ""
-        let host = URL(string: href)?.host ?? webView.url?.host ?? rp
-        Self.recordWebAuthnDiagnostic(event: event, kind: kind, rp: rp, host: host, conditional: conditional, errorName: errorName, href: href)
+        let host = URL(string: href)?.host ?? fallbackHost ?? rp
+        recordWebAuthnDiagnostic(event: event, kind: kind, rp: rp, host: host, conditional: conditional, errorName: errorName, href: href)
         guard event == "rejected" || event == "throw", !conditional else { return }
         NotificationCenter.default.post(name: .mikaWebAuthnBlocked, object: nil, userInfo: ["host": host, "kind": kind])
     }

@@ -38,3 +38,17 @@ jobs:
           APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: bundle exec fastlane beta
+      - name: Collect dSYMs
+        if: always()
+        run: |
+          mkdir -p dsym-out
+          find . -name "*.dSYM" -type d -print -exec cp -R {} dsym-out/ \; || true
+          ls -la dsym-out || true
+      - name: Upload dSYM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsym-${{ github.run_id }}
+          path: dsym-out
+          if-no-files-found: warn
+          retention-days: 90
