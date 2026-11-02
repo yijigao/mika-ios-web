@@ -183,6 +183,23 @@ struct SettingsView: View {
                 Text("任务执行时，网页内容及你的任务会发送至所选模型服务。切到后台时任务会驻停并保存进度，回到 App 自动接着跑；单步的页面小错误会自动重试，不再一步失败就停下。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("任务") }
+            Section {
+                if SkillStore.shared.skills.isEmpty {
+                    Text("暂无已安装的 playbook。").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(SkillStore.shared.skills) { skill in
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(skill.name).font(.callout).fontWeight(.medium)
+                                if skill.isBuiltin { Text("内置").font(.caption2).foregroundStyle(.secondary) }
+                            }
+                            Text(skill.description).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Text("playbook 是给模型的经验手册：任务对口时模型按需加载全文（加载会记在对话步流里），平时只占一行清单。playbook 只是经验提示，付款确认、密码手输等安全规则永远优先，不受 playbook 影响。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("Playbook（经验手册）") }
             if let diagnostics { Section { NavigationLink("崩溃报告") { CrashReportsView(store: diagnostics) } } }
         }.navigationTitle("设置")
     }

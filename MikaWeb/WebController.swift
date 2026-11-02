@@ -75,7 +75,14 @@ import Combine
     func goForward() { webView.goForward() }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { revision += 1; pageError = nil; update() }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { update() }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        update()
+        // Cookie 备份／回注（ADOPTION-TOP3 第 1 条）：真实导航完成即记访问（老化
+        // 时钟）并节流同步一次——用户手动建立的登录态及时入备份，ITP 静默清除
+        // 后的回注也借导航时机发生，不必等 agent 任务才恢复。
+        CookieBackup.shared.noteVisit(url: webView.url)
+        Task { @MainActor in await CookieBackup.shared.syncIfNeeded(store: WKWebsiteDataStore.default().httpCookieStore) }
+    }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
     /// 系统在内存压力下杀掉网页进程时，该标签页内容已丢失——按最后已知地址重载恢复
@@ -275,6 +282,13 @@ import Combine
     private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
     func state() async throws -> PageState {
         let tab = executionTab
+        if !agentWorkSuspended {
+            // 取快照前先同步一次 Cookie（60 秒节流，BACKGROUND-RESILIENCE 的驻停
+            // 期不做）：任务开始时若登录态已被 ITP 静默清除，先回注再让 agent 看
+            // 页面，避免它对着登录墙误判（ADOPTION-TOP3 第 1 条）。
+            CookieBackup.shared.noteVisit(url: tab.webView.url)
+            await CookieBackup.shared.syncIfNeeded(store: WKWebsiteDataStore.default().httpCookieStore)
+        }
         try await ready(in: tab)
         await waitForStability(in: tab)
         guard let json = try await evaluate(PageScript.extract, on: tab) as? String else { throw MikaError("无法抽取页面状态") }

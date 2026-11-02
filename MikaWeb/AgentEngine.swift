@@ -60,6 +60,16 @@ struct AgentStep: Identifiable {
     /// maxTransientStreak 次才判失败。任一整轮迭代走通、或切后台回前台后清零。
     private var transientStreak = 0
     static let maxTransientStreak = 3
+    /// 跨步循环检测（ADOPTION-TOP3 第 2 条）：与瞬时错误重试正交——那条治「单步
+    /// 失败」，这条治「多步都成功但原地打转」。pendingLoopHint 是给模型的分级
+    /// 提醒，跨入阈值时置位、随下一次模型调用注入提示后清除（提醒原文同时以
+    /// 「loop」步留在历史里，模型与用户都看得见）。
+    private var loopDetector = LoopDetector()
+    private var pendingLoopHint: String?
+    /// 本任务已加载的 playbook（ADOPTION-TOP3 第 3 条）：名称防重复加载，正文
+    /// 随每次模型调用注入任务上下文；playbook 只是提示层，安全判定不读它。
+    private var loadedSkillNames: [String] = []
+    private var loadedSkillBodies = ""
     /// 后台宽限断言（层 2）：进后台时申请、回前台／会话终结／到期时释放。
     private var backgroundGraceID: UIBackgroundTaskIdentifier = .invalid
     /// iOS 26 持续处理（层 3）的类型擦除盒：BGContinuedProcessingTask 只在 #available
@@ -92,6 +102,7 @@ struct AgentStep: Identifiable {
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         conversationTaskID = UUID()
         do { if let local { try web.loadLocal(local) } } catch { status = .failed(error.localizedDescription); return }
         // 任务绑定到开始时的当前标签页：全程作用于它，用户中途手动切页不影响任务（TABS-IMPL）
@@ -184,7 +195,11 @@ struct AgentStep: Identifiable {
                         let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                         let history = steps.map { "\($0.id). \($0.action): \($0.reason)" }.joined(separator: "\n")
                         let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
-                        let action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: "任务：\(goal)\n历史：\(history)\n用户补充问答：\(answers)\n当前页面 JSON：\(json)")
+                        var prompt = "任务：\(goal)\n历史：\(history)\n用户补充问答：\(answers)"
+                        if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
+                        if let hint = pendingLoopHint { prompt += "\n\(hint)"; pendingLoopHint = nil }
+                        prompt += "\n当前页面 JSON：\(json)"
+                        let action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
                         try await checkpoint(token)
                         if action.action == "done" {
                             record(action); status = .done(action.summary)
@@ -198,21 +213,53 @@ struct AgentStep: Identifiable {
                             status = .waitingManual(action.question); persistSnapshot()
                             return
                         }
-                        if action.action == "open_new_tab" {
+                        // 本轮的循环检测指纹（动作＋目标＋结果），分支内赋值、分支后统一裁决
+                        var loopFingerprint: String?
+                        if action.action == "use_skill" {
+                            // playbook 加载（ADOPTION-TOP3 第 3 条）：正文只在命中时注入
+                            // 本任务上下文，加载结果记入步流（用户可见）；加载不改变任何
+                            // 安全判定——确认／手输流程照旧走 runTargeted 的安全检查。
+                            let name = !action.skill.isEmpty ? action.skill : action.text
+                            record(action)
+                            let outcome: String
+                            if loadedSkillNames.contains(name) {
+                                appendStep("skill", "playbook《\(name)》已在本任务上下文中，未重复加载")
+                                outcome = "already-loaded"
+                            } else if let skill = SkillStore.shared.skill(named: name) {
+                                loadedSkillNames.append(skill.name)
+                                loadedSkillBodies += "\n【playbook：\(skill.name)】\n\(skill.body)"
+                                appendStep("skill", "已加载 playbook《\(skill.name)》：\(skill.description)")
+                                outcome = "loaded"
+                            } else {
+                                appendStep("skill", "没有名为「\(name)」的 playbook，已忽略；请按清单选择或直接执行任务")
+                                outcome = "missing"
+                            }
+                            loopFingerprint = LoopDetector.fingerprint(action: "use_skill", target: name, outcome: outcome)
+                        } else if action.action == "open_new_tab" {
                             // 在新标签页打开指定网址：新页成为当前页且执行绑定随之移过去，后续动作作用于新页
                             executionSerial += 1
                             _ = try web.openTabForExecution(urlString: action.url)
                             try await checkpoint(token)
                             record(action)
+                            loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.url, outcome: "ok")
                             try await Task.sleep(for: .milliseconds(500))
                         } else if ["click", "type"].contains(action.action) {
+                            // 循环检测的目标键：模型所见快照里目标元素的稳定描述（type 再
+                            // 掺输入文本指纹——同元素换内容不算同动作，同元素同内容才算）
+                            var targetKey = "index:\(action.index)"
+                            if action.index >= 0, action.index < page.elements.count {
+                                targetKey = ElementDescriptor(page.elements[action.index]).key
+                                if action.action == "type" { targetKey += "|\(LoopDetector.textFingerprint(action.text))" }
+                            }
                             // 目标获取走失效恢复（runTargeted）：页面在模型思考／执行期间重排时
                             // 按稳定描述重找重绑，不再把「目标已失效／已变化」直接判为任务失败。
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
                                 record(action)
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "executed")
                                 try await Task.sleep(for: .milliseconds(500))
                             case .strategySwitch:
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "strategy-switch")
                                 break // 策略切换已记入轨迹，下一轮带着新快照让模型重新判断
                             case .waiting:
                                 persistSnapshot()
@@ -224,7 +271,31 @@ struct AgentStep: Identifiable {
                             try await web.execute(action, expected: nil)
                             try await checkpoint(token)
                             record(action)
+                            let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : "\(Int(action.seconds))")
+                            loopFingerprint = LoopDetector.fingerprint(action: action.action, target: target, outcome: "ok")
                             try await Task.sleep(for: .milliseconds(500))
+                        }
+                        // 循环裁决（ADOPTION-TOP3 第 2 条）：警告只置位提醒、随下一次
+                        // 调用注入；熔断＝真正停驻（已暂停、可继续），与步数上限的
+                        // 停驻同形态——执行绑定与进度都保留，用户点继续即接着跑，
+                        // 该指纹的窗口记录已在检测器内清掉，不会一恢复就再熔断。
+                        if let loopFingerprint {
+                            let verdict = loopDetector.record(fingerprint: loopFingerprint)
+                            switch verdict.level {
+                            case .tripped:
+                                appendStep("loop", "循环熔断：同一动作已重复 \(verdict.count) 次且页面结果没有变化，已停下等你决定")
+                                status = .paused("检测到在同一处反复打转：同一动作重复了 \(verdict.count) 次、页面没有变化。点「继续」可让它再试，或换个说法重新开始")
+                                persistSnapshot()
+                                return
+                            case .severe:
+                                appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已要求模型必须换做法，再重复将自动停下")
+                                pendingLoopHint = "严重警告：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果始终没有变化。若下一步仍原样重复，任务将自动停下交用户决定。必须换一种做法：换目标、换入口、先滚动或等待让页面变化，或用 ask_user 向用户说明卡点。"
+                            case .warning:
+                                appendStep("loop", "循环提醒：同一动作已重复 \(verdict.count) 次且结果未变，下一步提示已要求模型换做法")
+                                pendingLoopHint = "注意：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果没有变化。下一步不要原样重复：换目标、换入口、先滚动或等待让页面变化，或用 ask_user 向用户说明卡点。"
+                            case .none:
+                                break
+                            }
                         }
                         // 一整轮迭代走通：瞬时连败清零
                         transientStreak = 0
@@ -606,6 +677,7 @@ struct AgentStep: Identifiable {
         var pendingURL: String?
         var waiting: WaitingDTO?
         var answersJSON: String // [QuestionAnswer] 的 JSON
+        var skillNames: [String]? // 已加载 playbook 名（正文恢复时按名从 SkillStore 重读；可选字段，旧快照无此键照常解码）
     }
     private static let snapshotKey = "agentSessionSnapshot.v1"
 
@@ -648,7 +720,8 @@ struct AgentStep: Identifiable {
                                        steps: steps.map { SessionSnapshot.StepDTO(id: $0.id, action: $0.action, reason: $0.reason) },
                                        statusKind: kind, statusText: text,
                                        pendingActionJSON: pendingJSON, pendingElement: pendingElement, pendingURL: pendingURL,
-                                       waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self))
+                                       waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
+                                       skillNames: loadedSkillNames)
         if let data = try? JSONEncoder().encode(snapshot) {
             UserDefaults.standard.set(data, forKey: Self.snapshotKey)
         }
@@ -670,6 +743,14 @@ struct AgentStep: Identifiable {
         stepSeq = snapshot.stepSeq
         steps = snapshot.steps.map { AgentStep(id: $0.id, action: $0.action, reason: $0.reason) }
         if let answers = try? JSONDecoder().decode([QuestionAnswer].self, from: Data(snapshot.answersJSON.utf8)) { answerContext = answers }
+        if let names = snapshot.skillNames {
+            for name in names {
+                if let skill = SkillStore.shared.skill(named: name), !loadedSkillNames.contains(skill.name) {
+                    loadedSkillNames.append(skill.name)
+                    loadedSkillBodies += "\n【playbook：\(skill.name)】\n\(skill.body)"
+                }
+            }
+        }
         if let waiting = snapshot.waiting {
             waitingInput = waiting.kind == "question" ? .question(id: waiting.id, text: waiting.text) : .manual(id: waiting.id, text: waiting.text)
         }
