@@ -82,7 +82,15 @@ Draft 的粘贴管线是其唯一「整段状态事务」入口：editOnPaste �
 
 ## 6. 交付证据
 
-（待 CI/Release 完成后填入：validate_project、CI run 号与日志双核对、构建号、Release run、dSYM 字节数。）
+- **分支与提交**：`feat/zhuanlan-fix2`（未合 main，未推送 main），提交 `2b9a97c`（paste 路线＋真 Draft.js 自检页＋案卷初版）与 `fdf9277`（按 Astra 咨询修正根因表述与 paste 分支注释；代码设计未变）。基线＝封面单分支 `feat/cover-gen-consent-click` tip `b389bf7`。
+- **validate_project**：`python3 scripts/validate_project.py` 全 PASS（资源断言 9 项，含新增 test-draft.html）。
+- **CI（最终 tip）**：Run **41506759409**（提交 `fdf9277`），conclusion=**success**；日志原文双核对：SwiftCompile 68 条、`** BUILD SUCCEEDED **` ×1、`BUILD FAILED` ×0；唯一 `error:` 行为既有 AppIntents 训练噪声（与既往各轮一致，非编译错误）；`WebController.swift` 在 x86_64 与 arm64 编译列中均有。
+- **CI（旧提交 run 的定性）**：Run **41504342224**（提交 `2b9a97c`）——job `build` 自 2026-11-02T18:50:30Z 起排队约 15 分钟未获 macOS runner，steps 为空（一步未跑），2026-11-02T19:05:32Z 以 job 结论 cancelled、run 结论 failure 结束。**定性：排队取消，既不算失败、也不算通过。** 补充核实：①我方无主动取消操作记录（无 `gh run cancel` 调用），取消触发方在 GitHub API 回读中无留痕，不归因；②新提交 `fdf9277` 虽于 18:56:02Z 已推送、使旧提交失去意义，但新提交的 CI run 41506759409 创建于 19:06:02Z、晚于旧 run 完成时间，故不表述为「被新 run 取代」；③最终 tip 的验收只认 41506759409，不以 41504342224 的 failure 字面作失败结论。
+- **Release**：Run **41507050664**（提交 `fdf9277`），conclusion=**success**，job `beta` 5m31s 全步骤 ✓（fastlane beta／Collect dSYMs／Upload dSYM artifact 均 ✓）；日志原文：`agvtool new-version -all 202611021908`、`Successfully uploaded the new binary to App Store Connect`。
+- **构建号**：**202611021908**（0.1.0，fastlane 现场置号）。
+- **dSYM artifact**：`dsym-41507050664`，**4,428,883 字节**，expired=false（`gh api …/actions/runs/41507050664/artifacts` 回读实存）。
+- **红线自查**：`git diff b389bf7 -- MikaWeb/MikaWebApp.swift MikaWeb/SafetyPolicy.swift` ＝ **0 行**；改动仅 WebController.swift（＋63/−5）、SkillStore.swift（＋2）、SelfTestView.swift（＋6）、Resources/test-draft.html（新增 88 行登记的压缩 bundle 页）、project.pbxproj（＋12/−2）、validate_project.py（＋2/−2）；无新第三方依赖（Draft/React 仅内嵌于自检页测试资源）；凭据不落盘；新增内容无「并行执行」字样。
+- **TESTFLIGHT-LOG.md**：本单提交随日志一并入库——此前未提交的 1830 ASC 亲验行（阿仁 2026-11-03 02:41 亲验记录，非本单代记）＋本构建 202611021908 条目；本构建的 ASC 状态写「**待阿仁亲验**」，未代记 VALID、未挂组。
 
 ## 7. 复测清单（给 Joey）
 

@@ -198,3 +198,12 @@
 - 内容（案卷 COVER-CONSENT-IMPL-2026-11-03.md）：COVER-CONSENT 封面自产＋弹窗点按升级——①缺陷 A（微信 AI 配图条款弹窗点同意无响应）：click 增加模态升级路径——点击前探针判定目标在 dialog/浮层内、或普通点击后存续探针发现同一弹窗仍在 → 升级为完整点按序列（scrollIntoView 后按中心坐标带间隔派发 pointerover→pointerdown→mousedown→focus→pointerup→mouseup→click，每步重跑安全词检查）；连败 2 次抛「弹窗点按无响应」，引擎自主/确认两条路径统一转对话内介入请用户亲手点按（诚实边界：合成事件 isTrusted=false 不可伪造，不静默循环、不假装已同意）；系统提示新增弹窗点按段。②缺陷 B（agent 不能自产封面）：新动作 generate_cover——Swift 原生渲染 900×383 PNG（三款版式 dark/light/green、标题自动换行/字号适配、空标题拒绝），落当前会话附件并登记「本任务生成」来源（复用 F1 的 SP-01 豁免判定），agent 再以 upload_file 设封面。③内置 playbook 新增 wechat-oa-editor：条款弹窗处理顺序、封面自产优先路径，及 02:15 续测补口径（封面主题/文案必须从文章标题与正文主题推导、不得按素材文件名猜主题、素材须按主题核对）。④自检十一（Tier A：三款渲染尺寸/非空白/登记与来源/SP-01 豁免＋合成页 test-modal 验证裸 click 关不掉、升级序列关得掉、顽固弹窗连败转介入判定；Tier B 见案卷复测清单）。
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线实查均 0 行）；无新第三方依赖；未合 main；文案无「并行执行」；凭据不落盘。
 - 待 Joey 按案卷复测清单 5 项验收（第一条＝公众号编辑器复刻 1655 现场：条款弹窗点同意＋generate_cover 按文章标题自产封面并设上＋草稿回读核对）；验收通过前不合 main。**取代 1655 成为唯一复测目标（待阿仁 ASC 亲验后生效）。**
+- ASC 亲验（阿仁，2026-11-03 02:41 CST）：构建 202611021830 processingState=VALID（build id 66217cfd-626f-48e2-98c3-8c26984a954e），已 POST 挂 Internal 组并回读确认居首——**正式取代 1655 成为唯一复测目标**。注：另有一构建 202611021815（被取消 Release 的先行上传，不含 02:15 playbook 补口径）VALID 但未挂组、不用。
+
+## 增补（2026-11-03）：ZHUANLAN-FIX2（知乎专栏输入同步第二轮修复），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611021908**（0.1.0）：分支 `feat/zhuanlan-fix2`（自封面单分支新开，未合 main），代码提交 `2b9a97c`＋`fdf9277`；CI Run 41506759409 success（日志双核对：68 条 SwiftCompile＋BUILD SUCCEEDED、FAILED 0）；Release Run 41507050664 success（agvtool 置号 202611021908、上传成功、dSYM artifact dsym-41507050664 4,428,883 字节）；ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 ZHUANLAN-FIX2-IMPL-2026-11-03.md）：第一轮四策略逐项根因（事件语义 vs Draft.js 编辑模型，Astra max 咨询＋源码复核修正）；新增 paste 粘贴事务路线（Draft 类编辑器阶梯首位：选区锚定首末 block 文本节点→selectionchange＋mouseup 同步内部选区→ClipboardEvent('paste')＋DataTransfer text/plain 与 text/html，构造退路含 defineProperty 与 mock）；自检十二（内嵌真 Draft.js 0.11.7 仿真页，本地落盘 test-draft.html，不运行时拉 CDN）；Tier A 实测：第一轮策略在真 Draft 页精确复现坏账（range 冻结 102、exec/events/chunks 坏账至末段），paste 锚定选区精确替换 102→54 且保存落定。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线实查均 0 行）；无新第三方依赖；文案无「并行执行」；凭据不落盘。
+- 过程注记：旧提交 2b9a97c 的 CI run 41504342224 排队约 15 分钟未获 macOS runner、steps=0 后被取消（job 结论 cancelled、run 结论 failure）；定性为排队取消，既不算失败也不算通过；非我方主动取消，取消触发方 API 无留痕；新提交 run 创建时间晚于旧 run 完成时间，故不表述为「被新 run 取代」；最终 tip 验收只认 41506759409。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷第 7 节复测（第一条＝102 字专栏文章改约 1000 字，回文章页核对已替换而非追加）；验收通过前不合 main。
