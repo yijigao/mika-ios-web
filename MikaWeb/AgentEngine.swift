@@ -258,11 +258,15 @@ struct AgentStep: Identifiable {
     }
 
     /// 失效类错误判定：元素被重渲染换掉／目标已变化这一类（区别于「按钮是灰的／没输入
-    /// 进去／敏感操作未经确认」等有具体口径的失败，那些不走重找、照原样上抛）。注入脚本
-    /// 抛出的同名 JS 错误若被 WebKit 带回错误信息，靠文案命中；带不回时该路径维持原
-    /// 行为（任务按原错误失败），不会误伤其他错误。
+    /// 进去／敏感操作未经确认」等有具体口径的失败，那些不走重找、照原样上抛）。两路命中：
+    /// ① 错误文案含「已失效／已变化」（Swift 侧抛出的同名错误、以及被 WebKit 带回原文的
+    /// JS 错误）；② WKErrorDomain 的 JavaScript 异常（code 4）——注入脚本的 guard 校验
+    /// 抛出的同名错误若未被带回原文，就以这个形态出现。把 ② 也算失效类的安全性：每次
+    /// 重找重试前都会对新目标重跑 Swift 侧 SafetyPolicy.check，JS 侧的安全类抛错（敏感
+    /// 操作／敏感字段）即使被误判为失效，重试也只会落到确认／手输流程，绝不绕过安全边界。
     private static func isStaleTargetError(_ error: Error) -> Bool {
         let ns = error as NSError
+        if ns.domain == "WKErrorDomain", ns.code == 4 { return true }
         let text = error.localizedDescription + "|" + String(describing: ns.userInfo)
         return text.contains("已失效") || text.contains("已变化")
     }
