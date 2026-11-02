@@ -1,10 +1,13 @@
 import SwiftUI
 
-// 浏览器坞（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md）：
+// 浏览器坞（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md；
+// 真 resize 修复 2026-11-02，案卷 FLOATING-UI-FIX2-2026-11-02.md）：
 // 对话全屏为根层，浏览器改为盖在其上的坞：expanded＝全屏，mini＝可拖动悬浮小窗。
 // 保活原则：坞内承载的 BrowserView（含 WebSurface／同一个 WKWebView 实例）自 App 启动
-// 常驻、永不卸载或重建；布局尺寸恒为展开态全尺寸，缩小只走 scaleEffect 渲染变换＋
-// 外层 visual frame＋offset 定位，不改 WKWebView 自身 frame，页面不重排、不重载。
+// 常驻、永不卸载或重建、永不重载。收放动画期间只走 scaleEffect 渲染变换过渡；状态落定
+// （弹簧结束约 480ms 后）把 BrowserView 的布局尺寸切到当前态的真实尺寸，WKWebView 随之
+// 按新视口响应式重排（内容随窗口适配）；resize 只发生在落定时点，拖动过程中不触发。
+// resize 前后保存／恢复页面滚动比例，页面导航（revision 变化）时不恢复。
 // 位置几何走「中心点＋缩放比」模型：动画由 mode 驱动（弹簧、可被新手势打断重定向），
 // 拖动位移走无动画事务，松手按预测落点（速度采样）弹簧吸附到最近的左／右边缘。
 
@@ -22,11 +25,13 @@ enum DockGeometry {
     /// 底部保留高度（pt）：对话输入区（输入框＋按钮行＋内边距）的大致高度，
     /// 小窗的停靠与拖动钳制不越过此线，避免长期遮住输入栏；键盘弹起时的短暂遮挡不在此列。
     static let bottomReserve: CGFloat = 148
-    /// 小窗目标宽度占容器宽度比例与绝对范围（pt）
-    static let miniWidthFraction: CGFloat = 0.44
-    static let miniWidthRange: ClosedRange<CGFloat> = 150...184
+    /// 小窗目标宽度占容器宽度比例与绝对范围（pt）。
+    /// FIX2：小窗态布局尺寸＝视觉尺寸（页面按此视口真实排版），旧 0.44／150–184 在真 resize 下
+    /// 视口过窄（约 173pt），故适度调大；整页等比形态不变，手感不合仍可一行调整。
+    static let miniWidthFraction: CGFloat = 0.50
+    static let miniWidthRange: ClosedRange<CGFloat> = 170...210
     /// 小窗高度上限占容器高度比例
-    static let miniMaxHeightFraction: CGFloat = 0.46
+    static let miniMaxHeightFraction: CGFloat = 0.50
 
     /// 小窗缩放比：按目标宽度换算，并受高度上限约束（等比缩放、整页可见）。
     static func miniScale(area: CGSize) -> CGFloat {
@@ -118,6 +123,11 @@ struct BrowserDockView: View {
     @State private var dragDelta: CGSize = .zero
     @State private var dragStartCenter: CGPoint?
     @State private var area: CGSize = .zero
+    /// 已落定的布局缩放比：BrowserView 按 area×layoutScale 布局；动画期间的视觉缩放比
+    /// （由 mode 决定）与它之商走 scaleEffect 过渡，落定后 layoutScale 追平视觉缩放比、
+    /// 渲染缩放归 1，页面按真实尺寸重排（FIX2 缺陷 1）。
+    @State private var layoutScale: CGFloat = 1
+    @State private var settleTask: Task<Void, Never>?
     @AppStorage("dock.miniCenterXFrac") private var storedXFrac: Double = -1
     @AppStorage("dock.miniCenterYFrac") private var storedYFrac: Double = -1
 
@@ -152,6 +162,10 @@ struct BrowserDockView: View {
             .onAppear {
                 area = size
                 restoreCenter(area: size)
+                // 冷启动无过渡动画：布局尺寸直接落到初始态（mini），起始页一次排好
+                if mode == .mini {
+                    layoutScale = DockGeometry.miniScale(area: size)
+                }
             }
             .onChange(of: size) { _, newSize in
                 area = newSize
@@ -159,6 +173,7 @@ struct BrowserDockView: View {
                 if let current = miniCenter {
                     miniCenter = DockGeometry.clampedCenter(current, area: newSize, scale: DockGeometry.miniScale(area: newSize))
                 }
+                scheduleSettle()
             }
         }
         // 仅忽略键盘安全区：键盘弹起时坞的坐标系不变，小窗保持屏幕坐标（允许被键盘短暂遮挡）
@@ -168,12 +183,15 @@ struct BrowserDockView: View {
         }
     }
 
-    /// 坞卡片：BrowserView 恒以展开尺寸布局，仅经 scaleEffect 做渲染缩放；
-    /// 外层 frame 取视觉尺寸承接圆角裁剪／描边／阴影与护盾、按钮等覆盖层。
+    /// 坞卡片：BrowserView 按已落定的 layoutScale 布局，动画期间以「视觉缩放比／layoutScale」
+    /// 的渲染缩放过渡；外层 frame 取视觉尺寸承接圆角裁剪／描边／阴影与护盾、按钮等覆盖层。
+    /// 落定后渲染缩放归 1、布局尺寸＝视觉尺寸，WKWebView 按该视口真实排版（FIX2）。
     private func dockCard(area size: CGSize, scale: CGFloat, visual: CGSize) -> some View {
-        BrowserView(controller: web)
-            .frame(width: size.width, height: size.height)
-            .scaleEffect(scale)
+        let layoutSize = CGSize(width: size.width * layoutScale, height: size.height * layoutScale)
+        let renderScale = layoutScale > 0 ? scale / layoutScale : scale
+        return BrowserView(controller: web)
+            .frame(width: layoutSize.width, height: layoutSize.height)
+            .scaleEffect(renderScale)
             .frame(width: visual.width, height: visual.height)
             .background(Color(.systemBackground))
             .clipShape(RoundedRectangle(cornerRadius: mode == .mini ? 14 : 0, style: .continuous))
@@ -241,10 +259,49 @@ struct BrowserDockView: View {
             dragDelta = .zero
             dragStartCenter = nil
         }
+        scheduleSettle()
     }
 
     private func collapse() {
         withAnimation(spring) { mode = .mini }
+        scheduleSettle()
+    }
+
+    /// 落定真 resize（FIX2 缺陷 1）：弹簧（0.42s）结束后，把布局尺寸切到当前态真实尺寸，
+    /// 页面随之按新视口重排。切换在禁用动画的事务里完成，切换前先存页面滚动比例、
+    /// 切换后恢复（页面在等待期间发生导航＝revision 变化则不恢复，避免跳错位置）。
+    /// 拖动不改 mode、不调本方法，故拖动过程中绝不 resize。
+    private func scheduleSettle() {
+        settleTask?.cancel()
+        let targetMode = mode
+        let revisionAtSchedule = web.revision
+        settleTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(480))
+            guard !Task.isCancelled, mode == targetMode, area.width > 0 else { return }
+            let target = targetMode == .expanded ? 1 : DockGeometry.miniScale(area: area)
+            guard abs(layoutScale - target) > 0.001 else { return }
+            let fraction = await scrollFraction()
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { layoutScale = target }
+            if web.revision == revisionAtSchedule, let fraction {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard mode == targetMode else { return }
+                await restoreScrollFraction(fraction)
+            }
+        }
+    }
+
+    /// 页面纵向滚动比例（0–1）；页面不可滚动时返回 nil（无需恢复）。
+    private func scrollFraction() async -> Double? {
+        guard let raw = try? await web.evaluate("(()=>{const h=document.documentElement.scrollHeight-window.innerHeight;if(h<=0)return -1;return Math.min(1,Math.max(0,window.scrollY/h));})()"),
+              let number = raw as? NSNumber else { return nil }
+        let value = number.doubleValue
+        return value >= 0 ? value : nil
+    }
+
+    private func restoreScrollFraction(_ fraction: Double) async {
+        _ = try? await web.evaluate("(()=>{const h=document.documentElement.scrollHeight-window.innerHeight;if(h>0)window.scrollTo(0,\(fraction)*h);return true;})()")
     }
 
     private func restoreCenter(area size: CGSize) {

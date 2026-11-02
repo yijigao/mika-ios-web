@@ -3,6 +3,8 @@ struct PageElement: Codable, Equatable {
     let index: Int
     let tag, type, text, placeholder, href, name, inputType, ariaLabel: String
     let sensitive: Bool
+    // 按钮「存在但被禁用（灰的）」与「不存在」是两种失败，须在快照层就分开（FIX2 案卷 d/c 项）
+    let disabled: Bool
 }
 struct PageState: Codable {
     let url, title, text: String
@@ -18,7 +20,7 @@ enum PageScript {
         e.setAttribute('data-mika-idx',index);
         const labelText=[...(e.labels||[])].map(l=>l.innerText||'').join(' ');
         const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.autocomplete,labelText].join(' ');
-        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||e.tagName.toLowerCase(),text:(e.innerText||labelText||e.getAttribute('aria-label')||'').slice(0,300),placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint)};
+        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||e.tagName.toLowerCase(),text:(e.innerText||labelText||e.getAttribute('aria-label')||'').slice(0,300),placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true'};
       });
       let text='',n;const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
       while((n=walker.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&visible(n.parentElement))text+=n.textContent.trim()+' ';}
