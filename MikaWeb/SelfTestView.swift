@@ -7,6 +7,7 @@ struct SelfTestView: View {
     @State private var resumeTestRunning = false
     @State private var outcomeTestRunning = false
     @State private var multiSessionTestRunning = false
+    @State private var coverModalTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -70,7 +71,35 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active)
             Text("自检十预期（F1）：两层。Tier A 不调用模型（本按钮）：临时会话里导入文本／图片／未知格式样本——文本抽取到摘录、图片生成缩放副本且尺寸受限、未知格式只存不假报已读；同名再导入不覆盖（两个稳定 ID 并存、第一份逐字节未变）；截图进 browser/；落盘索引回读与内存逐 ID 一致；注入段三态口径在场；SP-01 判定（本任务生成＝放行、其余＝须确认）与一次性确认绑定四连（错附件消费失败、正消费成功、同凭据二次消费失败、作废后消费失败）逐项核对，结论写进对话、临时会话删净。Tier B 真机人工（步骤见案卷 F1-IMPL 的复测清单）：先把一个文本文件导入附件中心，再开本地自检的上传页（浏览器打开 test-upload），发任务让它把该附件上传到页面——应先出 SP-01 确认卡（文件名与页面在卡上）、确认后进选文件卡、在系统选择器选定该文件、回读核验步显示页面已持有文件名；中途取消一次应能继续任务。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十一：封面自产与弹窗点按升级") {
+                guard !coverModalTestRunning else { return }
+                coverModalTestRunning = true
+                runCoverModalTest()
+                dismiss()
+            }.disabled(!engine.active || coverModalTestRunning)
+            Text("自检十一预期（COVER-CONSENT）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，弹窗核查会占用当前标签页打开本地合成页 test-modal）：①封面自产——三款版式渲染均为 900×383、像素非空白（多色）、空标题被拒；scratch 会话里生成并登记：落盘 attachments/、来源＝本任务生成、注入段带文件名与「本任务生成」字样、SP-01 判定对该附件放行，scratch 删净。②弹窗点按——合成页上方弹窗只认完整点按序列：裸 click 关不掉、引擎 click 经升级序列关掉并显示确认结果；下方无响应弹窗经升级连败 2 次后抛「弹窗点按无响应」，且转介入判定命中该错误、普通错误不误触发。结论逐条写进对话。Tier B 真机人工（步骤见案卷 COVER-CONSENT-IMPL 的复测清单）：公众号编辑器复刻 1655 现场——AI 配图条款弹窗点同意、generate_cover 自产封面并 upload_file 设上、存草稿后回读核对；顽固弹窗全链转对话内介入卡由用户亲手点按。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检十一 Tier A 编排（COVER-CONSENT）：封面自产程序化核查
+    /// （CoverGenerator.verifyCoverGeneration：三款渲染尺寸/非空白/登记与
+    /// 来源/SP-01 豁免判定）＋弹窗点按合成页真实驱动核查（WebController
+    /// .verifyModalClickEscalation：裸 click 关不掉、升级序列关得掉、
+    /// 无响应弹窗连败转判定）＋转介入判定双向核对，全部结论以「自检十一」
+    /// 条目写进对话。不调用模型、不起任务；要求引擎空闲（弹窗核查会占用
+    /// 当前标签页打开合成页）。Tier B（公众号真机全链）步骤与预期见上方
+    /// 说明与案卷复测清单，不在本按钮内自动执行。
+    private func runCoverModalTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检十一：开始——Tier A 封面自产与弹窗点按升级程序化核查（不调用模型）")
+        Task { @MainActor in
+            defer { coverModalTestRunning = false }
+            let lines = await engine.verifyCoverAndModal()
+            for line in lines { conversation.localFeedback("自检十一：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检十一结论（Tier A）：全部通过——封面渲染/登记/SP-01 豁免、弹窗升级点按、连败转介入判定均成立；Tier B 公众号真机全链按案卷清单人工复测" : "自检十一结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
+        }
     }
 
     /// 自检十 Tier A 编排（F1）：附件存储闭环的程序化核查（AttachmentStore

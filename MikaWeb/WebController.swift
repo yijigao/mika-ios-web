@@ -1222,16 +1222,165 @@ enum SiteMode: String {
         return (result as? String) ?? "missing"
     }
 
-    /// click 总流程：先按已校验元素点；禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后
-    /// 按钮常延迟启用或被重渲染替换）；最终按「是灰的／找不到」两种口径分别报错并留诊断快照。
+    // MARK: - 弹窗点按升级（COVER-CONSENT-IMPL-2026-11-03，缺陷 A）
+    //
+    // 真机现场（Joey 2026-11-03 01:46，构建 1655）：微信公众号编辑器的
+    // 「AI 配图」条款弹窗，agent 多次点「同意」弹窗始终不消失——这类网页
+    // 按钮只认完整的 pointer/mouse 事件序列（或只认真实点按），旧 click
+    // 只调 e.click() 派发一个简化 click 事件，网页不认账。升级路径：
+    // 目标位于弹窗内、或普通点击后观察到同一弹窗仍在 → 改用完整事件
+    // 序列（先滚动入视口，再按元素中心坐标带间隔依次派发 pointerover→
+    // pointerdown→mousedown→focus→pointerup→mouseup→click）；升级后弹窗
+    // 仍在、连败 2 次 → 抛 modalUnresponsivePrefix 错误，引擎据此转对话
+    // 内介入请用户亲手点按（见 AgentEngine.modalInterventionText）。
+    // 诚实边界：合成事件 isTrusted=false 无法伪造——过不去时如实转人工，
+    // 绝不静默循环、绝不假装已同意。
+
+    /// 弹窗点按无响应的错误前缀（引擎转介入判定的唯一依据，两处共用同一常量）。
+    static let modalUnresponsivePrefix = "弹窗点按无响应"
+
+    /// 弹窗判定 JS 片段（注入各探针脚本共用）：dialogOf(x) 沿祖先链找
+    /// 「对话框样容器」——dialog[open]／role=dialog|alertdialog／
+    /// aria-modal=true，或固定/绝对定位且类名/id 含 dialog|modal|popup|
+    /// layer|mask|overlay|alert|confirm 关键词的浮层。普通固定顶栏（无
+    /// 关键词）不算弹窗，避免把导航按钮误判成弹窗按钮；判定漏检的弹窗
+    /// 由点击后的存续探针兜底，误判方向偏保守（漏检退回旧行为）。
+    private static let dialogProbeJS = """
+    const visDlg=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+    const labDlg=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim();
+    const normDlg=s=>(s||'').replace(/\\s+/g,' ').trim().toLowerCase();
+    const dlgKey=/dialog|modal|popup|pop-|layer|mask|overlay|alert|confirm/;
+    const dialogOf=x=>{let n=x;while(n&&n!==document.body){if(n.tagName==='DIALOG'&&n.open)return n;const role=n.getAttribute?n.getAttribute('role'):null;if(role==='dialog'||role==='alertdialog')return n;if(n.getAttribute&&n.getAttribute('aria-modal')==='true')return n;const s=getComputedStyle(n);if(s.position==='fixed'||s.position==='absolute'){const cls=((typeof n.className==='string'?n.className:'')+' '+(n.id||'')).toLowerCase();if(dlgKey.test(cls))return n;}n=n.parentElement;}return null;};
+    """
+
+    /// 点击前探针（guard 校验与旧口径一致：目标已变化/已失效照旧 throw）：
+    /// 返回 'ready-dialog'（目标在弹窗内）／'ready-plain'／'disabled'。
+    private func probeClickContext(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws -> String {
+        let prefix = try guardScript(action: action, expected: expected, approved: approved)
+        let script = """
+        (()=>{\(prefix)
+        \(Self.dialogProbeJS)
+        if(e.disabled===true||e.getAttribute('aria-disabled')==='true')return 'disabled';
+        return dialogOf(e)?'ready-dialog':'ready-plain';})()
+        """
+        let result = try await evaluate(script, on: tab)
+        return (result as? String) ?? "ready-plain"
+    }
+
+    /// 弹窗存续探针：点击之后「同一弹窗仍在」是否成立——目标节点仍连接、
+    /// 可见且身处弹窗内，或任一可见弹窗容器里还有同文案的可见按钮。
+    private func dialogPersists(action: AgentAction, expected: PageElement, tab: BrowserTab) async -> Bool {
+        let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
+        guard let data = try? JSONSerialization.data(withJSONObject: ["index": action.index, "label": label]),
+              let json = String(data: data, encoding: .utf8) else { return false }
+        let script = """
+        (()=>{const a=\(json);
+        \(Self.dialogProbeJS)
+        const e=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        if(e&&e.isConnected&&visDlg(e)&&dialogOf(e))return 'still';
+        const want=normDlg(a.label);
+        if(want){
+          const all=document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],div,section');
+          for(const d of all){if(!visDlg(d)||dialogOf(d)!==d)continue;
+            const cands=d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');
+            for(const c of cands){if(visDlg(c)&&normDlg(labDlg(c))===want)return 'still';}}
+        }
+        return 'gone';})()
+        """
+        let result = try? await evaluate(script, on: tab)
+        return (result as? String) == "still"
+    }
+
+    /// 完整点按序列的单步派发：每步独立求值（步间由 Swift 侧睡出小间隔），
+    /// 每步都重定位节点并重跑安全词检查（与 click 同口径，未经确认的敏感
+    /// 操作照样 throw）；节点中途消失返回 'gone'（多半弹窗已被前序事件
+    /// 关掉，成败由随后的存续探针裁决）。坐标取当下包围盒中心（真实坐标）。
+    private func runPointerStep(step: String, action: AgentAction, approved: Bool, tab: BrowserTab) async throws -> String {
+        let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
+        let script = """
+        (()=>{const e=document.querySelector('[data-mika-idx="\(action.index)"]');
+        if(!e||!e.isConnected)return 'gone';
+        const l=[(e.innerText||e.value||''),(e.getAttribute('aria-label')||'')].join(' ').toLowerCase();
+        if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');
+        const step='\(step)';
+        if(step==='scroll'){e.scrollIntoView({block:'center'});return 'ok';}
+        if(step==='focus'){try{e.focus();}catch(_){}return 'ok';}
+        if(step==='click'){e.click();return 'ok';}
+        const r=e.getBoundingClientRect();const x=r.left+r.width/2,y=r.top+r.height/2;
+        const down=step==='pointerdown'||step==='mousedown';
+        const opts={bubbles:true,composed:true,cancelable:true,clientX:x,clientY:y,button:0,buttons:down?1:0,view:window};
+        if(step.indexOf('pointer')===0){
+          let ev=null;
+          try{ev=new PointerEvent(step,Object.assign({},opts,{pointerId:1,pointerType:'mouse',isPrimary:true}));}catch(_){ev=null;}
+          if(!ev){try{ev=new MouseEvent(step,opts);}catch(__){ev=null;}}
+          if(ev)e.dispatchEvent(ev);
+          return 'ok';
+        }
+        e.dispatchEvent(new MouseEvent(step,opts));
+        return 'ok';})()
+        """
+        let result = try await evaluate(script, on: tab)
+        return (result as? String) ?? "gone"
+    }
+
+    /// 完整点按序列：scrollIntoView 后按 spec 顺序派发，步间小间隔
+    /// （scroll 后 150ms 落位、其余步间 70ms——匀速即时派发整串时，部分
+    /// 网页的状态机会跟不上或直接忽略，分步带间隔更接近真实点按节奏）。
+    private func performPointerSequence(action: AgentAction, approved: Bool, tab: BrowserTab) async throws {
+        let steps = ["scroll", "pointerover", "pointerdown", "mousedown", "focus", "pointerup", "mouseup", "click"]
+        for (offset, step) in steps.enumerated() {
+            let status = try await runPointerStep(step: step, action: action, approved: approved, tab: tab)
+            if status == "gone" { return }
+            try await Task.sleep(for: .milliseconds(offset == 0 ? 150 : 70))
+        }
+    }
+
+    /// 弹窗升级点击：完整序列→等 600ms→存续探针；仍在则再来一轮；
+    /// 连败 2 次抛「弹窗点按无响应」转人工（不静默循环、不假装已同意）。
+    private func performModalClick(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
+        for _ in 1...2 {
+            try await performPointerSequence(action: action, approved: approved, tab: tab)
+            try await Task.sleep(for: .milliseconds(600))
+            if await dialogPersists(action: action, expected: expected, tab: tab) == false { return }
+        }
+        await captureFailureSnapshot(context: "弹窗点按无响应：\(action.reason)", tab: tab)
+        throw MikaError("\(Self.modalUnresponsivePrefix)：弹窗内的按钮经完整点按序列（真实坐标的 pointer/mouse 事件）两次尝试后仍未关闭——合成点按不是真实点按（isTrusted=false），这类网页只认真实点按")
+    }
+
+    /// click 总流程：先探针分流——目标在弹窗内直接走升级序列；普通目标
+    /// 先按已校验元素点（旧口径），点后若观察到同一弹窗仍在再升级；
+    /// 禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后按钮常
+    /// 延迟启用或被重渲染替换，重扫点击成功后同样过一遍存续探针）；
+    /// 最终按「是灰的／找不到」两种口径分别报错并留诊断快照。
     private func performClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
-        var status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: false, tab: tab)
-        if status == "clicked" { return }
+        let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
+        if probe == "ready-dialog" {
+            try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+            return
+        }
+        var status = probe
+        if probe == "ready-plain" {
+            let first = try await runClickScript(action: action, expected: expected, approved: approved, rescan: false, tab: tab)
+            status = first
+            if first == "clicked" {
+                try await Task.sleep(for: .milliseconds(500))
+                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                    try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+                }
+                return
+            }
+        }
         for _ in 0..<12 {
             try await Task.sleep(for: .milliseconds(300))
             status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
-            if status == "clicked" { return }
+            if status == "clicked" {
+                try await Task.sleep(for: .milliseconds(500))
+                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                    try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+                }
+                return
+            }
         }
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         if status == "disabled" {
@@ -1240,6 +1389,83 @@ enum SiteMode: String {
         }
         await captureFailureSnapshot(context: "click 目标缺失：\(action.reason)", tab: tab)
         throw MikaError("页面上找不到要点的按钮「\(label)」（可能还没渲染出来或已经关闭）")
+    }
+
+    // MARK: - 自检十一 Tier A（COVER-CONSENT）：弹窗点按升级的程序化核查
+    //
+    // 在本地合成页 test-modal 上全程真实驱动（不调用模型）：严格弹窗的
+    // 按钮只认完整 pointer 序列——先验裸 click() 关不掉（基线），再走
+    // execute 的 click 应经升级序列关掉它；顽固弹窗的按钮对任何事件都
+    // 不响应——execute 应在两次升级后抛「弹窗点按无响应」。核查在当前
+    // 标签页上进行（自检的既定形态，与自检九的标签操作同级），结束时
+    // 页面留在该测试页上。
+
+    private static func selfTestClickAction(index: Int) -> AgentAction? {
+        let json = "{\"action\":\"click\",\"index\":\(index),\"reason\":\"自检十一合成页验证\"}"
+        return try? JSONDecoder().decode(AgentAction.self, from: Data(json.utf8))
+    }
+
+    private func modalStateProbe(on tab: BrowserTab) async -> String {
+        let result = try? await evaluate("(()=>{return window.__modalState?window.__modalState():'{}';})()", on: tab)
+        return (result as? String) ?? ""
+    }
+
+    func verifyModalClickEscalation() async -> [String] {
+        var lines: [String] = []
+        let tab = activeTab
+        do { try tab.loadLocal("test-modal") } catch {
+            return ["✗ 合成测试页 test-modal 加载失败：\(error.localizedDescription)"]
+        }
+        try? await Task.sleep(for: .milliseconds(1000))
+        guard let page = try? await state() else { return ["✗ 合成测试页状态抽取失败"] }
+        guard let strict = page.elements.first(where: { $0.text.contains("同意并继续") }) else {
+            return ["✗ 合成测试页未找到严格弹窗的按钮（抽取异常）"]
+        }
+        // —— 基线：裸 click() 关不掉严格弹窗 ——
+        _ = try? await evaluate("(()=>{const e=document.querySelector('[data-mika-idx=\"\(strict.index)\"]');if(e)e.click();return 'done';})()", on: tab)
+        try? await Task.sleep(for: .milliseconds(400))
+        let afterPlain = await modalStateProbe(on: tab)
+        lines.append(afterPlain.contains("\"strictOpen\":true")
+            ? "✓ 基线：只派发 click 的裸点按关不掉严格弹窗（页面只认完整 pointer 序列，与微信弹窗现场同型）"
+            : "✗ 基线异常（裸点按后页面状态 \(afterPlain)）")
+        // —— 引擎 click：探针判定在弹窗内 → 升级序列 → 弹窗关闭 ——
+        // （点前重取状态：基线裸点按改过提示文案，序号以最新抽取为准）
+        guard let pageFresh = try? await state(), let strictFresh = pageFresh.elements.first(where: { $0.text.contains("同意并继续") }) else {
+            lines.append("✗ 合成测试页升级点击前状态重取失败")
+            return lines
+        }
+        guard let clickStrict = Self.selfTestClickAction(index: strictFresh.index) else {
+            lines.append("✗ 自检动作构造失败（严格弹窗）")
+            return lines
+        }
+        do {
+            try await execute(clickStrict, expected: strictFresh)
+            try? await Task.sleep(for: .milliseconds(400))
+            let after = await modalStateProbe(on: tab)
+            lines.append(after.contains("\"strictOpen\":false") && after.contains("\"strictResult\":\"block\"")
+                ? "✓ 升级点击：引擎 click 经完整 pointer 序列后严格弹窗已关闭、页面确认标记在场"
+                : "✗ 升级点击未关掉严格弹窗（页面状态 \(after)）")
+        } catch {
+            lines.append("✗ 升级点击抛错：\(error.localizedDescription)")
+        }
+        // —— 顽固弹窗：两次升级仍无响应 → 抛「弹窗点按无响应」——
+        guard let page2 = try? await state(), let stubborn = page2.elements.first(where: { $0.text.contains("同意（无响应）") }) else {
+            lines.append("✗ 合成测试页未找到顽固弹窗的按钮（抽取异常）")
+            return lines
+        }
+        guard let clickStubborn = Self.selfTestClickAction(index: stubborn.index) else {
+            lines.append("✗ 自检动作构造失败（顽固弹窗）")
+            return lines
+        }
+        do {
+            try await execute(clickStubborn, expected: stubborn)
+            lines.append("✗ 顽固弹窗：升级序列后没有抛错（无响应判定未触发）")
+        } catch {
+            lines.append((error as? MikaError)?.message.hasPrefix(Self.modalUnresponsivePrefix) == true
+                ? "✓ 顽固弹窗：完整序列连败 2 次后按口径抛出「\(Self.modalUnresponsivePrefix)」——引擎据此转对话内介入，不静默循环"
+                : "✗ 顽固弹窗抛错口径不对：\(error.localizedDescription)")
+        }
+        return lines
     }
 
     // MARK: - 失败留证（写入既有 DiagnosticStore 通道：同目录、同信封格式，诊断页可见）

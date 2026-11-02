@@ -743,6 +743,24 @@ struct AgentStep: Identifiable {
                                 persistSnapshot()
                                 return // waitingConfirm／waitingManual 已置位，等用户介入后另行 launch
                             }
+                        } else if action.action == "generate_cover" {
+                            // 封面自产（COVER-CONSENT，缺陷 B）：纯本机渲染，
+                            // 不经网页执行层——产物落当前会话附件（来源＝本
+                            // 任务生成），模型随后用 upload_file 引用其编号
+                            // 设封面。标题缺失/渲染失败都如实记步交模型处理，
+                            // 不判任务失败、更不假装已生成。
+                            record(action)
+                            let coverTitle = action.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if coverTitle.isEmpty {
+                                appendStep("cover", "generate_cover 缺标题：请在 text 里给出封面标题（通常用文章标题）后重试")
+                                loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: "", outcome: "missing-title")
+                            } else if let produced = CoverGenerator.generate(title: coverTitle, subtitle: action.subtitle, template: CoverTemplate.from(action.template), sessionID: runSessionID) {
+                                appendStep("cover", "已自产封面「\(produced.displayName)」并存入本会话附件（编号 \(String(produced.id.uuidString.prefix(8)))，版式 \(CoverTemplate.from(action.template).label)，900×383，来源＝本任务生成）；设为网页封面时用 upload_file 引用该编号（任务生成文件免 SP-01 确认卡），设没设上以页面回读为准")
+                                loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "ok")
+                            } else {
+                                appendStep("cover", "封面渲染失败（标题：\(coverTitle)），请如实汇报或调整标题后重试，不要假装已生成")
+                                loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "render-failed")
+                            }
                         } else if action.action == "upload_file" {
                             // 网页上传人在环（F1）：定位文件控件后停在等待侧
                             // （SP-01 确认卡→选文件→回读核验），用户在介入卡
@@ -877,6 +895,16 @@ struct AgentStep: Identifiable {
         } catch {
             guard token == generation else { throw CancellationError() }
             if error is CancellationError { throw error }
+            // 弹窗点按无响应（COVER-CONSENT）：已确认动作同样过不去时不判
+            // 失败、不把 pending 放回重确认（再确认只会再连败一次）——转
+            // 人工介入，用户亲手点完弹窗、点继续后由主循环按现状续跑。
+            if let intervention = Self.modalInterventionText(for: error) {
+                appendStep("click", "弹窗点按转人工：\(intervention)")
+                waitingInput = .manual(id: UUID(), text: intervention)
+                status = .waitingManual(intervention)
+                persistSnapshot()
+                return .halted
+            }
             guard let kind = Self.transientKind(of: error) else { throw error }
             writeTransientDiagnostic(kind: kind, error: error, streak: 0)
             pending = saved
@@ -1101,6 +1129,14 @@ struct AgentStep: Identifiable {
                 }
                 return .executed
             } catch {
+                // 弹窗点按无响应（COVER-CONSENT）：不是失效类错误，重找
+                // 重试只会再连败——直接转人工介入等用户亲手点弹窗。
+                if let intervention = Self.modalInterventionText(for: error) {
+                    appendStep("click", "弹窗点按转人工：\(intervention)")
+                    waitingInput = .manual(id: UUID(), text: intervention)
+                    status = .waitingManual(intervention)
+                    return .waiting
+                }
                 guard Self.isStaleTargetError(error), refinds < 2 else { throw error }
                 refinds += 1
                 snapshot = try await web.state()
@@ -1123,6 +1159,33 @@ struct AgentStep: Identifiable {
         }
         appendStep("strategy", "策略切换：目标「\(label)」在页面变化后无法按原描述重定位，已刷新快照，请按最新页面重新判断")
         return .strategySwitch
+    }
+
+    /// 弹窗点按无响应的转介入判定（COVER-CONSENT，缺陷 A）：执行层以
+    /// WebController.modalUnresponsivePrefix 抛错＝弹窗内的按钮经完整点按
+    /// 序列连败 2 次仍在——合成点按（isTrusted=false）过不去，只能请用户
+    /// 亲手点按。命中返回给用户的介入文案：runTargeted 自主路径与
+    /// runConfirmed 确认路径共用同一判定，两处都转 .manual 等待（用户点
+    /// 完弹窗后点继续，主循环按页面现状续跑），不判失败、不静默重试、
+    /// 不假装已同意。不命中返回 nil，错误照原有分类处理。
+    static func modalInterventionText(for error: Error) -> String? {
+        guard let mika = error as? MikaError, mika.message.hasPrefix(WebController.modalUnresponsivePrefix) else { return nil }
+        return "页面上的弹窗没有响应自动点按（已升级为完整点按序列仍无效——合成点按不是真实点按，部分网页只认真实点按）。请在网页上亲手点一下弹窗里的按钮（例如「同意」），弹窗关闭后点「继续」；在此之前不要声称已经取得同意。"
+    }
+
+    /// 自检十一 Tier A 组合（COVER-CONSENT）：封面自产核查（CoverGenerator
+    /// 程序化）＋弹窗点按核查（WebController 在合成页真实驱动）＋转介入
+    /// 判定函数双向核对（弹窗错误命中介入文案、普通错误不误触发）。
+    /// 不调用模型；要求引擎空闲（弹窗核查会占用当前标签页打开合成页）。
+    func verifyCoverAndModal() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检十一 Tier A 未执行（先等当前任务终结或停止）"] }
+        var lines = CoverGenerator.verifyCoverGeneration()
+        lines += await web.verifyModalClickEscalation()
+        let probe = MikaError("\(WebController.modalUnresponsivePrefix)：合成样本")
+        lines.append(Self.modalInterventionText(for: probe) != nil && Self.modalInterventionText(for: MikaError("其它错误样本")) == nil
+            ? "✓ 转介入判定：弹窗无响应错误命中介入文案、普通错误不误触发（自主/确认两条执行路径共用同一判定）"
+            : "✗ 转介入判定异常")
+        return lines
     }
 
     /// 失效类错误判定：元素被重渲染换掉／目标已变化这一类（区别于「按钮是灰的／没输入

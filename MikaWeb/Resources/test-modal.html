@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>弹窗点按自检页（test-modal）</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 24px; color: #222; }
+  .dlg { position: fixed; left: 50%; transform: translateX(-50%); width: 320px;
+         background: #fff; border: 1px solid #bbb; border-radius: 10px;
+         box-shadow: 0 8px 30px rgba(0,0,0,.25); padding: 16px; z-index: 10; }
+  #dlg-strict { top: 40px; }
+  #dlg-stubborn { bottom: 40px; }
+  .dlg h2 { font-size: 16px; margin: 0 0 8px; }
+  .dlg p { font-size: 13px; color: #555; }
+  .dlg button { font-size: 15px; padding: 8px 18px; border-radius: 6px;
+                border: 1px solid #07c160; background: #07c160; color: #fff; }
+  #strict-result { margin-top: 200px; font-size: 15px; color: #07c160; }
+  #strict-hint { color: #c00; min-height: 18px; }
+</style>
+</head>
+<body>
+<h1>弹窗点按自检页</h1>
+<p>自检十一 Tier A 专用合成页（非真实网页）：上方弹窗模拟「只认完整 pointer/mouse
+事件序列」的条款弹窗——只派发 click 关不掉，完整序列（pointerdown＋mousedown＋
+pointerup 后 click）才关闭；下方弹窗对任何事件都不响应，模拟合成点按过不去、
+必须转人工亲手点按的情形。</p>
+
+<div class="dlg" id="dlg-strict" role="dialog" aria-modal="true" aria-label="严格点按弹窗">
+  <h2>服务条款（严格）</h2>
+  <p>本弹窗只接受完整点按序列，单独的 click 事件不会关闭它。</p>
+  <button id="strict-agree" type="button">同意并继续</button>
+  <p id="strict-hint"></p>
+</div>
+
+<div id="strict-result" style="display:none">完整点按序列已确认，严格弹窗已关闭</div>
+
+<div class="dlg" id="dlg-stubborn" role="dialog" aria-modal="true" aria-label="无响应弹窗">
+  <h2>服务条款（无响应）</h2>
+  <p>本弹窗的按钮对任何合成事件都不响应，用来验证连败后转人工介入的判定。</p>
+  <button id="stubborn-agree" type="button">同意（无响应）</button>
+</div>
+
+<script>
+(function () {
+  var seq = [];
+  var btn = document.getElementById('strict-agree');
+  ['pointerover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(function (t) {
+    btn.addEventListener(t, function () { seq.push(t); });
+  });
+  btn.addEventListener('click', function () {
+    var ok = seq.indexOf('pointerdown') >= 0 && seq.indexOf('mousedown') >= 0 && seq.indexOf('pointerup') >= 0;
+    if (ok) {
+      document.getElementById('dlg-strict').style.display = 'none';
+      document.getElementById('strict-result').style.display = 'block';
+    } else {
+      document.getElementById('strict-hint').textContent = '未检测到完整点按序列，弹窗未关闭';
+    }
+    seq = [];
+  });
+  window.__modalState = function () {
+    var s = document.getElementById('dlg-strict');
+    var b = document.getElementById('dlg-stubborn');
+    var r = document.getElementById('strict-result');
+    return JSON.stringify({
+      strictOpen: s.style.display !== 'none',
+      stubbornOpen: b.style.display !== 'none',
+      strictResult: r.style.display
+    });
+  };
+})();
+</script>
+</body>
+</html>
