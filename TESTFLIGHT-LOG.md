@@ -107,3 +107,11 @@
 - 内容（案卷 FLOATING-UI-FIX2-2026-11-02.md）：①BrowserDockView 落定真 resize——动画期渲染缩放过渡、落定后布局尺寸切当前态真实尺寸让页面响应式重排，同 WKWebView 实例不重载/不重建、拖动不触发、滚动比例存恢复，小窗默认尺寸适度调大；②输入注入重写——contenteditable 主路径 execCommand insertText、备用 Range＋InputEvent，写后回读硬校验（文本＋发布按钮禁用状态），不过关换路径重试、再失败如实报「没输入进去」；click 加禁用判定与约 3.6 秒等待重扫，失败口径分「按钮是灰的／找不到／没输入进去」，失败留截图＋DOM 摘要到既有诊断通道；PageElement 新增 disabled。
 - 红线复核：MikaWebApp.swift 持有形态、WebSurface/AgentEngine/SafetyPolicy 零改动；安全边界与确认/手输语义不变。
 - 待 Joey 按案卷复测清单验收（知乎评论展开/小窗各测一次、适配重排与滚动位置）；验收通过前不合 main。
+
+## 增补（2026-11-02）：浏览器标签页（tabs）构建，新构建已上
+
+- 构建 **202611020614**（0.1.0），build id `9340c346-fc47-4fb6-a7dd-3aa6595e2e02`：分支 `feat/browser-tabs`（自 feat/floating-browser-dock 新开，未合 main/fix/feat），代码提交 `fbe0914`；CI Run 41398417501 success（Debug 模拟器真编译）、Release Run 41398566563 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 回读确认、Internal 组挂载 POST 204 且组内回读居首 [202611020614, 202611020602, 202611020540]；validate_project.py 全 PASS（19 个 Swift 源文件）。
+- 背景：Joey 13:57 指出浏览器没有 tab（单页、点链接顶掉当前页）。
+- 内容（案卷 TABS-IMPL-2026-11-02.md）：新增 BrowserTab（每标签独立 WKWebView＋历史/标题/加载状态，切换不重载、离屏强持有保活，网页进程被系统杀掉时按最后已知地址重载恢复）；WebController 改为标签管理器＋当前页门面（旧 API 逐个转发当前页，BrowserView/BrowserDockView 既有调用零改动）；展开态工具栏加标签按钮（带数量）＋标签总览（列表：标题＋网址＋关闭、任务中标记、新建标签；关当前页切相邻、关到最后一个自动补空白页永不归零）；target=_blank/window.open 经 WKUIDelegate createWebViewWith 新开标签承接，window.close 走同一关闭规则；agent 绑定任务开始时的标签页（state/execute 全程路由执行页，revision 判定换执行页口径，用户中途切页不影响任务，展开态有「任务在标签页…执行中」提示），新增 open_new_tab 动作（执行绑定随新页迁移）；agent 切标签不做（本轮边界）。
+- 红线复核：MikaWebApp.swift 持有形态与 SafetyPolicy 零改动（git diff 实查）；浮窗双态/真 resize 不变，小窗态只呈现当前页、无标签 UI；FIX2 注入脚本逐字保留、仅执行目标改为执行页。
+- 待 Joey 按案卷真机清单验收（多标签切换不重载、新窗口链接开新标签、关标签行为、agent 当前页干活＋中途切页、open_new_tab、小窗态只看当前页、闪退回归）；验收通过前不合 main。
