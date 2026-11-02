@@ -76,3 +76,12 @@
 
 - 构建 **202611020016**（0.1.0），build id `f9ab837d-fdd8-483f-aba6-ee731d91d192`：源码＝提交 `3165943` 逐字（分支 `baseline-1652-confirm` 直接指向该提交，diff 为空、tree hash 一致，零夹带）；CI Run 41366049681 success、Release Run 41366185979 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false、已挂 Internal 组（组内回读 [202611020016, 202611012002, 202611011920, 202611011811, 202611011747, 202611011652, 202611011544]）。构建号由 fastlane 现场生成、不落仓；版本串保持基线 0.1.0（改版本串会破坏零 diff，取舍理由见 BASELINE-CONFIRM-2026-11-02.md）。
 - 背景：v0.2.3 结构修复版 202611012002 真机复测仍闪退（Joey 2026-11-02 08:12），UI 结构组整体回退不足以止崩。本版按 CRASH-HUNT-2 预写退路验证「1652 基线在当前设备仍不崩」这一前提：Joey 装 202611020016 后点网页 5 次＋滚动、口头报崩/不崩即可（此版无崩溃报告导出）。基线不崩→逐个回加 1652 后增量（DiagnosticStore＋MetricKit、conversation store＋binds、AgentEngine 增量、App 装配）；基线也崩→增量整体脱罪、转查设备/iOS/页面环境。两种结论均非根因确认。
+
+## 增补（2026-11-02）：最小化阶梯 H0/H1/H2（1652 基线真机仍崩后），三构建已上
+
+- 背景：基线确认构建 202611020016（1652 逐字源码）Joey 真机复测**一点网页即崩**（08:30）——v0.2 以来全部增量整体脱罪，且「1652 点网页不崩」的前提从未被验证（1652 当时只验设置页与跑任务）。病因在所有构建共有的地基里，改走最小化阶梯自下而上分离层级。案卷 CRASH-LADDER-2026-11-02.md。
+- 代码：分支 `crash-ladder`（主线未动），新文件 Harness.swift + 分支专用 App 入口（仅装配 DiagnosticStore）；三构建间唯一源码差异为 Harness.step 常量（0/1/2，每阶 diff 经核验恰 1 行）。起始页三阶恒定＝WebController 的 loadHTMLString 本地页原文（脚本比对一致），WKWebView 配置与 UA 亦与原文一致；三阶均带 MetricKit 崩溃报告导出（右下角按钮）。
+- **H0＝202611020036**（提交 a3cabd2；CI 41367853188、Release 41368007955 均 success）：单屏裸 WKWebView representable，无导航栈/工具栏/地址栏/任何 store（诊断除外）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组。
+- **H1＝202611020045**（提交 a638f2d；CI 41368716521、Release 41368837716 均 success）：H0 + 1652 形态 chrome（NavigationStack+toolbar+地址栏行，按钮/地址栏直连裸 WKWebView；观察/代理装配不在本阶）。ASC 同上 VALID 并挂组。
+- **H2＝202611020054**（提交 2e9a33d；CI 41369501063、Release 41369619422 均 success）：换现行 BrowserView/WebSurface/WebController 地基原文 + 底部静态占位，无 conversation store 与 AgentEngine。ASC 同上 VALID 并挂组（组内共 10 构建，三阶梯居前三）。
+- Joey 规程：按 H0→H1→H2 顺序装、起始页上点网页 5 次＋滚动，在第一个崩的构建停下并从右下角按钮导出最新崩溃报告发回。判读只定位到层（H0 崩→裸挂载/起始页/系统层；H1 崩→chrome 层；H2 崩→地基本体层；全稳→地基之上装配组合另开一轮），不写根因确认。
