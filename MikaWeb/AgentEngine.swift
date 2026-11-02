@@ -236,6 +236,11 @@ struct AgentStep: Identifiable {
         launch(confirmed: saved)
     }
     private func launch(confirmed: (AgentAction, PageElement, String, Int)? = nil) {
+        // 恢复会话的现场重建在此兜底：resume() 已先行调用过则守卫使其为空操作；
+        // 等待确认恢复后直接走 confirm() 的路径不经 resume()，也要先把标签带回
+        // 中断页面，runConfirmed 的网址／目标复核才有机会在原页面上通过（复核
+        // 本身一字不改，页面对不上仍安全失败，绝不误执行）。
+        applyPendingTabRestore()
         generation = UUID(); let token = generation
         worker?.cancel(); status = .running; sessionActive = true; applyIdleTimerPolicy()
         transientStreak = 0
