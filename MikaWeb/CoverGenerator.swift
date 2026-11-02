@@ -80,7 +80,7 @@ private static let margin: CGFloat = 56
 static func renderPNG(title: String, subtitle: String, template: CoverTemplate) -> Data? {
 let title = title.trimmingCharacters(in:.whitespacesAndNewlines)
 let subtitle = subtitle.trimmingCharacters(in:.whitespacesAndNewlines)
-guard!title.isEmpty else { return nil}
+guard !title.isEmpty else { return nil}
 let palette = template.palette
 let format = UIGraphicsImageRendererFormat()
 format.scale = 1
@@ -109,7 +109,7 @@ circle(CGPoint(x: 58, y: 366), 66, 0.07)
 
 let textWidth = canvasSize.width - margin * 2
 let paragraph = NSMutableParagraphStyle()
-paragraph.alignment =.left
+paragraph.alignment = .left
 paragraph.lineSpacing = 6
 let titleFont = fittedTitleFont(title: title, maxWidth: textWidth, hasSubtitle:!subtitle.isEmpty)
 let titleAttr = NSAttributedString(string: title, attributes: [
@@ -119,7 +119,7 @@ with: CGSize(width: textWidth, height:.greatestFiniteMagnitude),
 options: [.usesLineFragmentOrigin,.usesFontLeading], context: nil).height)
 var subtitleAttr: NSAttributedString?
 var subtitleHeight: CGFloat = 0
-if!subtitle.isEmpty {
+if !subtitle.isEmpty {
 let attr = NSAttributedString(string: subtitle, attributes: [
 .font: UIFont.systemFont(ofSize: 28, weight:.regular),
 .foregroundColor: palette.subtitle,.paragraphStyle: paragraph])
@@ -129,7 +129,7 @@ options: [.usesLineFragmentOrigin,.usesFontLeading], context: nil).height)
 subtitleAttr = attr
 }
 let barHeight: CGFloat = 10, barGap: CGFloat = 26, subGap: CGFloat = 16
-let total = barHeight + barGap + titleHeight + (subtitleAttr == nil? 0: subGap + subtitleHeight)
+let total = barHeight + barGap + titleHeight + (subtitleAttr == nil ? 0 : subGap + subtitleHeight)
 var y = max(24, (canvasSize.height - total) / 2)
 palette.accent.setFill()
 UIBezierPath(roundedRect: CGRect(x: margin, y: y, width: 76, height: barHeight),
@@ -150,7 +150,7 @@ return image.pngData()
 /// 超文案区上限（有副标题 176pt、无副标题 216pt）放下；30pt 兜底
 /// （超长标题在 30pt 下仍超限时由绘制区自然裁切，不无限降级到不可读）。
 private static func fittedTitleFont(title: String, maxWidth: CGFloat, hasSubtitle: Bool) -> UIFont {
-let maxHeight: CGFloat = hasSubtitle? 176: 216
+let maxHeight: CGFloat = hasSubtitle ? 176 : 216
 var size: CGFloat = 60
 while size > 30 {
 let font = UIFont.systemFont(ofSize: size, weight:.bold)
@@ -216,15 +216,15 @@ _ = store.deleteSession(id: scratch.id)
 let record = generate(title: "自检十一封面", subtitle: "来源标记核查", template:.wechatGreen, sessionID: scratch.id)
 let fm = FileManager.default
 let registered = record.map {
-$0.origin ==.taskGenerated && $0.readState ==.imageScaled
+$0.origin == .taskGenerated && $0.readState == .imageScaled
 && fm.fileExists(atPath: AttachmentStore.shared.fileURL(for: $0).path)
 && AttachmentStore.shared.fileURL(for: $0).path.contains("/attachments/")
-}?? false
+} ?? false
 lines.append(registered
 ? "✓ 生成登记：封面落进会话 attachments/ 目录、来源标记＝本任务生成、图片缩放副本就绪（附件中心按来源徽标展示）"
-: "✗ 生成登记异常（记录 \(record == nil? "缺失": "在位")）")
+: "✗ 生成登记异常（记录 \(record == nil ? "缺失" : "在位")）")
 if let record {
-lines.append(SafetyPolicy.uploadDecision(isTaskGenerated: record.origin ==.taskGenerated) ==.allow
+lines.append(SafetyPolicy.uploadDecision(isTaskGenerated: record.origin == .taskGenerated) == .allow
 ? "✓ SP-01 豁免判定：本任务生成的封面走.allow（不弹 SP-01 新卡；原有对外发送与敏感信息边界不变）"
 : "✗ SP-01 豁免判定异常")
 let block = AttachmentStore.shared.promptBlock(for: scratch.id)
