@@ -85,3 +85,10 @@
 - **H1＝202611020045**（提交 a638f2d；CI 41368716521、Release 41368837716 均 success）：H0 + 1652 形态 chrome（NavigationStack+toolbar+地址栏行，按钮/地址栏直连裸 WKWebView；观察/代理装配不在本阶）。ASC 同上 VALID 并挂组。
 - **H2＝202611020054**（提交 2e9a33d；CI 41369501063、Release 41369619422 均 success）：换现行 BrowserView/WebSurface/WebController 地基原文 + 底部静态占位，无 conversation store 与 AgentEngine。ASC 同上 VALID 并挂组（组内共 10 构建，三阶梯居前三）。
 - Joey 规程：按 H0→H1→H2 顺序装、起始页上点网页 5 次＋滚动，在第一个崩的构建停下并从右下角按钮导出最新崩溃报告发回。判读只定位到层（H0 崩→裸挂载/起始页/系统层；H1 崩→chrome 层；H2 崩→地基本体层；全稳→地基之上装配组合另开一轮），不写根因确认。
+
+## 增补（2026-11-02）：生产版持有形态修复构建已上（待真机验收）
+
+- 背景：第四轮阶梯判读落行——X-1（202611020431，生产对象图＋持有者形态）Joey 真机稳、X-2（202611020437，同内容＋App 直接 @StateObject 逐个持有形态）12:45 崩、崩溃报告在案（案卷 CRASH-LADDER-4、CRASH-X2-EVIDENCE）。定案触发条件＝「App struct 里直接以多个 @StateObject 逐个持有对象图」这一形态（机制未分离，不声称根因）。
+- 修复：分支 `fix/app-holding-form`（自 main 新开，未合 main），提交 `4419fbd`，全仓仅 `MikaWeb/MikaWebApp.swift` 一文件（+33/−15）：生产 App 原 5 个 @StateObject（web/settings/engine/conversation/diagnostics）全部移入新增持有者 `AppObjectGraph`（@MainActor ObservableObject，App init 内同步构造、构造顺序与 bind/start 副作用与原 init 逐字等价），App 只以一个 @StateObject 持有该持有者，五件经原参数通道下传 ContentView。WebSurface/WebController/AgentEngine/UI/模型/Keychain/网络全部零改动；validate_project.py 全 PASS。修复记录 FIX-PROD-HOLDING-FORM-2026-11-02.md（含 @StateObject 枚举附注与 X-1 对应关系表）。
+- **生产修复构建＝202611020450**（build id `791d0160-70cd-4b90-a77e-e902ba27ce9b`）：CI Run 41390473187 success → Release Run 41390586904 success（日志实查真上传）；ASC 回读 processingState=VALID、expired=false、usesNonExemptEncryption 已 PATCH=false、Internal 组挂载 POST 204 且组内回读居首。
+- 待 Joey 真机验收：TestFlight 更新到 202611020450 后产品级复测（点网页多次＋滚动、跑低风险任务、作答续跑、确认卡片、模型名防呆）；验收通过前不合 main。
