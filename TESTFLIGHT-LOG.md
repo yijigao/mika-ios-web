@@ -100,3 +100,11 @@
 - **A-2＝构建 202611020307**（提交 9f90663；CI 41381189491、Release 41381285067 均 success）：只加 A2（App 级创建并持有 SettingsStore，不消费、不接业务），根视图逐字 H2。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
 - **A-3＝构建 202611020316**（角标 A-2+3；提交 ea07eec；CI 41382027953、Release 41382133911 均 success）：耦合阶 A2+A3（App 级 SettingsStore＋AgentEngine 只建不执行；engine 的 web 参数仅为满足 init 签名的依赖实例，不下传视图；BrowserView 的 controller 仍根视图自持）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
 - Joey 规程：按 A-1 → A-2 → A-3 顺序装（构建号 202611020259 → 202611020307 → 202611020316；最新为 A-3，测 A-1/A-2 须从「以前的构建」手动选号），起始页点网页 5 次＋滚动，首崩即停并从右下角圆钮导出崩溃报告。判读：A-1 崩→A1；A-2 崩→A2；A-3 崩→{A3/engine-web 依赖持有/耦合组合}；全稳→件间交互，下一轮出组合阶。
+
+## 增补（2026-11-02）：最小化阶梯第四轮 X-1/X-2（交互验证：共享实例接线／持有形态），两构建已上
+
+- 背景：第三轮单件阶 A-1（202611020259）、A-2（202611020307）、A-3（202611020316）经 Joey 2026-11-02 12:28 真机实测**全稳**——A 组单件全脱罪，疑为件间交互。A-3 与生产/H3a 的关键未验差别有二：①生产/H3a 里 AgentEngine 用视图正在消费的**同一个** WebController 实例构造，A-3 里是独立替身实例；②H3a 为 App 直接三件 @StateObject 持有，第三轮改走 HarnessObjectGraph 持有者间接层。本轮两阶即按此二候选设计，案卷 CRASH-LADDER-4-2026-11-02.md。
+- 代码：分支 crash-ladder-2 续；两阶均以 H2 形态为根视图（BrowserView 消费下传 web＋120pt 占位、无 B 组布局）；validate_project.py 两阶全 PASS；主线未动。
+- **X-1＝构建 202611020431**（提交 abaf077；CI 41388910697、Release 41388922547 均 success）：持有者形态复刻生产对象图——web＋settings＋engine 全建，engine 用同一个 web 实例构造（只建不执行），根视图只消费 web。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- **X-2＝构建 202611020437**（提交 b170254；CI 41389435339、Release 41389446381 均 success）：与 X-1 内容逐字相同，唯一差异是持有形态换回 H3a 原样（App 直接 @StateObject 持有 web/settings/engine，不用持有者层）——即 H3a 复刻锚点。两阶 git diff 实查恰为 step 一行＋MikaWebApp.swift 持有形态。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- Joey 规程：按 X-1 → X-2 顺序装（构建号 202611020431 → 202611020437；最新为 X-2，测 X-1 须从「以前的构建」手动选号），起始页点网页 5 次＋滚动，首崩即停并从右下角圆钮导出崩溃报告。判读：X-1 崩→触发区在 engine 与共享 controller 的接线（下一轮拆 engine init 内部订阅）；X-1 稳 X-2 崩→持有形态本身是触发条件；两台全稳→先逐项列 H3a 与 X-2 的残余差别查包装等价性。

@@ -36,4 +36,20 @@
 
 ## 3. 构建与 ASC 回读证据
 
-（交付后回填：两阶的提交号、两阶 git diff 实查结果、CI/Release Run 号、build id、ASC 回读 VALID 与 Internal 组挂载证据。交付口径沿第三轮教训：**只认 Release Run success＋ASC 回读**，CI 仅作编译参考。）
+分支 `crash-ladder-2`（续第三轮；main 未动）；validate_project.py 两阶均全 PASS。以下两阶均经 ASC API 逐台回读：processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false（组内回读确认）、Internal 组（6a722377-d7f3-4c76-876f-4c35e193e0e4）挂载 POST 204 且组内回读居首。
+
+### 阶 X-1（step=10）— 构建 202611020431
+
+- 代码提交：`abaf077`（Harness.swift：step 9→10、角标 X-1/X-2、持有者构造表 step=10 全图＋共享实例、根视图 step 10/11 接 HarnessH3aView 分支；MikaWebApp.swift 未动；本案卷初版同批入仓）。
+- CI Run **41388910697** success → Release Run **41388922547** success。
+- build id `2ebb3f22-1f95-4e7e-95fc-c93b06c5dc05`；ASC 回读 VALID、expired=false、合规 PATCH=false 后组内回读确认；Internal 组挂载 204，组内回读居首。
+
+### 阶 X-2（step=11）— 构建 202611020437
+
+- 代码提交：`b170254`。**两阶 git diff 实查（abaf077..b170254）恰为两处**：Harness.swift 的 `Harness.step` 10→11 一行；MikaWebApp.swift 的持有形态（持有者 @StateObject graph → App 直接三件 @StateObject，含文件头注释）。对象图内容、构造顺序（web→settings→engine）、构造时机（App init）、engine 的共享实例接线、diagnostics 处理（init 构造＋start()）两阶逐字等价，无其他文件差异。
+- CI Run **41389435339** success → Release Run **41389446381** success。
+- build id `7cc5bc2a-2ef8-45ce-bedf-1866ba578436`；ASC 回读 VALID、expired=false、合规 PATCH=false 后组内回读确认；Internal 组挂载 204，组内回读为 [202611020437, 202611020431, 202611020316, 202611020307]，X-2 居首。
+
+- 构建号由 fastlane 现场生成（UTC 时间戳 %Y%m%d%H%M），不落仓；两阶构建号分别为 202611020431 / 202611020437。
+
+待主聊转交 Joey：按 §2 规程按 X-1 → X-2 顺序装（TestFlight 内按构建号选装：X-1 为 202611020431、X-2 为 202611020437；最新构建为 X-2，测 X-1 时须从「以前的构建」里手动选号），首崩即停并导出崩溃报告。
