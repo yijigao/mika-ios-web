@@ -4,6 +4,10 @@ struct AgentChatView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
     @ObservedObject var conversation: AgentConversationStore
+    /// 对话输入框焦点：由 ContentView 持有并下传（浏览器坞展开盖住对话层时需代为收起，见
+    /// CHAT-KEYBOARD-FIX-2026-11-02.md）。此前本视图无任何焦点管理：发送不清焦点、
+    /// 列表不收键盘、点按无收起手势，键盘一旦唤起便无路可收。
+    var inputFocus: FocusState<Bool>.Binding
     @State private var followLatest = true
     private var questionID: UUID? {
         guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
@@ -42,6 +46,11 @@ struct AgentChatView: View {
                 }
                 // 对话层改为全屏常驻根层（悬浮窗改造）：消息区不再受并屏时代的 240pt 上限约束
                 .frame(maxHeight: .infinity)
+                // 收键盘（对齐主流聊天 App）：拖动消息列表时键盘交互式跟随收起；
+                // 点按消息区（空白或气泡皆可）顺带收起——用 simultaneousGesture 只做
+                // 收键盘这一件事，不拦截 ConfirmCard 按钮等内容本身的点击。
+                .scrollDismissesKeyboard(.interactively)
+                .simultaneousGesture(TapGesture().onEnded { inputFocus.wrappedValue = false })
                 .onChange(of: conversation.entries.count) { _, _ in
                     if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
@@ -49,6 +58,7 @@ struct AgentChatView: View {
             HStack(alignment: .bottom, spacing: 6) {
                 TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
                     .lineLimit(1...3).textFieldStyle(.roundedBorder)
+                    .focused(inputFocus)
                 Button(questionID != nil ? "回答并继续" : (isNewTask && isPaused ? "新任务" : "发送")) { send() }
                     .disabled(!canSend).buttonStyle(.borderedProminent)
             }
@@ -78,15 +88,26 @@ struct AgentChatView: View {
         let text = conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines)
         if let questionID {
             switch engine.submitAnswer(text, requestID: questionID) {
-            case .accepted: conversation.acceptedAnswer(text); conversation.draft = ""; followLatest = true
+            case .accepted:
+                conversation.acceptedAnswer(text); conversation.draft = ""; followLatest = true
+                dismissKeyboard()
             case .rejected(let reason): conversation.localFeedback(reason)
             }
         } else if isNewTask {
             let previous = engine.conversationTaskID
             engine.taskText = text
             engine.start()
-            if engine.conversationTaskID != previous { conversation.draft = ""; followLatest = true }
+            if engine.conversationTaskID != previous {
+                conversation.draft = ""; followLatest = true
+                dismissKeyboard()
+            }
         }
+    }
+    /// 发送成功后收起键盘：仅在两条真成功路径调用（作答被接受／新任务真启动）——
+    /// 被拒或启动失败时保留焦点与草稿，方便用户改完重发。draft 已先清空，多行输入框
+    /// 的高度由内容驱动，随之自动复位到单行收起态。
+    private func dismissKeyboard() {
+        inputFocus.wrappedValue = false
     }
     private func entryView(_ entry: ChatEntry) -> some View {
         let user = entry.kind == .userTask || entry.kind == .userAnswer

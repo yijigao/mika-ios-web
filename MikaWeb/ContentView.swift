@@ -6,6 +6,10 @@ struct ContentView: View {
     @ObservedObject var conversation: AgentConversationStore
     @ObservedObject var diagnostics: DiagnosticStore
     @ObservedObject private var pending = PendingTaskStore.shared
+    /// 对话输入框焦点（键盘修复，案卷 CHAT-KEYBOARD-FIX-2026-11-02.md）：在此持有，
+    /// 绑定下传对话层 TextField，普通 Binding 再下传浏览器坞——坞展开盖住对话层时
+    /// 由坞代为收起，避免键盘悬浮在全屏浏览器上且用户无从收起。
+    @FocusState private var chatInputFocused: Bool
     var body: some View {
         NavigationStack {
             // 布局层（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md）：
@@ -13,8 +17,8 @@ struct ContentView: View {
             // 坞内 BrowserView 与 WKWebView 实例常驻保活，见 BrowserDockView.swift）。
             // App 级对象图与持有形态（MikaWebApp.swift）不变，五件仍经原参数通道下传。
             ZStack {
-                AgentChatView(engine: engine, settings: settings, conversation: conversation)
-                BrowserDockView(web: web, engine: engine)
+                AgentChatView(engine: engine, settings: settings, conversation: conversation, inputFocus: $chatInputFocused)
+                BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused)
             }
             .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
             .toolbar {

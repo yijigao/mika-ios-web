@@ -137,6 +137,12 @@ struct MiniShieldView: View {
 struct BrowserDockView: View {
     @ObservedObject var web: WebController
     @ObservedObject var engine: AgentEngine
+    /// 对话输入框焦点（由 ContentView 下传）：坞展开即全屏盖住对话层，若对话输入框
+    /// 此前持有焦点，键盘（系统级浮层）会继续悬浮在浏览器上方、而对话层不可达，
+    /// 用户无从收起——故在切到 expanded 的瞬间代为收起（见 mode 的 onChange）。
+    /// 仅此一个写入点；mini 态不动它（边看小窗边在对话打字是常态路径）。
+    /// 网页内的手输焦点是 WKWebView 自己的 first responder，与本状态无关、不受影响。
+    var chatInputFocus: Binding<Bool>
 
     @State private var mode: DockMode = .mini
     @State private var miniCenter: CGPoint?
@@ -202,6 +208,12 @@ struct BrowserDockView: View {
         }
         // 仅忽略键盘安全区：键盘弹起时坞的坐标系不变，小窗保持屏幕坐标（允许被键盘短暂遮挡）
         .ignoresSafeArea(.keyboard)
+        .onChange(of: mode) { _, newMode in
+            // 展开＝对话层被全屏盖住：顺手收起对话键盘（触发来源不限：护盾点按、
+            // 任务自动展开、介入自动展开皆走此一条）。expanded 期间用户与网页的
+            // 交互走 WKWebView 自己的焦点，不受影响。
+            if newMode == .expanded { chatInputFocus.wrappedValue = false }
+        }
         .onChange(of: needsIntervention) { _, needed in
             if needed, mode != .expanded { expand() }
         }
