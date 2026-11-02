@@ -24,7 +24,7 @@ extension Notification.Name {
 @MainActor private final class WebAuthnProbeMultiplexer: NSObject, WKScriptMessageHandler {
     static let shared = WebAuthnProbeMultiplexer()
     private var equippedControllers = NSHashTable<WKUserContentController>.weakObjects()
-    private var tabsByWebView: [ObjectIdentifier: WeakTabBox] = []
+    private var tabsByWebView: [ObjectIdentifier: WeakTabBox] = [:]
     private final class WeakTabBox {
         weak var tab: BrowserTab?
         init(_ tab: BrowserTab) { self.tab = tab }
