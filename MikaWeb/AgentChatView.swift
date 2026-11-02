@@ -1,22 +1,21 @@
 import SwiftUI
 
+/// 对话消息层（层级见 ContentView 与 CHAT-KEYBOARD-FIX-2026-11-02.md 问题 3）：
+/// ZStack 自下而上为 消息层 ＜ 浏览器坞 ＜ 聊天输入栏。输入栏（输入框＋发送键）已
+/// 拆出为独立的 ChatInputBar 放在最上层，坞在任何形态下都盖不住它；本层只剩标题、
+/// 消息列表与停止／继续按钮行，底部留出实测的输入栏高度（bottomInset），保证最后
+/// 一条消息与按钮行不被输入栏压住。
 struct AgentChatView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
     @ObservedObject var conversation: AgentConversationStore
-    /// 对话输入框焦点：由 ContentView 持有并下传（浏览器坞展开盖住对话层时需代为收起，见
-    /// CHAT-KEYBOARD-FIX-2026-11-02.md）。此前本视图无任何焦点管理：发送不清焦点、
-    /// 列表不收键盘、点按无收起手势，键盘一旦唤起便无路可收。
+    /// 对话输入框焦点：由 ContentView 持有并下传（浏览器坞展开盖住对话层时需代为收起）。
+    /// 焦点本体绑在 ChatInputBar 的 TextField 上；本层只用它做点按收键盘。
     var inputFocus: FocusState<Bool>.Binding
-    @State private var followLatest = true
-    private var questionID: UUID? {
-        guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
-        switch engine.status { case .waitingManual, .paused: return id; default: return nil }
-    }
-    private var isNewTask: Bool {
-        switch engine.status { case .idle, .done, .failed: return true; case .paused: return questionID == nil; default: return false }
-    }
-    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil) }
+    /// 跟随最新消息：发送成功后由 ChatInputBar 置真，本层据此滚动到底部。
+    var followLatest: Binding<Bool>
+    /// 底部避让：输入栏的实测高度（ContentView 测得后下传），本层底部留白与之等高。
+    var bottomInset: CGFloat
     var body: some View {
         VStack(spacing: 8) {
             HStack {
@@ -52,15 +51,8 @@ struct AgentChatView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .simultaneousGesture(TapGesture().onEnded { inputFocus.wrappedValue = false })
                 .onChange(of: conversation.entries.count) { _, _ in
-                    if followLatest, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    if followLatest.wrappedValue, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
-            }
-            HStack(alignment: .bottom, spacing: 6) {
-                TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
-                    .lineLimit(1...3).textFieldStyle(.roundedBorder)
-                    .focused(inputFocus)
-                Button(questionID != nil ? "回答并继续" : (isNewTask && isPaused ? "新任务" : "发送")) { send() }
-                    .disabled(!canSend).buttonStyle(.borderedProminent)
             }
             HStack(spacing: 8) {
                 Button("停止") { engine.stop() }.disabled(!engine.busy || !engine.active)
@@ -73,6 +65,8 @@ struct AgentChatView: View {
             .font(.caption)
         }
         .padding(12)
+        // 输入栏浮在最上层，本层底部留出其实测高度，按钮行与最后一条消息不被压住
+        .padding(.bottom, bottomInset)
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
     private var manualWaiting: Bool {
@@ -83,31 +77,9 @@ struct AgentChatView: View {
         guard engine.active, questionID == nil else { return false }
         switch engine.status { case .paused, .failed: return true; case .waitingManual: return manualWaiting; default: return false }
     }
-    private func send() {
-        guard canSend else { return }
-        let text = conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let questionID {
-            switch engine.submitAnswer(text, requestID: questionID) {
-            case .accepted:
-                conversation.acceptedAnswer(text); conversation.draft = ""; followLatest = true
-                dismissKeyboard()
-            case .rejected(let reason): conversation.localFeedback(reason)
-            }
-        } else if isNewTask {
-            let previous = engine.conversationTaskID
-            engine.taskText = text
-            engine.start()
-            if engine.conversationTaskID != previous {
-                conversation.draft = ""; followLatest = true
-                dismissKeyboard()
-            }
-        }
-    }
-    /// 发送成功后收起键盘：仅在两条真成功路径调用（作答被接受／新任务真启动）——
-    /// 被拒或启动失败时保留焦点与草稿，方便用户改完重发。draft 已先清空，多行输入框
-    /// 的高度由内容驱动，随之自动复位到单行收起态。
-    private func dismissKeyboard() {
-        inputFocus.wrappedValue = false
+    private var questionID: UUID? {
+        guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
+        switch engine.status { case .waitingManual, .paused: return id; default: return nil }
     }
     private func entryView(_ entry: ChatEntry) -> some View {
         let user = entry.kind == .userTask || entry.kind == .userAnswer
@@ -118,6 +90,71 @@ struct AgentChatView: View {
             .frame(maxWidth: .infinity, alignment: user ? .trailing : .leading)
             .background(user ? Color.blue.opacity(0.14) : Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
             .accessibilityLabel(entry.text)
+    }
+}
+
+/// 聊天输入栏（输入框＋发送键）：ContentView 的 ZStack 最上层，渲染在浏览器坞之上——
+/// 小窗态、展开态都一样，坞怎么拖、怎么展开都盖不住它（问题 3）。背景用材质填充并
+/// 向底部安全区延伸，键盘升起时随根层安全区上浮、仍在最上层。高度由 ContentView
+/// 实测（草稿多行时变高）并下传给消息层避让与坞的钳制／避让。
+struct ChatInputBar: View {
+    @ObservedObject var engine: AgentEngine
+    @ObservedObject var conversation: AgentConversationStore
+    var inputFocus: FocusState<Bool>.Binding
+    var followLatest: Binding<Bool>
+    private var questionID: UUID? {
+        guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
+        switch engine.status { case .waitingManual, .paused: return id; default: return nil }
+    }
+    private var isNewTask: Bool {
+        switch engine.status { case .idle, .done, .failed: return true; case .paused: return questionID == nil; default: return false }
+    }
+    private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
+    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil) }
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
+                .lineLimit(1...3).textFieldStyle(.roundedBorder)
+                .focused(inputFocus)
+            Button(questionID != nil ? "回答并继续" : (isNewTask && isPaused ? "新任务" : "发送")) { send() }
+                .disabled(!canSend).buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            // 顶部分隔线＋材质背景，背景向底部安全区（Home 指示条区）延伸填满
+            VStack(spacing: 0) {
+                Divider()
+                Rectangle().fill(.regularMaterial)
+            }
+            .ignoresSafeArea(edges: .bottom)
+        }
+    }
+    private func send() {
+        guard canSend else { return }
+        let text = conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let questionID {
+            switch engine.submitAnswer(text, requestID: questionID) {
+            case .accepted:
+                conversation.acceptedAnswer(text); conversation.draft = ""; followLatest.wrappedValue = true
+                dismissKeyboard()
+            case .rejected(let reason): conversation.localFeedback(reason)
+            }
+        } else if isNewTask {
+            let previous = engine.conversationTaskID
+            engine.taskText = text
+            engine.start()
+            if engine.conversationTaskID != previous {
+                conversation.draft = ""; followLatest.wrappedValue = true
+                dismissKeyboard()
+            }
+        }
+    }
+    /// 发送成功后收起键盘：仅在两条真成功路径调用（作答被接受／新任务真启动）——
+    /// 被拒或启动失败时保留焦点与草稿，方便用户改完重发。draft 已先清空，多行输入框
+    /// 的高度由内容驱动，随之自动复位到单行收起态（问题 1）。
+    private func dismissKeyboard() {
+        inputFocus.wrappedValue = false
     }
 }
 

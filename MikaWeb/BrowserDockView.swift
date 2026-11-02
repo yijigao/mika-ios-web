@@ -42,8 +42,11 @@ enum DockLayoutMode {
 enum DockGeometry {
     /// 小窗距容器左／右／上边缘的留白（pt）
     static let edgeInset: CGFloat = 10
-    /// 底部保留高度（pt）：对话输入区（输入框＋按钮行＋内边距）的大致高度，
-    /// 小窗的停靠与拖动钳制不越过此线，避免长期遮住输入栏；键盘弹起时的短暂遮挡不在此列。
+    /// 底部保留高度（pt）的兜底常量：层级调整（问题 3）后，钳制改用 ContentView
+    /// 下传的实测值（输入栏实测高＋底部安全区上限＋余量，见 ContentView 的
+    /// dockBottomReserve），本常量只在未收到下传值时兜底。旧值 148 对应旧层级下
+    /// 「输入行＋按钮行」两行区的高度；新层级按钮行回到消息层、只护输入栏一行，
+    /// 故实测口径的数值变小属预期。键盘弹起时的短暂遮挡不在此列。
     static let bottomReserve: CGFloat = 148
     /// 小窗目标宽度占容器宽度比例与绝对范围（pt）。
     /// AGENT-VIEWPORT-FIX：FIX2 的 0.50／170–210（约 196×380）盖住半个对话区、观感压迫，
@@ -68,7 +71,8 @@ enum DockGeometry {
     }
 
     /// 把小窗中心钳制进合法区间：左右不越边缘，上下不越顶边与底部输入保留线。
-    static func clampedCenter(_ center: CGPoint, area: CGSize, scale: CGFloat) -> CGPoint {
+    /// bottomReserve 由调用方下传实测值（问题 3），缺省用兜底常量。
+    static func clampedCenter(_ center: CGPoint, area: CGSize, scale: CGFloat, bottomReserve: CGFloat = DockGeometry.bottomReserve) -> CGPoint {
         let visual = visualSize(area: area, scale: scale)
         let minX = visual.width / 2 + edgeInset
         let maxX = max(minX, area.width - visual.width / 2 - edgeInset)
@@ -79,20 +83,20 @@ enum DockGeometry {
     }
 
     /// 松手吸附：按预测落点选最近的左／右边缘，纵向钳制进合法区间。
-    static func snappedCenter(predicted: CGPoint, area: CGSize, scale: CGFloat) -> CGPoint {
+    static func snappedCenter(predicted: CGPoint, area: CGSize, scale: CGFloat, bottomReserve: CGFloat = DockGeometry.bottomReserve) -> CGPoint {
         let visual = visualSize(area: area, scale: scale)
         let leftX = visual.width / 2 + edgeInset
         let rightX = area.width - visual.width / 2 - edgeInset
         let x = abs(predicted.x - leftX) <= abs(predicted.x - rightX) ? leftX : rightX
-        return clampedCenter(CGPoint(x: x, y: predicted.y), area: area, scale: scale)
+        return clampedCenter(CGPoint(x: x, y: predicted.y), area: area, scale: scale, bottomReserve: bottomReserve)
     }
 
     /// 默认停靠位：右下，贴右边缘、底边在输入保留线之上。
-    static func defaultCenter(area: CGSize, scale: CGFloat) -> CGPoint {
+    static func defaultCenter(area: CGSize, scale: CGFloat, bottomReserve: CGFloat = DockGeometry.bottomReserve) -> CGPoint {
         let visual = visualSize(area: area, scale: scale)
         return clampedCenter(CGPoint(x: area.width - visual.width / 2 - edgeInset,
                                      y: area.height - bottomReserve - visual.height / 2 - 4),
-                             area: area, scale: scale)
+                             area: area, scale: scale, bottomReserve: bottomReserve)
     }
 }
 
@@ -144,9 +148,13 @@ struct BrowserDockView: View {
     /// 用户无从收起——故在切到 expanded 的瞬间代为收起（见 mode 的 onChange）。
     /// 仅此一个写入点；mini 态不动它（边看小窗边在对话打字是常态路径）。
     /// 网页内的手输焦点是 WKWebView 自己的 first responder，与本状态无关、不受影响。
-    /// 类型须是 FocusState 的 Binding（与对话层 TextField 绑定的同一个），
+    /// 类型须是 FocusState 的 Binding（与输入栏 TextField 绑定的同一个），
     /// 普通 Binding<Bool> 与之不互通（首版 Release 编译实证，见案卷）。
     var chatInputFocus: FocusState<Bool>.Binding
+    /// 底部保留高度（本坞全出血坐标）：ContentView 按输入栏实测高度推导后下传
+    /// （问题 3）——小窗钳制下界、展开态收起按钮与介入 UI 的底部避让都用它，
+    /// 输入栏永远在坞之上、压不住。草稿变高（输入栏变高）时经 onChange 重钳小窗。
+    var bottomReserve: CGFloat
 
     @State private var mode: DockMode = .mini
     @State private var miniCenter: CGPoint?
@@ -182,7 +190,7 @@ struct BrowserDockView: View {
             let visual = DockGeometry.visualSize(area: size, scale: scale)
             let baseCenter = mode == .expanded
                 ? CGPoint(x: size.width / 2, y: size.height / 2)
-                : (miniCenter ?? DockGeometry.defaultCenter(area: size, scale: DockGeometry.miniScale(area: size)))
+                : (miniCenter ?? DockGeometry.defaultCenter(area: size, scale: DockGeometry.miniScale(area: size), bottomReserve: bottomReserve))
             let center = CGPoint(x: baseCenter.x + dragDelta.width, y: baseCenter.y + dragDelta.height)
             ZStack(alignment: .topLeading) {
                 // 尺寸锚：保证 ZStack 恒为容器全尺寸（小窗态也不缩），且不拦截触摸
@@ -205,9 +213,15 @@ struct BrowserDockView: View {
                 area = newSize
                 // 容器尺寸变化（旋转等）时把记忆位置钳制回合法区间；键盘不改本层尺寸（见下）
                 if let current = miniCenter {
-                    miniCenter = DockGeometry.clampedCenter(current, area: newSize, scale: DockGeometry.miniScale(area: newSize))
+                    miniCenter = DockGeometry.clampedCenter(current, area: newSize, scale: DockGeometry.miniScale(area: newSize), bottomReserve: bottomReserve)
                 }
                 scheduleSettle()
+            }
+            .onChange(of: bottomReserve) { _, _ in
+                // 输入栏变高（草稿长到多行）时保留线随之下移，小窗若已越线则重钳回线之上
+                if let current = miniCenter, area.width > 0 {
+                    miniCenter = DockGeometry.clampedCenter(current, area: area, scale: DockGeometry.miniScale(area: area), bottomReserve: bottomReserve)
+                }
             }
         }
         // 仅忽略键盘安全区：键盘弹起时坞的坐标系不变，小窗保持屏幕坐标（允许被键盘短暂遮挡）
@@ -289,13 +303,17 @@ struct BrowserDockView: View {
                             .background(.ultraThinMaterial, in: Circle())
                             .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
                     }
-                    .padding(12)
+                    // 输入栏在坞之上浮于底部（问题 3）：收起按钮抬到输入栏之上，不被压住
+                    .padding(.trailing, 12)
+                    .padding(.bottom, bottomReserve + 12)
                     .accessibilityLabel("缩小浏览器为悬浮小窗")
                 }
             }
             .overlay(alignment: .bottom) {
                 if mode == .expanded {
+                    // 介入 UI（确认卡片／手输提示）同样抬到输入栏之上呈现，不与输入口重叠
                     interventionOverlay
+                        .padding(.bottom, bottomReserve)
                 }
             }
             .animation(spring, value: mode)
@@ -395,9 +413,9 @@ struct BrowserDockView: View {
         if storedXFrac >= 0, storedYFrac >= 0, size.width > 0, size.height > 0 {
             miniCenter = DockGeometry.clampedCenter(
                 CGPoint(x: storedXFrac * size.width, y: storedYFrac * size.height),
-                area: size, scale: scale)
+                area: size, scale: scale, bottomReserve: bottomReserve)
         } else if miniCenter == nil {
-            miniCenter = DockGeometry.defaultCenter(area: size, scale: scale)
+            miniCenter = DockGeometry.defaultCenter(area: size, scale: scale, bottomReserve: bottomReserve)
         }
     }
 
@@ -405,7 +423,7 @@ struct BrowserDockView: View {
 
     private func shieldDragChanged(_ value: DragGesture.Value) {
         if dragStartCenter == nil {
-            dragStartCenter = miniCenter ?? DockGeometry.defaultCenter(area: area, scale: DockGeometry.miniScale(area: area))
+            dragStartCenter = miniCenter ?? DockGeometry.defaultCenter(area: area, scale: DockGeometry.miniScale(area: area), bottomReserve: bottomReserve)
         }
         // 拖动跟手不走动画事务，避免弹簧滞后
         var transaction = Transaction()
@@ -414,7 +432,7 @@ struct BrowserDockView: View {
     }
 
     private func shieldDragEnded(_ value: DragGesture.Value) {
-        let start = dragStartCenter ?? miniCenter ?? DockGeometry.defaultCenter(area: area, scale: DockGeometry.miniScale(area: area))
+        let start = dragStartCenter ?? miniCenter ?? DockGeometry.defaultCenter(area: area, scale: DockGeometry.miniScale(area: area), bottomReserve: bottomReserve)
         dragStartCenter = nil
         let moved = hypot(value.translation.width, value.translation.height)
         if moved < tapThreshold {
@@ -425,7 +443,7 @@ struct BrowserDockView: View {
         let predicted = CGPoint(x: start.x + value.predictedEndTranslation.width,
                                 y: start.y + value.predictedEndTranslation.height)
         let scale = DockGeometry.miniScale(area: area)
-        let snapped = DockGeometry.snappedCenter(predicted: predicted, area: area, scale: scale)
+        let snapped = DockGeometry.snappedCenter(predicted: predicted, area: area, scale: scale, bottomReserve: bottomReserve)
         withAnimation(spring) {
             miniCenter = snapped
             dragDelta = .zero
