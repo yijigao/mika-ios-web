@@ -123,4 +123,8 @@
 - **H3a 稳、H3b 崩** → 触发点在 B 组：根视图 1652 布局结构或控制台静态形态（流内 TextField 的存在）之内，下一轮在 B 组内拆（布局 vs TextField）。
 - **H3a/H3b 全稳** → 与 H3 实测矛盾，先查阶梯包装/构建差异（H3b 与 H3 的等价性复核），不直接下结论。
 
-（构建完成后回填：H3a/H3b 提交号、CI/Release Run、构建号、build id、ASC 回读。）
+构建证据（分支 crash-ladder-2 续，validate_project.py 全 PASS）：
+- **H3a＝构建 202611020217**（提交 `0905d58`；CI Run 41376836711 success、Release Run 41376839327 success）：build id `bf889e9a-28a9-44de-92e7-255eee6992ff`；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false；Internal 组挂载 204，组内回读居首 [202611020217, 202611020210, 202611020205, …]。实现注记：scenePhase 门控已由 `step>=4` 收紧为 `step==4`（否则 step 5/6 会误开 H4 接线、破坏与 H3 的等价性）；右下角阶号经 stepName 映射显示 H3a/H3b。
+- **H3b＝构建 202611020221**（提交为 step 5→6 一行 diff，git diff --stat 实查 1 file/1 insertion/1 deletion；CI Run 41377276250 success、Release Run 41377279882 success）：build id `f67e938b-8ac1-4727-9041-5b4fd4e616c4`；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false；Internal 组挂载 204，组内回读居首 [202611020221, 202611020217, 202611020210, 202611020205, …]。H3b 装配与 H3（202611020205）等价，为复刻锚点。
+
+待主聊转交 Joey：先测 H3a（起始页点网页 5 次＋滚动）——崩则停在 H3a 并导出崩溃报告；不崩再测 H3b。

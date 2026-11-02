@@ -84,3 +84,10 @@
 - **H3＝202611020205**（提交 5e81bf1；CI 41375765685、Release 41375769004 均 success）：App 入口按 1652 形态持有 WebController/SettingsStore/AgentEngine/DiagnosticStore 对象图，根视图按 1652 ContentView 布局（BrowserView＋Divider＋控制台静态形态：本地 @State 输入框、不绑 engine），根视图不观察 settings/engine，engine 只创建不执行。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
 - **H4＝202611020210**（提交 b46647e；CI 41376265046、Release 41376269351 均 success）：H3＋1652 动态接线——根视图逐字复刻 3165943 ContentView（@ObservedObject 扇出＋PendingTaskStore 观察/consumePending＋toolbar 自检/设置真实导航项）＋真实 AgentConsoleView 子树（$engine.taskText 双向绑定等）＋scenePhase→engine.setForeground 接线（挂载点在根包装、step≥4 生效）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
 - Joey 规程：按 H3→H4 装，起始页点网页 5 次＋滚动，首崩即停并从右下角圆钮导出崩溃报告。判读只定位到层（H3 崩→装配骨架层；H4 崩→动态接线层；全稳→生产追加装配 E 组），不写根因确认。
+
+## 增补（2026-11-02）：H3 真机闪退确认，增量拆半 H3a/H3b 已上
+
+- H3（202611020205）Joey 真机 10:11 实测点击网页闪退，崩溃报告签名与历代一致（NSInvalidArgumentException，NSArrayM insert nil，offset 98532），崩法确认＝点击网页崩、非启动崩。H2 不崩 ⇒ 触发点在 H3 相对 H2 的装配增量内（清单见案卷 CRASH-LADDER-2 §5.1：A 组＝App 级对象图 A1–A4，B 组＝1652 布局＋控制台静态形态 B1–B2）。H4（202611020210）已交付但对定位无新增信息，停止推进其测试。
+- **H3a＝202611020217**（提交 0905d58；CI 41376836711、Release 41376839327 均 success）：H2 形态＋仅 A 组（App 持有 web/settings/engine 对象图并传递，BrowserView 消费 App 的 web；底部仍 120pt 占位）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- **H3b＝202611020221**（step 5→6 一行 diff；CI 41377276250、Release 41377279882 均 success）：H3a＋B 组，装配与 H3 等价（复刻锚点，应崩）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- Joey 规程：先 H3a，崩则停并导出报告；不崩再测 H3b。判读：H3a 崩→A 组；H3a 稳 H3b 崩→B 组；全稳→先查包装等价性。
