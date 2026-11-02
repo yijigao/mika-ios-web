@@ -606,15 +606,21 @@ enum SiteMode: String {
 
     /// 校验前导（与旧版单脚本同口径）：抽取快照比对 expected、安全词与敏感字段检查、取回 DOM 节点。
     /// 返回 JS 片段，执行后上下文里有 a／target／e 三个变量；校验不过直接 throw（与旧行为一致）。
-    private func guardScript(action: AgentAction, expected: PageElement, approved: Bool) throws -> String {
+    /// strict=false（编辑器多策略重试的后续策略专用）：编辑器自身的文本已被前一策略
+    /// 改动，逐字段相等必然误判「元素已变化」——只核 tag／editable 身份，敏感与安全
+    /// 词检查照旧不放松。
+    private func guardScript(action: AgentAction, expected: PageElement, approved: Bool, strict: Bool = true) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": action.text, "action": action.action])
         let json = String(decoding: data, as: UTF8.self)
         let expectedJSON = String(decoding: try JSONEncoder().encode(expected), as: UTF8.self)
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
+        let identityCheck = strict
+            ? "if(!target||!Object.keys(expected).every(k=>target[k]===expected[k]))throw new Error('目标元素已变化');"
+            : "if(!target||target.tag!==expected.tag||!!target.editable!==!!expected.editable)throw new Error('目标元素已变化');"
         return """
         const a=\(json),expected=\(expectedJSON);
         const page=JSON.parse(\(PageScript.extract)),target=page.elements.find(x=>x.index===a.index);
-        if(!target||!Object.keys(expected).every(k=>target[k]===expected[k]))throw new Error('目标元素已变化');
+        \(identityCheck)
         if(a.action==='type'&&target.sensitive)throw new Error('敏感字段必须手动输入');
         const label=[target.text,target.placeholder,target.name,target.ariaLabel].join(' ').toLowerCase();
         if(!\(approved ? "true" : "false")&&\(keywords).some(k=>label.includes(k)))throw new Error('敏感操作未经确认');
@@ -624,11 +630,15 @@ enum SiteMode: String {
     }
 
     /// type 写入脚本。path=exec：聚焦＋全选后 execCommand('insertText')（走 WebKit 原生编辑管线，
-    /// 框架编辑器 Draft/Slate/ProseMirror 都认这条）；path=range：Selection/Range 直接写 DOM
-    /// 再补带 inputType/data 的 InputEvent（备用路径）。表单字段两条路径同法：原生 value setter
-    /// ＋InputEvent（React 受控组件认 setter＋input 事件）。返回 'ok' 或 'exec-failed'。
-    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, tab: BrowserTab) async throws -> String {
-        let prefix = try guardScript(action: action, expected: expected, approved: approved)
+    /// 框架编辑器 Draft/Slate/ProseMirror 都认这条）；path=events：按段派发完整的
+    /// beforeinput→（框架未接管才）原生插入→input 事件序列（Draft.js 类编辑器靠
+    /// beforeinput 的 data 把文字吃进内部状态，整段原生插入在 WKWebView 里可能只
+    /// 改 DOM 不动状态——ZHIHU-COLUMN-SYNC 实证）；path=chunks：按段原生插入＋逐段
+    /// input 事件；path=range：Selection/Range 直接写 DOM 再补 InputEvent（末位兜底）。
+    /// 表单字段各路径同法：原生 value setter＋InputEvent（React 受控组件认 setter＋
+    /// input 事件）。返回 'ok' 或 'exec-failed'。
+    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, strict: Bool = true, tab: BrowserTab) async throws -> String {
+        let prefix = try guardScript(action: action, expected: expected, approved: approved, strict: strict)
         let result = try await evaluate("""
         (()=>{\(prefix)
         e.scrollIntoView({block:'center'});e.focus();
@@ -651,6 +661,43 @@ enum SiteMode: String {
             let done=false;
             try{done=document.execCommand('insertText',false,text);}catch(_){done=false;}
             return done?'ok':'exec-failed';
+          }
+          if('\(path)'==='events'){
+            // 事件序列路径：Draft.js 类编辑器在 beforeinput 里读 data 更新内部
+            // 状态并 preventDefault——dispatchEvent 返回 false 即框架已接管，
+            // 不再原生插入（防双写）；未被接管才退回原生 insertText 补这一段。
+            // 框架重渲染可能换掉编辑器节点：host 失效时按 idx／首个可见编辑器
+            // 重新锚定并把 caret 放回末尾。
+            let host=e;
+            const rehost=()=>{if(host.isConnected)return;const cand=document.querySelector('[data-mika-idx="'+a.index+'"]');if(cand&&cand.isContentEditable){host=cand;}else{const anyC=[...document.querySelectorAll('[contenteditable="true"]')].find(x=>{const r=x.getBoundingClientRect();return r.width>0&&r.height>0;});if(anyC)host=anyC;}try{const r=document.createRange();r.selectNodeContents(host);r.collapse(false);sel.removeAllRanges();sel.addRange(r);}catch(_){}}
+            const fireBI=(inputType,data)=>{let ev;try{ev=new InputEvent('beforeinput',{bubbles:true,composed:true,cancelable:true,inputType:inputType,data:data});}catch(_){try{ev=new Event('beforeinput',{bubbles:true,cancelable:true});}catch(__){return true;}}return host.dispatchEvent(ev);};
+            const fireIN=(inputType,data)=>{let ev;try{ev=new InputEvent('input',{bubbles:true,composed:true,cancelable:false,inputType:inputType,data:data});}catch(_){ev=new Event('input',{bubbles:true});}host.dispatchEvent(ev);};
+            const paras=text.split('\\n');
+            paras.forEach((p,i)=>{
+              rehost();
+              if(p){
+                if(fireBI('insertText',p)){try{document.execCommand('insertText',false,p);}catch(_){}}
+                fireIN('insertText',p);
+              }
+              if(i<paras.length-1){
+                rehost();
+                if(fireBI('insertParagraph',null)){let d=false;try{d=document.execCommand('insertParagraph');}catch(_){}if(!d){try{document.execCommand('insertText',false,'\\n');}catch(_){}}}
+                fireIN('insertParagraph',null);
+              }
+            });
+            try{document.dispatchEvent(new Event('selectionchange',{bubbles:true}));}catch(_){}
+            return 'ok';
+          }
+          if('\(path)'==='chunks'){
+            // 分段原生路径：整段一次插入对某些编辑器的状态同步太「整」，按段落
+            // 逐段原生插入、每段后补带 data 的 input 事件，给框架留出逐段吃进
+            // 状态的节奏；段间用 insertParagraph 分段（失败退回插入换行）。
+            const paras2=text.split('\\n');
+            paras2.forEach((p,i)=>{
+              if(p){try{document.execCommand('insertText',false,p);}catch(_){}fireInput('insertText',p);}
+              if(i<paras2.length-1){let d=false;try{d=document.execCommand('insertParagraph');}catch(_){}if(!d){try{document.execCommand('insertText',false,'\\n');}catch(_){}}fireInput('insertParagraph',null);}
+            });
+            return 'ok';
           }
           const range=sel.getRangeAt(0);
           range.deleteContents();
@@ -734,10 +781,181 @@ enum SiteMode: String {
         return decoded
     }
 
-    /// type 总流程：写入→回读；不过关换备用路径重试一次；仍不过关如实报「没输入进去」，
-    /// 不再误报成「找不到发表按钮」。文字已进但提交按钮全员禁用时单独报「按钮是灰的」。
+    // MARK: - 编辑器自报信号（ZHIHU-COLUMN-SYNC：写后校验升级为编辑器状态校验）
+
+    /// 编辑器自报信号探针结果：页面可读的「字数：N」计数与保存状态文案，以及
+    /// 编辑器 DOM 全文长度（次级信号）。count/saveState 为 nil 表示页面没有
+    /// 这类信号（校验回落 DOM 口径，不硬判）。
+    private struct EditorSignals: Decodable {
+        let found: Bool
+        let count: Int?
+        let saveState: String?
+        let textLength: Int
+    }
+
+    /// 探针：定位 contenteditable 编辑器（先按 data-mika-idx，再退首个可见编辑器），
+    /// 在编辑器的祖先作用域内（由近及远）找短文案里的字数与保存状态；祖先里没有
+    /// 才扫全页。编辑器自身内容不参与匹配；「保存中」优先于「已保存」（保存进行
+    /// 时旧的已保存标签可能同时在场，活动状态说了算）。
+    private func probeEditorSignals(action: AgentAction, tab: BrowserTab) async throws -> EditorSignals {
+        let data = try JSONSerialization.data(withJSONObject: ["index": action.index])
+        let json = String(decoding: data, as: UTF8.self)
+        guard let raw = try await evaluate("""
+        (()=>{const a=\(json);
+        const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        let ed=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        if(!ed||!ed.isContentEditable)ed=[...document.querySelectorAll('[contenteditable="true"]')].find(vis)||null;
+        if(!ed||!ed.isContentEditable)return JSON.stringify({found:false,count:null,saveState:null,textLength:0});
+        const textLength=(ed.innerText||'').length;
+        const countRe=/(?:字数|words?|characters?)\\s*[:：]?\\s*(\\d{1,7})/i;
+        const savingRe=/保存中|正在保存|saving/i, savedRe=/已保存|保存成功|草稿已保存|上次保存|最近保存|保存于|saved/i;
+        const collect=root=>{const out=[];if(!root)return out;root.querySelectorAll('*').forEach(x=>{if(ed.contains(x)||!vis(x))return;const t=(x.innerText||'').trim();if(t&&t.length<=40)out.push(t);});return out;};
+        let cands=[],scope=ed;
+        for(let i=0;i<9;i++){scope=scope.parentElement;if(!scope)break;cands=cands.concat(collect(scope));if(cands.some(t=>countRe.test(t)))break;}
+        if(!cands.length)cands=collect(document.body);
+        let count=null;
+        for(const t of cands){const m=t.match(countRe);if(m){count=parseInt(m[1],10);break;}}
+        let saveState=null;
+        if(cands.some(t=>savingRe.test(t)))saveState='saving';
+        else if(cands.some(t=>savedRe.test(t)))saveState='saved';
+        return JSON.stringify({found:true,count:count,saveState:saveState,textLength:textLength});})()
+        """, on: tab) as? String, let decoded = try? JSONDecoder().decode(EditorSignals.self, from: Data(raw.utf8)) else {
+            throw MikaError("编辑器状态探针失败（页面无响应）")
+        }
+        return decoded
+    }
+
+    /// 与 verifyType 同口径的归一化长度（去空白与零宽字符）。
+    private static func normalizedLength(_ s: String) -> Int {
+        s.filter { !$0.isWhitespace && $0 != "\u{200B}" && $0 != "\u{FEFF}" }.count
+    }
+
+    /// 字数一致性：写入是全选替换，落定字数应与目标文本量级一致（±15%＋余量）；
+    /// 编辑器原有内容场景再给一条兜底：较基线增长了目标量级也算吃进去了。
+    /// 计数与基线相同（冻结）必然不过——这正是专栏编辑器的实证形态。
+    private static func countConsistent(_ count: Int, expected: Int, baseline: Int?) -> Bool {
+        if expected == 0 { return true }
+        let low = max(0, Int(Double(expected) * 0.85) - 5)
+        let high = Int(Double(expected) * 1.15) + 10
+        if count >= low && count <= high { return true }
+        if let b = baseline, count > b {
+            let growth = count - b
+            if growth >= low && growth <= high { return true }
+        }
+        return false
+    }
+
+    /// 保存落定处理：状态停在「保存中」时，先让编辑器失焦促一次同步，再轮询
+    /// 信号直到落定或窗口耗尽（约 5 秒），返回最后一次信号。落定与否由调用方
+    /// 按口径判定，这里只负责「给它落定的机会＋如实回读」。
+    private func waitForEditorSaveSettle(action: AgentAction, tab: BrowserTab) async -> EditorSignals? {
+        _ = try? await evaluate("(()=>{const ae=document.activeElement;if(ae&&ae.blur)ae.blur();return 'blurred';})()", on: tab)
+        var last: EditorSignals?
+        for _ in 0..<10 {
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let s = try? await probeEditorSignals(action: action, tab: tab) else { return last }
+            last = s
+            if s.saveState != "saving" { return s }
+        }
+        return last
+    }
+
+    /// type 总流程分发：目标是 contenteditable 富文本编辑器且基线探针找得到它
+    /// 时，走编辑器状态校验流程（performTypeInEditor）；其余目标（表单字段、
+    /// 探针落空）走旧流程（performTypeLegacy，行为逐字不变）。
     private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
+        if expected.editable, let baseline = try? await probeEditorSignals(action: action, tab: tab), baseline.found {
+            try await performTypeInEditor(action: action, expected: expected, approved: approved, baseline: baseline, tab: tab)
+            return
+        }
+        try await performTypeLegacy(action: action, expected: expected, approved: approved, tab: tab)
+    }
+
+    /// 编辑器写入失败的性质分类（阶梯耗尽后按最后一次失败区分口径汇报）。
+    private enum EditorWriteFailure {
+        case domMissing
+        case stateRejected(count: Int, baseline: Int?)
+        case saveUnsettled(count: Int?)
+    }
+
+    /// 富文本编辑器 type 流程（ZHIHU-COLUMN-SYNC）：DOM 文本在场不算写成功——
+    /// 还须核对编辑器自报信号：字数计数与目标量级一致（计数不动＝文字没进入
+    /// 编辑器内部状态，判该策略失败并自动升级下一策略）、保存状态落定（计数
+    /// 已对上但一直「保存中」时先失焦促同步并等一个窗口复查，仍不落定按
+    /// 「保存未落定」口径收尾，未落定前本动作绝不返回成功、更不会去点更新）。
+    /// 策略阶梯 exec→events→chunks→range：首策略用严格 guard，后续策略用宽松
+    /// guard（编辑器文本已被前一策略改动，逐字段比对必然误判）。四条都不过关
+    /// 才汇报，逐策略读数进失败快照留痕。
+    private func performTypeInEditor(action: AgentAction, expected: PageElement, approved: Bool, baseline: EditorSignals, tab: BrowserTab) async throws {
+        let expectedLen = Self.normalizedLength(action.text)
+        let strategies = ["exec", "events", "chunks", "range"]
+        var trace: [String] = []
+        var failure: EditorWriteFailure = .domMissing
+        for (i, path) in strategies.enumerated() {
+            let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, strict: i == 0, tab: tab)
+            if status == "exec-failed" { trace.append("\(path)=exec-failed"); continue }
+            try await Task.sleep(for: .milliseconds(500))
+            var v = try await verifyType(action: action, tab: tab)
+            if !v.found {
+                if let byContent = try await verifyTypeByContent(action: action, tab: tab), byContent.textOK {
+                    v = byContent
+                } else {
+                    throw MikaError("输入后目标元素已失效，请重新开始或继续")
+                }
+            }
+            let signals = try? await probeEditorSignals(action: action, tab: tab)
+            guard v.textOK else {
+                trace.append("\(path)=dom-missing")
+                failure = .domMissing
+                continue
+            }
+            if let count = signals?.count {
+                guard Self.countConsistent(count, expected: expectedLen, baseline: baseline.count) else {
+                    trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
+                    failure = .stateRejected(count: count, baseline: baseline.count)
+                    continue
+                }
+                if signals?.saveState == "saving" {
+                    let settled = await waitForEditorSaveSettle(action: action, tab: tab)
+                    if settled?.saveState == "saving" {
+                        trace.append("\(path)=count-ok:\(count),save-unsettled")
+                        failure = .saveUnsettled(count: count)
+                        continue
+                    }
+                    trace.append("\(path)=count-ok:\(count),save-settled")
+                } else {
+                    trace.append("\(path)=count-ok:\(count)")
+                }
+            } else if signals?.saveState == "saving" {
+                // 无字数信号可核对：仍给保存一个落定窗口（结果只记 trace）——
+                // 这类编辑器旧流程只认 DOM，无信号时不单独判失败，避免误杀。
+                _ = await waitForEditorSaveSettle(action: action, tab: tab)
+                trace.append("\(path)=dom-ok,no-count-signal")
+            } else {
+                trace.append("\(path)=dom-ok,no-signals")
+            }
+            if v.editorLike, !v.submits.isEmpty, v.submits.allSatisfy({ $0.disabled }) {
+                await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
+                throw MikaError("文字已输入，但「\(v.submits[0].text)」按钮仍是灰的（禁用状态），没能发布")
+            }
+            return
+        }
+        await captureFailureSnapshot(context: "type 编辑器状态校验失败：\(action.reason)｜\(trace.joined(separator: "；"))", tab: tab)
+        switch failure {
+        case .domMissing:
+            throw MikaError("文字没能输入到编辑器：\(strategies.count) 种写入方式都已尝试、回读仍为空或对不上，请在网页手动输入后点继续")
+        case .stateRejected(let count, let base):
+            throw MikaError("文字已出现在编辑器里，但编辑器内部字数仍停在 \(count) 字（\(base.map { "写入前 \($0) 字" } ?? "写入前字数未知")），说明文字没有真正进入编辑器状态——已自动换了 \(strategies.count) 种输入方式仍不成功；这种状态下点更新只会提交旧内容，请在网页手动输入后点继续")
+        case .saveUnsettled(let count):
+            throw MikaError("文字已进入编辑器、字数已更新到 \(count.map { "\($0)" } ?? "目标") 字，但保存状态一直停在「草稿保存中」未落定——此时点更新/发布可能丢掉新内容，已停手。请等页面保存完成（或手动点一下编辑器外区域触发保存）后点继续")
+        }
+    }
+
+    /// 旧流程（表单字段等非富文本目标，行为逐字不变）：写入→回读；不过关换备用
+    /// 路径重试一次；仍不过关如实报「没输入进去」，不再误报成「找不到发表按钮」。
+    /// 文字已进但提交按钮全员禁用时单独报「按钮是灰的」。
+    private func performTypeLegacy(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
         for path in ["exec", "range"] {
             let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, tab: tab)
             if status == "exec-failed" { continue }

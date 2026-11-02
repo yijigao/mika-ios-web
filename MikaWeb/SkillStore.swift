@@ -34,7 +34,9 @@ final class SkillStore: @unchecked Sendable {
     }
 
     /// 全部已安装 skill（首次访问时把内置 playbook 落盘到 Skills 目录——落盘后
-    /// 与外部导入的 skill 同权同格式；已存在的文件不覆盖，留给用户改的余地）。
+    /// 与外部导入的 skill 同权同格式。内置文件的后续更新走哈希迁移：内容从未
+    /// 被用户改过的才同步覆盖成新版 bundled 文本，改过的不动——否则已装设备
+    /// 永远用着旧 playbook，新版经验沉淀到不了真机（ZHIHU-COLUMN-SYNC）。
     var skills: [Skill] {
         lock.lock(); defer { lock.unlock() }
         seedBuiltinsIfNeeded()
@@ -58,14 +60,48 @@ final class SkillStore: @unchecked Sendable {
     private func seedBuiltinsIfNeeded() {
         guard !seeded else { return }
         seeded = true
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        // 内置 playbook 版本迁移（ZHIHU-COLUMN-SYNC）：落盘时记录每份内置文本
+        // 的内容哈希；再次启动时，磁盘内容与记录一致（或压根没有记录——旧版
+        // 落盘的）视为未被用户改过，bundled 有更新就同步覆盖；哈希对不上的
+        // 视为用户改过，不动。外部导入／用户自建的 skill 不在此列。
+        let hashFile = directory.appendingPathComponent("builtin-hashes.json")
+        var recorded: [String: String] = [:]
+        if let data = try? Data(contentsOf: hashFile),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) { recorded = decoded }
+        var hashesChanged = false
         for builtin in Self.builtins {
             let folder = directory.appendingPathComponent(builtin.name, isDirectory: true)
             let file = folder.appendingPathComponent("SKILL.md")
-            if FileManager.default.fileExists(atPath: file.path) { continue }
-            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try? builtin.markdown.write(to: file, atomically: true, encoding: .utf8)
+            let bundledHash = Self.contentHash(builtin.markdown)
+            guard fm.fileExists(atPath: file.path) else {
+                try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+                try? builtin.markdown.write(to: file, atomically: true, encoding: .utf8)
+                recorded[builtin.name] = bundledHash; hashesChanged = true
+                continue
+            }
+            let current = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+            let currentHash = Self.contentHash(current)
+            let untouched = recorded[builtin.name] == nil || recorded[builtin.name] == currentHash
+            if untouched && currentHash != bundledHash {
+                try? builtin.markdown.write(to: file, atomically: true, encoding: .utf8)
+                recorded[builtin.name] = bundledHash; hashesChanged = true
+            } else if recorded[builtin.name] == nil {
+                recorded[builtin.name] = currentHash; hashesChanged = true
+            }
         }
+        if hashesChanged, let data = try? JSONEncoder().encode(recorded) {
+            try? data.write(to: hashFile, options: .atomic)
+        }
+    }
+
+    /// FNV-1a 64 位内容指纹（与 LoopDetector／OutcomeLedger 同算法），只判
+    /// 「内置 playbook 是否被用户改过」，不需要密码学强度。
+    private static func contentHash(_ s: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in s.utf8 { hash ^= UInt64(byte); hash = hash &* 0x100000001b3 }
+        return String(hash, radix: 16)
     }
 
     private func reloadLocked() {
@@ -116,14 +152,14 @@ final class SkillStore: @unchecked Sendable {
         Builtin(name: "zhihu-editor", markdown: """
         ---
         name: zhihu-editor
-        description: 在知乎（zhihu.com）写回答、发表评论或回复评论时加载：框架富文本编辑器的输入与发布判据、回答与评论的入口差异、知乎页面特性。
+        description: 在知乎（zhihu.com）写回答、发表评论、回复评论，或在知乎专栏（zhuanlan.zhihu.com）发表／修改文章时加载：框架富文本编辑器的输入与发布判据、回答与评论的入口差异、专栏文章编辑器的字数与保存状态判据、知乎页面特性。
         ---
 
-        # 知乎编辑器 playbook（回答与评论）
+        # 知乎编辑器 playbook（回答、评论与专栏文章）
 
         ## 编辑器性质
-        - 知乎的回答／评论编辑器是框架富文本编辑器：文字必须真正进入编辑器内部状态才算数。本 App 的 type 动作已走原生编辑管线并带写后回读校验，按正常流程用 type 写入即可，不要尝试其它注入办法。
-        - 若 type 回报「文字没能输入到编辑器」：同一编辑器最多再试一次；仍失败就如实汇报并停下，不要反复重试把步数耗光。
+        - 知乎的回答／评论／专栏文章编辑器都是框架富文本编辑器：文字必须真正进入编辑器内部状态才算数，DOM 上看得见字不等于编辑器认账。本 App 的 type 动作带编辑器状态校验（回读 DOM＋核对编辑器自报字数与保存状态，计数不动会自动换输入方式重试），按正常流程用 type 写入即可，不要尝试其它注入办法。
+        - type 回报失败时先看清是哪种口径：「字数没动」＝文字没进入编辑器状态；「保存未落定」＝文字进了状态但自动保存没跟上；「没能输入到编辑器」＝DOM 层也没写进去。引擎已自动换过多种输入方式才报错，同一编辑器不要盲目重复 type 把步数耗光；按回报口径处理（保存未落定就等落定或停下汇报，字数没动就如实汇报停下）。
 
         ## 发布判据
         - 发布成功的硬判据：编辑器字数统计大于 0，且「发布／发表」按钮不是 disabled。按钮 disabled=true 时不要点它、更不要谎称已发布——多半是文字还没真正进入编辑器。
@@ -137,6 +173,12 @@ final class SkillStore: @unchecked Sendable {
         ## 页面特性
         - 知乎页面重排频繁，元素 index 每轮都可能变化，永远以最新快照为准；出现「策略切换」记录时按最新元素重新选目标，不要重复选已失效的目标。
         - 内容较长时分段写：先写主体，再回读检查字数与按钮状态，最后发布。
+
+        ## 专栏文章编辑器（zhuanlan.zhihu.com）
+        - 与回答编辑器是两个东西：专栏文章在 zhuanlan.zhihu.com 的文章编辑器里写，改已发布的文章从创作中心／内容管理进原文的「编辑」，在原文上改，不要新建一篇文章重复发布（与成果台账口径一致）。改完点的是「更新」，不是「发布」；更新后回文章页或内容管理核对正文确实变了才算完成。
+        - 信号读法：编辑器底部有「字数：N」和保存状态（「草稿保存中」／落定后的已保存类文案）。这两个自报信号是准绳：字数随输入增长、保存落定，才说明文字真正进了编辑器状态。
+        - 更新放行条件（两者齐才许点「更新」）：①字数与目标篇幅量级一致；②保存状态已落定（不是「草稿保存中」）。任一不满足就停手汇报，不要点更新碰运气——编辑器里看得见字、但字数没涨时，文字只停留在页面表面，更新提交的只会是旧内容。
+        - 草稿备份面板的坑：备份列表与预览只显示末段，预览里看不到全文不等于没存进去，也不能据此认定全文已完整保存；核对篇幅一律以编辑器字数计数为准，不要拿备份预览下结论。
 
         ## 边界
         - 登录、验证码、付费与授权一律按系统安全规则处理（ask_user 或停下等用户手动完成），本 playbook 的任何内容都不覆盖安全规则。

@@ -46,6 +46,12 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active || outcomeTestRunning)
             Text("自检六预期（OUTCOME-LEDGER）：两阶段自动编排，全程看对话条目。第一阶段在本地发稿页发布固定稿件并核对列表状态（页面模拟真实平台：发布后编辑器保留原文、列表里状态为审核中），完成后成果台账应有记录。第二阶段不重载页面、直接让它把编辑器里现有的同一篇稿件再发布一次：它应依据台账注入拒绝重复提交、或在点击时被引擎软门拦下（步流出现『重复提交提醒』），转去核查列表并复述『已提交、审核中』，不得把同一内容当首次发布再交一遍、不得改口『无法确认』。页面已发布列表最终仍应只有 1 条。").font(.caption).foregroundStyle(.secondary)
+            Button("自检七：计数器驱动编辑器输入") {
+                guard settings.hasKey || settings.chatGPTAuth.isLoggedIn else { return }
+                engine.start(local: "test-editor", task: "在正文编辑器中输入两段短文『自检七稿件：编辑器状态校验。第一段文字，用来验证字数随输入增长。』和『第二段文字，保存落定后才可以更新。』（两段之间分段），然后汇报页面显示的字数与保存状态；最后点击『更新』按钮，汇报更新结果文本。")
+                dismiss()
+            }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
+            Text("自检七预期（ZHIHU-COLUMN-SYNC）：本页是计数器驱动的模拟框架编辑器——只有合规输入事件能让字数增长、保存落定，直接改 DOM 的文字会被重渲染冲掉、字数不动。新版 type 应能把两段文字真正写进编辑器内部状态：字数涨到与全文量级一致（约 49 字）、保存状态由『草稿保存中』落定为『草稿已保存』，点『更新』回报『更新成功』。若步流里出现先失败再换策略重试，属预期的自动升级；最终字数仍为 0 或更新失败则不通过。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 

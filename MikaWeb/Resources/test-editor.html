@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地计数器编辑器页</title>
+<style>body{font:20px system-ui;margin:24px}#editor{border:1px solid #999;border-radius:8px;min-height:150px;padding:12px;margin:12px 0}button{display:block;margin:16px 0;font:inherit;padding:10px 22px}</style>
+<h1>模拟框架编辑器（计数器驱动）</h1>
+<p>本页模拟 Draft.js 类框架编辑器：正文只有通过合规的输入事件（beforeinput 携带 data、且事件到达时 DOM 未被外来改动）进入编辑器内部状态，才会计入字数并触发保存；直接改 DOM 的文字会被框架按内部状态重渲染冲掉——字数不动、保存也不会落定。点「更新」的判据：字数大于 0 且保存状态已落定。</p>
+<div id="editor" contenteditable="true" aria-label="正文编辑器"></div>
+<p>字数：<span id="count">0</span></p>
+<p>保存状态：<span id="savestate">草稿已保存</span></p>
+<button id="update" type="button">更新</button>
+<p id="result" role="status"></p>
+<script>
+var state={text:''};
+var editor=document.getElementById('editor');
+var countEl=document.getElementById('count');
+var saveEl=document.getElementById('savestate');
+var saveTimer=null;
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function render(){
+  var paras=state.text.split('\n');
+  editor.innerHTML=paras.map(function(p){return '<div>'+(p?esc(p):'<br>')+'</div>';}).join('');
+  countEl.textContent=String(state.text.replace(/\s/g,'').length);
+}
+function joinedDom(){return editor.textContent.replace(/\r/g,'');}
+function joinedState(){return state.text.replace(/\n/g,'');}
+function markSaving(){
+  saveEl.textContent='草稿保存中';
+  if(saveTimer)clearTimeout(saveTimer);
+  saveTimer=setTimeout(function(){saveEl.textContent='草稿已保存';},800);
+}
+function selOffsets(){
+  var sel=window.getSelection();
+  if(!sel.rangeCount)return [state.text.length,state.text.length];
+  var range=sel.getRangeAt(0);
+  function off(container,offset){
+    var pre=range.cloneRange();
+    pre.selectNodeContents(editor);
+    pre.setEnd(container,offset);
+    return pre.toString().length;
+  }
+  return [off(range.startContainer,range.startOffset),off(range.endContainer,range.endOffset)];
+}
+editor.addEventListener('beforeinput',function(e){
+  // 框架拦截口径：DOM 已被外来写入改动过（与内部状态不一致）时不接管本次
+  // 事件——那类文字不进状态，随后会被周期重渲染冲掉。
+  if(joinedDom()!==joinedState())return;
+  if(e.inputType!=='insertText'&&e.inputType!=='insertParagraph')return;
+  var data=e.inputType==='insertParagraph'?'\n':e.data;
+  if(typeof data!=='string')return;
+  e.preventDefault();
+  var pair=selOffsets();
+  var start=pair[0],end=pair[1];
+  // DOM 选区偏移在「去换行连接」空间里，换算回带换行的状态文本坐标
+  function toState(off){
+    var seen=0;
+    for(var i=0;i<=state.text.length;i++){
+      if(seen===off)return i;
+      if(state.text[i]!=='\n')seen++;
+    }
+    return state.text.length;
+  }
+  var s=toState(start),en=toState(end);
+  state.text=state.text.slice(0,s)+data+state.text.slice(en);
+  render();
+  markSaving();
+});
+// 框架周期重渲染：DOM 与内部状态不一致时按状态重画（外来写入被冲掉）
+setInterval(function(){if(joinedDom()!==joinedState())render();},250);
+document.getElementById('update').addEventListener('click',function(){
+  var result=document.getElementById('result');
+  var n=parseInt(countEl.textContent,10)||0;
+  if(saveEl.textContent.indexOf('保存中')>=0){result.textContent='更新失败：草稿保存中，未落定';return;}
+  if(n<=0){result.textContent='更新失败：字数为 0，编辑器内部没有正文';return;}
+  result.textContent='更新成功：正文共 '+n+' 字，保存已落定';
+});
+render();
+</script></html>
