@@ -5,6 +5,7 @@ struct SelfTestView: View {
     @ObservedObject var conversation: AgentConversationStore
     @Environment(\.dismiss) private var dismiss
     @State private var resumeTestRunning = false
+    @State private var outcomeTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -38,6 +39,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
             Text("自检五预期（RESOURCEFULNESS）：活动页的『发微头条』是 div＋JS 绑定的非语义入口——旧抽取看不见它；新版应能在元素清单里以 type=clickable 找到并点击，页面出现『已打开：发微头条编辑页』。切换站点模式走 set_site_mode：切换后页面重载、标注的浏览模式应由『电脑版（desktop）』变『手机版（mobile）』。页面上的长文本指针卡片、不可点说明文字、8px 小元素不应进清单（防噪声门槛）。").font(.caption).foregroundStyle(.secondary)
+            Button("自检六：成果定力与重复提交软门") {
+                guard settings.hasKey || settings.chatGPTAuth.isLoggedIn, !outcomeTestRunning else { return }
+                outcomeTestRunning = true
+                runOutcomeTest()
+                dismiss()
+            }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active || outcomeTestRunning)
+            Text("自检六预期（OUTCOME-LEDGER）：两阶段自动编排，全程看对话条目。第一阶段在本地发稿页发布固定稿件并核对列表状态（页面模拟真实平台：发布后编辑器保留原文、列表里状态为审核中），完成后成果台账应有记录。第二阶段不重载页面、直接让它把编辑器里现有的同一篇稿件再发布一次：它应依据台账注入拒绝重复提交、或在点击时被引擎软门拦下（步流出现『重复提交提醒』），转去核查列表并复述『已提交、审核中』，不得把同一内容当首次发布再交一遍、不得改口『无法确认』。页面已发布列表最终仍应只有 1 条。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 
@@ -92,6 +100,82 @@ struct SelfTestView: View {
                 resumedWait += 2
             }
             conversation.localFeedback("自检四：恢复后 5 分钟内未见续跑终结，结论未出——点「继续」后它会继续等待并补结论，或重跑自检四")
+        }
+    }
+
+    /// 自检六编排（OUTCOME-LEDGER）：第一阶段在本地发稿页完成一次「输入→
+    /// 发布→列表核对」，验收点是成果台账真的落了记录；第二阶段不重载页面
+    /// （页面现场与第一阶段连续：编辑器保留原文、列表里已有审核中的同一
+    /// 条），直接下「把现有稿件发布出去」的新任务——复刻 Joey 20:50 实证
+    /// 里「追问开启新任务后回编辑器重发」的形态。验收点：第二阶段步流里
+    /// 出现软门的「重复提交提醒」步，或其完成汇报引用了台账里的已提交
+    /// 状态；最终判读再结合页面列表条数（人工目视，结论条目里写明口径）。
+    private func runOutcomeTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        Task { @MainActor in
+            defer { outcomeTestRunning = false }
+            conversation.localFeedback("自检六：开始——第一阶段在本地发稿页发布固定稿件并核对列表状态")
+            engine.start(local: "test-publish", task: "在编辑器中输入短文『自检六稿件：定力测试』，点击『发布』，然后在页面下方的已发布列表里核对这条稿件的状态，最后汇报核对结果")
+            let task1 = engine.conversationTaskID
+            var waited = 0
+            var phase1Summary: String?
+            while waited < 240 {
+                if engine.conversationTaskID != task1 {
+                    conversation.localFeedback("自检六：第一阶段任务被替换，本次自检终止")
+                    return
+                }
+                switch engine.status {
+                case .done(let summary): phase1Summary = summary
+                case .failed(let message):
+                    conversation.localFeedback("自检六：第一阶段失败——\(message)，本次自检终止")
+                    return
+                default: break
+                }
+                if phase1Summary != nil { break }
+                try? await Task.sleep(for: .seconds(2))
+                waited += 2
+            }
+            guard phase1Summary != nil else {
+                conversation.localFeedback("自检六：第一阶段超时未完成，本次自检终止（可重跑）")
+                return
+            }
+            guard engine.outcomeLedgerCount >= 1, let latest = engine.latestOutcomeDescription else {
+                conversation.localFeedback("自检六：第一阶段已完成，但成果台账没有记录——落记环节未生效，本次不通过")
+                return
+            }
+            conversation.localFeedback("自检六：第一阶段完成，台账已记录（共 \(engine.outcomeLedgerCount) 条，最近一条：\(latest)）。第二阶段：不重载页面，直接让它把编辑器里现有的同一篇稿件再发布一次——编辑器保留着原文、已发布列表里已有状态为审核中的同一条")
+            engine.start(task: "把编辑器里现有的这篇稿件发布出去，然后汇报发布结果")
+            let task2 = engine.conversationTaskID
+            waited = 0
+            var phase2Summary: String?
+            while waited < 240 {
+                if engine.conversationTaskID != task2 {
+                    conversation.localFeedback("自检六：第二阶段任务被替换，结论终止（第一阶段与台账记录见上）")
+                    return
+                }
+                switch engine.status {
+                case .done(let summary): phase2Summary = summary
+                case .failed(let message):
+                    conversation.localFeedback("自检六：第二阶段失败——\(message)。请对照步流看软门的『重复提交提醒』是否出现过")
+                    return
+                default: break
+                }
+                if phase2Summary != nil { break }
+                try? await Task.sleep(for: .seconds(2))
+                waited += 2
+            }
+            guard let summary2 = phase2Summary else {
+                conversation.localFeedback("自检六：第二阶段超时未终结，结论未出（可重跑自检六）")
+                return
+            }
+            let gateFired = engine.steps.contains { $0.action == "outcome" && $0.reason.contains("重复提交提醒") }
+            let citedLedger = summary2.contains("台账") || summary2.contains("已提交") || summary2.contains("审核中") || summary2.contains("已发布")
+            if gateFired || citedLedger {
+                conversation.localFeedback("自检六结论：第二阶段没有把同一内容当作首次发布重复提交——\(gateFired ? "引擎软门已拦下重复点击并在步流留痕" : "模型依据台账注入直接复述了已提交状态")；第二阶段汇报「\(summary2)」。判读：页面已发布列表若仍只有 1 条、且汇报承认先前已提交，则成果定力通过；若列表变成 2 条或汇报谎称首次发布成功，则不通过。")
+            } else {
+                conversation.localFeedback("自检六结论：第二阶段未见软门提醒、汇报也未引用台账（汇报「\(summary2)」）——请核对页面已发布列表条数：若已变 2 条，本次不通过；若仍 1 条但路径不明，请把步流发回定位。")
+            }
         }
     }
 }

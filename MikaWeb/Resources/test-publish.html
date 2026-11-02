@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地发稿页</title>
+<style>body{font:20px system-ui;margin:24px}textarea{width:95%;height:140px;font:inherit;display:block}button{display:block;margin:16px 0;font:inherit;padding:10px 22px}li{margin:8px 0}</style>
+<h1>模拟发稿页</h1>
+<p>在本页写稿并点「发布」。发布后稿件进入下方已发布列表（状态：审核中）；编辑器会保留原文——这是模拟真实平台的行为，保留原文不代表没有提交成功。</p>
+<textarea id="editor" placeholder="在这里输入稿件正文"></textarea>
+<button id="publish" type="button">发布</button>
+<p id="result" role="status"></p>
+<h2>已发布列表</h2>
+<p>已发布条数：<span id="count">0</span></p>
+<ul id="list"></ul>
+<script>
+var n=0;
+document.getElementById('publish').addEventListener('click',function(){
+  var text=document.getElementById('editor').value.trim();
+  var result=document.getElementById('result');
+  if(!text){result.textContent='编辑器为空，未发布';return;}
+  n+=1;
+  var li=document.createElement('li');
+  li.textContent='稿件'+n+'：'+text.slice(0,30)+'——状态：审核中';
+  document.getElementById('list').appendChild(li);
+  document.getElementById('count').textContent=String(n);
+  result.textContent='发布成功：稿件'+n+'已提交，状态审核中（编辑器保留原文属正常现象）';
+});
+</script></html>

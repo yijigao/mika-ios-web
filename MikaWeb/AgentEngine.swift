@@ -81,6 +81,25 @@ struct AgentStep: Identifiable {
     /// 恢复结果＋「不得向用户索要目标／网址／进度」的硬性口径），会话终结
     /// （done／failed）或新任务开始时清除。
     private var resumeNote: String?
+    /// 成果台账（OUTCOME-LEDGER，结构与分类见 OutcomeLedger.swift）：已真实
+    /// 执行并留痕的提交类关键动作。App 会话级——start() 不清（用户追问在
+    /// App 里就是一条新任务，台账必须跨得过任务界），自有持久化＋随会话
+    /// 快照双写，进程被杀重开仍在；24 小时过期、最多 20 条（见 prunedOutcomes）。
+    private(set) var outcomeLedger: [OutcomeRecord] = []
+    /// 软门已提醒过的台账条目 id（本进程内）：同一条目只拦第一次重复提交；
+    /// 模型收到提醒后仍坚持、或用户在新任务里明确要求重发时放行，由落记
+    /// 路径回记为再次提交。进程重启后集合清空，会再提醒一次（软门口径）。
+    private var outcomeGateFired: Set<UUID> = []
+    /// 重复提交被拦下时给模型的提醒：随下一次模型调用注入后清除（步流里
+    /// 另有一条 outcome 步，用户可见）。
+    private var pendingOutcomeHint: String?
+    /// 本轮刚落记／更新的台账说明：由 launch 在记完本步动作后补一条 outcome
+    /// 步进轨迹，保证步序是「动作 → 台账」而不是反过来。
+    private var pendingOutcomeStep: String?
+    /// 本任务最近的打字内容（提交指纹的来源）：只留内存、最近 5 条；优先取
+    /// 编辑器／textarea 的输入，回退任意字段的最近输入。start() 清空——新
+    /// 任务的提交若无打字记录，软门按页面＋按钮标识匹配（追问场景正是此路）。
+    private var recentTyped: [(text: String, isEditor: Bool)] = []
     /// 当前会话目标（对话层判定「有可续跑上下文」用，只读）。
     var activeGoal: String { goal }
     /// 后台宽限断言（层 2）：进后台时申请、回前台／会话终结／到期时释放。
@@ -101,6 +120,7 @@ struct AgentStep: Identifiable {
         settingsCancellable = settings.$keepScreenAwakeDuringTask.sink { [weak self] _ in
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
+        loadOutcomeLedger()
         restoreSnapshotIfNeeded()
     }
     var taskLimit: Int { limit }
@@ -129,6 +149,9 @@ struct AgentStep: Identifiable {
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
+        // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
+        recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = UUID()
@@ -270,9 +293,15 @@ struct AgentStep: Identifiable {
                         // 每一轮都带上——原页面恢复结果＋不得反问目标／网址／
                         // 进度的硬性口径，直到会话终结或新任务开始才清除。
                         if let resumeNote { prompt += resumeNote + "\n" }
+                        // 成果台账注入（OUTCOME-LEDGER）：与【中断恢复说明】并列
+                        // ——已留痕的提交逐条在目，附不得重复提交／先查列表／
+                        // 已核实结论不得无新证据改口的硬口径（见 outcomePromptBlock）
+                        let outcomeBlock = outcomePromptBlock()
+                        if !outcomeBlock.isEmpty { prompt += outcomeBlock + "\n" }
                         prompt += "历史：\(history)\n用户补充问答：\(answers)"
                         if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
                         if let hint = pendingLoopHint { prompt += "\n\(hint)"; pendingLoopHint = nil }
+                        if let hint = pendingOutcomeHint { prompt += "\n\(hint)"; pendingOutcomeHint = nil }
                         prompt += "\n当前页面 JSON：\(json)"
                         let action: AgentAction
                         if settings.modelSource == .chatGPT {
@@ -282,6 +311,9 @@ struct AgentStep: Identifiable {
                         }
                         try await checkpoint(token)
                         if action.action == "done" {
+                            // 完成总结是模型回读页面后写下的核实结论：钉进台账
+                            // 里仍待核查的条目，后续追问轮次据此守定力口径
+                            markOutcomesVerified(summary: action.summary)
                             record(action); status = .done(action.summary)
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
@@ -336,8 +368,15 @@ struct AgentStep: Identifiable {
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
                                 record(action)
+                                flushPendingOutcomeStep()
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "executed")
                                 try await Task.sleep(for: .milliseconds(500))
+                            case .duplicateBlocked:
+                                // 重复提交被软门拦下：提醒步已在 pendingOutcomeStep
+                                // 里、模型提醒已置位待下一轮注入；本轮按已消费处理，
+                                // 循环指纹单列 outcome，不与原动作混记
+                                flushPendingOutcomeStep()
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "duplicate-blocked")
                             case .strategySwitch:
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "strategy-switch")
                                 break // 策略切换已记入轨迹，下一轮带着新快照让模型重新判断
@@ -440,6 +479,11 @@ struct AgentStep: Identifiable {
             try await web.execute(saved.0, expected: target, approved: true)
             try await checkpoint(token)
             record(saved.0)
+            // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
+            // 指示，此路不设软门；台账记下后防的是后续轮次的无意识重复）
+            if let note = noteSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2) {
+                appendStep("outcome", note)
+            }
             try await Task.sleep(for: .milliseconds(500))
             return .proceed
         } catch {
@@ -455,8 +499,9 @@ struct AgentStep: Identifiable {
         }
     }
     /// click／type 的执行结果：executed＝已执行；strategySwitch＝目标整轮重找仍无法定位，
-    /// 已记策略切换步、交模型按新快照重新判断；waiting＝已进入确认／手输等待（状态已置位）。
-    private enum TargetedOutcome { case executed, strategySwitch, waiting }
+    /// 已记策略切换步、交模型按新快照重新判断；waiting＝已进入确认／手输等待（状态已置位）；
+    /// duplicateBlocked＝重复提交被成果台账软门拦下未执行，提醒步与模型提醒均已置位。
+    private enum TargetedOutcome { case executed, strategySwitch, waiting, duplicateBlocked }
 
     /// click／type 的目标获取＋执行，带失效恢复（AGENT-VIEWPORT-FIX）：
     /// 模型给的 index 只对它所见的那份快照有效——先从该元素提取稳定描述，再在最新快照里
@@ -501,6 +546,14 @@ struct AgentStep: Identifiable {
             case .allow:
                 break
             }
+            // 重复提交软门（OUTCOME-LEDGER）：只拦自主路径的 click——确认路径
+            // （runConfirmed）是用户亲手确认，不经此门；拦下后本轮不执行，
+            // 提醒步与下一轮注入提醒都已置位，模型应改走列表核查路径
+            if action.action == "click", let block = duplicateSubmissionBlock(element: target, pageURL: snapshot.url) {
+                pendingOutcomeStep = block.step
+                pendingOutcomeHint = block.hint
+                return .duplicateBlocked
+            }
             do {
                 try await checkpoint(token)
                 executionSerial += 1
@@ -508,6 +561,12 @@ struct AgentStep: Identifiable {
                 try await checkpoint(token)
                 lastStaleKey = nil
                 staleStreak = 0
+                // 台账记账点：打字成功先记内容（提交指纹来源），提交类点击
+                // 成功再落台账条目（说明经 pendingOutcomeStep 由调用方补步）
+                if action.action == "type" { noteTypedContent(action: action, element: target) }
+                if action.action == "click" {
+                    pendingOutcomeStep = noteSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url)
+                }
                 return .executed
             } catch {
                 guard Self.isStaleTargetError(error), refinds < 2 else { throw error }
@@ -633,6 +692,144 @@ struct AgentStep: Identifiable {
         syncContinuedProgress()
     }
     private func record(_ action: AgentAction, suffix: String = "") { appendStep(action.action, action.reason + suffix) }
+
+    // MARK: - 成果台账（OUTCOME-LEDGER-2026-11-02.md）
+
+    private static let outcomeLedgerKey = "outcomeLedger.v1"
+    private static let outcomeTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+    private static func outcomeTime(_ date: Date) -> String { outcomeTimeFormatter.string(from: date) }
+
+    /// 台账封顶口径：只留 24 小时内的最近 20 条——定力要守的是「刚提交过
+    /// 的别再交一遍」，过期与溢出的老条目留着只会污染注入。
+    private static func prunedOutcomes(_ records: [OutcomeRecord]) -> [OutcomeRecord] {
+        let fresh = records.filter { Date().timeIntervalSince($0.recordedAt) < 24 * 3600 }
+        return Array(fresh.suffix(20))
+    }
+    private func loadOutcomeLedger() {
+        guard let data = UserDefaults.standard.data(forKey: Self.outcomeLedgerKey),
+              let records = try? JSONDecoder().decode([OutcomeRecord].self, from: data) else { return }
+        outcomeLedger = Self.prunedOutcomes(records)
+    }
+    private func saveOutcomeLedger() {
+        outcomeLedger = Self.prunedOutcomes(outcomeLedger)
+        if let data = try? JSONEncoder().encode(outcomeLedger) {
+            UserDefaults.standard.set(data, forKey: Self.outcomeLedgerKey)
+        }
+    }
+
+    /// 条目同一性：双方都有正文指纹时按指纹＋主机比（同内容同站点才算同一
+    /// 提交，换个站点发同文案不拦）；任一侧无指纹时退到页面地址＋按钮文案
+    /// （追问场景：新任务里没重打正文，指纹为空，靠这一路认出「还是这个
+    /// 编辑器页的发布按钮」）。
+    private static func outcomeMatches(_ record: OutcomeRecord, fingerprint: String, host: String, pageURL: String, label: String) -> Bool {
+        if !fingerprint.isEmpty, !record.contentFingerprint.isEmpty {
+            return record.contentFingerprint == fingerprint && record.host == host
+        }
+        return record.pageURL == pageURL && record.elementLabel == label
+    }
+    private static func elementLabel(of element: PageElement) -> String {
+        if !element.text.isEmpty { return element.text }
+        if !element.ariaLabel.isEmpty { return element.ariaLabel }
+        return "提交按钮"
+    }
+    /// 当前待提交内容的指纹来源：本任务最近一次编辑器／textarea 输入；
+    /// 没有编辑器输入时回退到最近一次任意打字；都没有则空指纹。
+    private func currentContentFingerprint() -> (hash: String, prefix: String) {
+        let source = recentTyped.last(where: { $0.isEditor })?.text ?? recentTyped.last?.text ?? ""
+        return SubmissionClassifier.contentFingerprint(of: source)
+    }
+    private func noteTypedContent(action: AgentAction, element: PageElement) {
+        guard !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let isEditor = element.editable || element.tag == "textarea"
+        recentTyped.append((text: action.text, isEditor: isEditor))
+        if recentTyped.count > 5 { recentTyped.removeFirst(recentTyped.count - 5) }
+    }
+
+    /// 提交类点击真正执行成功后的落记（runTargeted 自主路径与 runConfirmed
+    /// 确认路径共用）：返回要补进轨迹的 outcome 步文案，非提交类返回 nil。
+    /// 同一性命中已有条目时不重复建条——更新其时间与状态并注明再次提交
+    /// （软门已提醒后坚持执行、或经用户确认执行的重发走的正是这条）。
+    private func noteSubmissionIfNeeded(action: AgentAction, element: PageElement, pageURL: String) -> String? {
+        guard action.action == "click", SubmissionClassifier.isSubmissionElement(element) else { return nil }
+        let (hash, prefix) = currentContentFingerprint()
+        let host = URL(string: pageURL)?.host ?? ""
+        let label = Self.elementLabel(of: element)
+        if let index = outcomeLedger.firstIndex(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }) {
+            outcomeLedger[index].recordedAt = Date()
+            outcomeLedger[index].resubmittedAt = Date()
+            outcomeLedger[index].statusNote = "再次提交（经提醒或用户确认后执行），待核查"
+            saveOutcomeLedger()
+            return "成果台账更新：同一内容已再次提交（「\(label)」），条目时间与状态已更新——后续仍按已提交内容对待，不得无意识再发"
+        }
+        let record = OutcomeRecord(id: UUID(), pageURL: pageURL, host: host, elementLabel: label,
+                                    contentFingerprint: hash, contentPrefix: prefix,
+                                    statusNote: "已提交（待核查）", recordedAt: Date(), resubmittedAt: nil)
+        outcomeLedger.append(record)
+        saveOutcomeLedger()
+        let contentDesc = prefix.isEmpty ? "（正文未留指纹，按页面与按钮记账）" : "内容「\(prefix)…」"
+        return "成果台账已记录：\(Self.outcomeTime(record.recordedAt)) 在 \(host.isEmpty ? "本地页面" : host) 提交了\(contentDesc)（按钮「\(label)」），状态：已提交（待核查）"
+    }
+
+    /// 重复提交软门：本次自主点击若命中台账里同一条目、且该条目本进程内
+    /// 还没提醒过——拦下本次点击，返回步流文案与当轮注入提醒；已提醒过的
+    /// 条目放行（模型已收到提醒仍坚持、或用户明确要求重发），执行后由
+    /// noteSubmissionIfNeeded 回记为再次提交。这就是「软」：只拦第一次
+    /// 无意识重复，不做硬阻断；确认路径（用户亲手点的确认）不经此门。
+    private func duplicateSubmissionBlock(element: PageElement, pageURL: String) -> (step: String, hint: String)? {
+        guard SubmissionClassifier.isSubmissionElement(element) else { return nil }
+        let (hash, _) = currentContentFingerprint()
+        let host = URL(string: pageURL)?.host ?? ""
+        let label = Self.elementLabel(of: element)
+        guard let record = outcomeLedger.first(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }),
+              !outcomeGateFired.contains(record.id) else { return nil }
+        outcomeGateFired.insert(record.id)
+        let when = Self.outcomeTime(record.recordedAt)
+        let contentDesc = record.contentPrefix.isEmpty ? "该内容" : "内容「\(record.contentPrefix)…」"
+        let step = "重复提交提醒：\(contentDesc)已于 \(when) 在 \(record.host.isEmpty ? "本地页面" : record.host) 提交过（状态：\(record.statusNote)），本次重复提交已拦下未执行——先去内容列表/记录页核查现状再决定"
+        let hint = "【重复提交提醒】你刚才试图再次提交的\(contentDesc)已于 \(when) 提交过，台账状态：\(record.statusNote)。本次点击已被拦下、没有执行。现在先去该站的内容列表/记录页核查这条内容的当前状态（如审核中/已发布），再决定下一步：状态正常就向用户复述核实结果，不要回编辑器凭残稿重发；只有用户明确要求重新提交时，才再次点击提交（再次点击会放行，reason 里注明系用户要求）。"
+        return (step, hint)
+    }
+
+    /// 任务以 done 收口时，把台账里仍「待核查」的条目钉上模型的完成总结
+    /// 作为已核实结论：总结是模型回读页面（列表核查等）后写下的，钉进
+    /// 台账后每轮注入——后续追问轮次再想改口「无法确认」，先要面对自己
+    /// 写进台账的这句总结（定力口径，配合系统提示「成果定力」段）。
+    private func markOutcomesVerified(summary: String) {
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var changed = false
+        for index in outcomeLedger.indices where outcomeLedger[index].statusNote.contains("待核查") {
+            outcomeLedger[index].statusNote = "已核实（完成总结）：\(String(trimmed.prefix(80)))"
+            changed = true
+        }
+        if changed { saveOutcomeLedger() }
+    }
+
+    /// 台账注入段：逐条列出已留痕的提交，附定力硬口径。返回空串＝台账为空。
+    private func outcomePromptBlock() -> String {
+        let records = Self.prunedOutcomes(outcomeLedger)
+        guard !records.isEmpty else { return "" }
+        let lines = records.map { record in
+            let content = record.contentPrefix.isEmpty ? "（正文未留指纹）" : "内容「\(record.contentPrefix)…」"
+            return "· \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」提交：\(content)，状态：\(record.statusNote)"
+        }
+        return "【本任务已完成的关键动作】\n" + lines.joined(separator: "\n") + "\n硬性口径：以上都是已真实执行并留痕的提交，不得对同一内容重复提交/发布。需要确认现状时，先去内容列表/记录页核查该条目的状态再下结论；编辑器里残留的同文草稿不是未提交的证据（提交后保留原文是常见形态）。已核实的结论无新证据不得改口为「无法确认」；用户追问时复述台账里的状态与证据来源。"
+    }
+
+    private func flushPendingOutcomeStep() {
+        if let note = pendingOutcomeStep { appendStep("outcome", note); pendingOutcomeStep = nil }
+    }
+
+    /// 自检六只读口径：台账条数与最近一条的人读摘要。
+    var outcomeLedgerCount: Int { outcomeLedger.count }
+    var latestOutcomeDescription: String? {
+        outcomeLedger.last.map { "\($0.host.isEmpty ? "本地页面" : $0.host) · \($0.contentPrefix.isEmpty ? "（无正文指纹）" : $0.contentPrefix) · \($0.statusNote)" }
+    }
 
     // MARK: - 后台韧性（BACKGROUND-RESILIENCE-2026-11-02.md；层 1 驻停/续跑在 checkpoint）
 
@@ -766,6 +963,10 @@ struct AgentStep: Identifiable {
         var tabURLs: [String]?
         var activeTabIndex: Int?
         var executionTabIndex: Int?
+        // OUTCOME-LEDGER 起：成果台账随快照双写——台账本体另有自有持久化，
+        // 快照里的这份保证「随会话恢复的正是本会话的条目」，恢复时按 id
+        // 合并去重。可选字段，此前快照无此键照常解码。
+        var outcomes: [OutcomeRecord]?
     }
     private static let snapshotKey = "agentSessionSnapshot.v1"
 
@@ -817,7 +1018,8 @@ struct AgentStep: Identifiable {
                                        waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
                                        skillNames: loadedSkillNames,
                                        taskID: conversationTaskID,
-                                       tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex)
+                                       tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex,
+                                       outcomes: outcomeLedger)
         if let data = try? JSONEncoder().encode(snapshot) {
             UserDefaults.standard.set(data, forKey: Self.snapshotKey)
         }
@@ -856,6 +1058,17 @@ struct AgentStep: Identifiable {
             waitingInput = waiting.kind == "question" ? .question(id: waiting.id, text: waiting.text) : .manual(id: waiting.id, text: waiting.text)
         }
         conversationTaskID = snapshot.taskID ?? UUID()
+        // 成果台账合并（OUTCOME-LEDGER）：快照里的条目按 id 补进台账（自有
+        // 持久化已载入的那份为主，快照补其所缺），保证恢复出的会话带着
+        // 中断前的已提交记录续跑，注入时与【中断恢复说明】并列出现
+        if let saved = snapshot.outcomes {
+            var merged = false
+            for record in saved where !outcomeLedger.contains(where: { $0.id == record.id }) {
+                outcomeLedger.append(record)
+                merged = true
+            }
+            if merged { saveOutcomeLedger() }
+        }
         restoredSession = true
         didApplyTabRestore = false
         if let urls = snapshot.tabURLs {
@@ -902,6 +1115,9 @@ struct AgentStep: Identifiable {
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         conversationTaskID = nil; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
+        // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
+        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; outcomeLedger = []
         web.resetTabsToStartPage()
         // —— 仅凭落盘恢复 ——
         restoreSnapshotIfNeeded()
