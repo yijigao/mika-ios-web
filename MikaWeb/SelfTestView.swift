@@ -78,6 +78,12 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || coverModalTestRunning)
             Text("自检十一预期（COVER-CONSENT）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，弹窗核查会占用当前标签页打开本地合成页 test-modal）：①封面自产——三款版式渲染均为 900×383、像素非空白（多色）、空标题被拒；scratch 会话里生成并登记：落盘 attachments/、来源＝本任务生成、注入段带文件名与「本任务生成」字样、SP-01 判定对该附件放行，scratch 删净。②弹窗点按——合成页上方弹窗只认完整点按序列：裸 click 关不掉、引擎 click 经升级序列关掉并显示确认结果；下方无响应弹窗经升级连败 2 次后抛「弹窗点按无响应」，且转介入判定命中该错误、普通错误不误触发。结论逐条写进对话。Tier B 真机人工（步骤见案卷 COVER-CONSENT-IMPL 的复测清单）：公众号编辑器复刻 1655 现场——AI 配图条款弹窗点同意、generate_cover 自产封面并 upload_file 设上、存草稿后回读核对；顽固弹窗全链转对话内介入卡由用户亲手点按。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十二：真 Draft.js 编辑器粘贴写入") {
+                guard settings.hasKey || settings.chatGPTAuth.isLoggedIn else { return }
+                engine.start(local: "test-draft", task: "在正文编辑器中输入两段短文『自检十二稿件：粘贴路线验证。第一段文字，用来验证字数随输入进入编辑器状态。』和『第二段文字，保存落定后才可以更新。』（两段之间分段），然后汇报页面显示的字数与保存状态；最后点击『更新』按钮，汇报更新结果文本。")
+                dismiss()
+            }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
+            Text("自检十二预期（ZHUANLAN-FIX2）：本页内嵌真正的 Draft.js（0.11.7），初始正文 102 字（模拟知乎专栏待改的已发布文章），字数与保存状态全由 EditorState 驱动。type 应走粘贴事务整段替换：字数由 102 变为与目标全文一致的 54（不是 102＋54 的追加）、保存状态落定为『草稿已保存』，点『更新』回报『更新成功：正文共 54 字』。若字数仍为 102（冻结）或变成 156（只追加没替换）则不通过；步流里出现换策略重试属预期自动升级，最终以字数与更新结果为准。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 

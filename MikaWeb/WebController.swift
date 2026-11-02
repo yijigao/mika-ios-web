@@ -827,7 +827,12 @@ enum SiteMode: String {
         """
     }
 
-    /// type 写入脚本。path=exec：聚焦＋全选后 execCommand('insertText')（走 WebKit 原生编辑管线，
+    /// type 写入脚本。path=paste：粘贴事务（ZHUANLAN-FIX2）——选区锚进首/末 block
+    /// 文本节点做真全选、派 selectionchange＋mouseup 促框架同步内部选区，再派
+    /// ClipboardEvent('paste') 携带 DataTransfer(text/plain＋text/html)，框架的
+    /// 粘贴管线以一次状态事务整段替换（Draft.js 的 replaceWithFragment）；增量
+    /// 输入路径在专栏编辑器上已被真机实证全灭（字数冻结），粘贴是其唯一整段
+    /// 事务入口。path=exec：聚焦＋全选后 execCommand('insertText')（走 WebKit 原生编辑管线，
     /// 框架编辑器 Draft/Slate/ProseMirror 都认这条）；path=events：按段派发完整的
     /// beforeinput→（框架未接管才）原生插入→input 事件序列（Draft.js 类编辑器靠
     /// beforeinput 的 data 把文字吃进内部状态，整段原生插入在 WKWebView 里可能只
@@ -855,6 +860,34 @@ enum SiteMode: String {
           const sel=window.getSelection();
           const selectAll=()=>{const r=document.createRange();r.selectNodeContents(e);sel.removeAllRanges();sel.addRange(r);};
           selectAll();
+          if('\(path)'==='paste'){
+            // 粘贴事务路径（ZHUANLAN-FIX2）：Draft 类编辑器的内部选区只认
+            // editOnSelect 的同步——DOM 选区必须锚在 block 的文本节点内（锚在
+            // 容器元素上映射必败，第一轮全灭的根因之一），且要在派发前用
+            // selectionchange＋mouseup 促一次同步；粘贴本身走框架的
+            // replaceWithFragment 整段替换内部选区，不经增量字符/段落操作
+            // （段落断开不是 beforeinput 事务，混入原生 insertParagraph 必坏账）。
+            const host=(e.isContentEditable?e:(e.querySelector('[contenteditable="true"]')||e));
+            host.focus();
+            const blocks=[...host.querySelectorAll('[data-offset-key]')];
+            const firstText=n=>{if(!n)return null;const w=document.createTreeWalker(n,NodeFilter.SHOW_TEXT);return w.nextNode();};
+            const lastText=n=>{if(!n)return null;const w=document.createTreeWalker(n,NodeFilter.SHOW_TEXT);let c=null,l=null;while((c=w.nextNode()))l=c;return l;};
+            let anchored=false;
+            if(blocks.length){const ft=firstText(blocks[0]),lt=lastText(blocks[blocks.length-1]);if(ft&&lt){const r=document.createRange();r.setStart(ft,0);r.setEnd(lt,(lt.textContent||'').length);sel.removeAllRanges();sel.addRange(r);anchored=true;}}
+            if(!anchored){const r=document.createRange();r.selectNodeContents(host);sel.removeAllRanges();sel.addRange(r);}
+            try{document.dispatchEvent(new Event('selectionchange',{bubbles:true}));}catch(_){}
+            try{host.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));}catch(_){}
+            const escHtml=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            const html=text.split('\\n').map(p=>'<p>'+escHtml(p)+'</p>').join('');
+            let dt=null;try{dt=new DataTransfer();}catch(_){dt=null;}
+            if(dt){try{dt.setData('text/plain',text);}catch(_){}try{dt.setData('text/html',html);}catch(_){}if(!dt.getData||!dt.getData('text/plain'))dt=null;}
+            if(!dt){const store={'text/plain':text,'text/html':html};dt={types:['text/plain','text/html'],files:[],items:[],getData:t=>store[t]||'',setData:(t,v)=>{store[t]=v;}};}
+            let ev=null;
+            try{ev=new ClipboardEvent('paste',{bubbles:true,cancelable:true,composed:true,clipboardData:dt});if(!ev.clipboardData||!ev.clipboardData.getData||!ev.clipboardData.getData('text/plain'))ev=null;}catch(_){ev=null;}
+            if(!ev){ev=new Event('paste',{bubbles:true,cancelable:true,composed:true});try{Object.defineProperty(ev,'clipboardData',{value:dt});}catch(_){try{ev.clipboardData=dt;}catch(__){}}}
+            host.dispatchEvent(ev);
+            return 'ok';
+          }
           if('\(path)'==='exec'){
             let done=false;
             try{done=document.execCommand('insertText',false,text);}catch(_){done=false;}
@@ -1082,12 +1115,35 @@ enum SiteMode: String {
     /// 编辑器内部状态，判该策略失败并自动升级下一策略）、保存状态落定（计数
     /// 已对上但一直「保存中」时先失焦促同步并等一个窗口复查，仍不落定按
     /// 「保存未落定」口径收尾，未落定前本动作绝不返回成功、更不会去点更新）。
-    /// 策略阶梯 exec→events→chunks→range：首策略用严格 guard，后续策略用宽松
-    /// guard（编辑器文本已被前一策略改动，逐字段比对必然误判）。四条都不过关
-    /// 才汇报，逐策略读数进失败快照留痕。
+    /// 策略阶梯：Draft 类＝paste→events→chunks→exec→range，其余＝exec→
+    /// events→chunks→range（ZHUANLAN-FIX2 分流）。首策略用严格 guard，后续
+    /// 策略用宽松 guard（编辑器文本已被前一策略改动，逐字段比对必然误判）。
+    /// 全部不过关才汇报，逐策略读数进失败快照留痕。
+    /// Draft 类编辑器探测（ZHUANLAN-FIX2）：编辑器子树里有 data-offset-key
+    /// block（Draft 的渲染标记）或 Draft 标志类名即判 Draft 类——这类编辑器
+    /// 的增量输入路径已被实证全灭，阶梯改走粘贴事务优先。
+    private func probeDraftClass(action: AgentAction, tab: BrowserTab) async -> Bool {
+        let data = (try? JSONSerialization.data(withJSONObject: ["index": action.index])) ?? Data()
+        let json = String(decoding: data, as: UTF8.self)
+        let raw = try? await evaluate("""
+        (()=>{const a=\(json);
+        const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        let ed=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        if(!ed||!ed.isContentEditable)ed=[...document.querySelectorAll('[contenteditable="true"]')].find(vis)||null;
+        if(!ed)return 'other';
+        const draft=ed.querySelector('[data-offset-key]')||ed.closest('[data-offset-key]')||ed.classList.contains('public-DraftEditor-content')||ed.querySelector('.public-DraftEditor-content');
+        return draft?'draft':'other';})()
+        """, on: tab) as? String
+        return raw == "draft"
+    }
+
     private func performTypeInEditor(action: AgentAction, expected: PageElement, approved: Bool, baseline: EditorSignals, tab: BrowserTab) async throws {
         let expectedLen = Self.normalizedLength(action.text)
-        let strategies = ["exec", "events", "chunks", "range"]
+        // ZHUANLAN-FIX2：Draft 类编辑器走粘贴优先阶梯（paste→events→chunks→
+        // exec→range）；其余编辑器保持第一轮阶梯不变，不扰动既有可用路径。
+        let strategies: [String] = await probeDraftClass(action: action, tab: tab)
+            ? ["paste", "events", "chunks", "exec", "range"]
+            : ["exec", "events", "chunks", "range"]
         var trace: [String] = []
         var failure: EditorWriteFailure = .domMissing
         for (i, path) in strategies.enumerated() {
