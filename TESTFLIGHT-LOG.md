@@ -115,3 +115,11 @@
 - 内容（案卷 TABS-IMPL-2026-11-02.md）：新增 BrowserTab（每标签独立 WKWebView＋历史/标题/加载状态，切换不重载、离屏强持有保活，网页进程被系统杀掉时按最后已知地址重载恢复）；WebController 改为标签管理器＋当前页门面（旧 API 逐个转发当前页，BrowserView/BrowserDockView 既有调用零改动）；展开态工具栏加标签按钮（带数量）＋标签总览（列表：标题＋网址＋关闭、任务中标记、新建标签；关当前页切相邻、关到最后一个自动补空白页永不归零）；target=_blank/window.open 经 WKUIDelegate createWebViewWith 新开标签承接，window.close 走同一关闭规则；agent 绑定任务开始时的标签页（state/execute 全程路由执行页，revision 判定换执行页口径，用户中途切页不影响任务，展开态有「任务在标签页…执行中」提示），新增 open_new_tab 动作（执行绑定随新页迁移）；agent 切标签不做（本轮边界）。
 - 红线复核：MikaWebApp.swift 持有形态与 SafetyPolicy 零改动（git diff 实查）；浮窗双态/真 resize 不变，小窗态只呈现当前页、无标签 UI；FIX2 注入脚本逐字保留、仅执行目标改为执行页。
 - 待 Joey 按案卷真机清单验收（多标签切换不重载、新窗口链接开新标签、关标签行为、agent 当前页干活＋中途切页、open_new_tab、小窗态只看当前页、闪退回归）；验收通过前不合 main。
+
+## 增补（2026-11-02）：视口所有权修复构建（任务期布局锁定＋引擎失效重找），新构建已上
+
+- 构建 **202611020645**（0.1.0），build id `ff1abe36-cca7-44a2-9293-d0dd5138ea6f`：分支 `fix/agent-viewport-lock`（自 feat/browser-tabs 新开，未合 main/fix/feat），代码提交 `58f0faf`＋`911bfef`；CI Run 41400749586、41401639222 success，Release Run 41401851651 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 回读确认、Internal 组挂载 POST 204 且组内回读居首 [202611020645, 202611020636, 202611020614]；validate_project.py 全 PASS。中途构建 202611020636（Release 41400939289）含主体修复但缺 JS 异常分类补强，已被 0645 取代、非交付口径。
+- 背景：0614 真机翻车（Joey 14:27 截图）：小窗态发起知乎写回答任务，FIX2 落定真 resize 把 WKWebView 视口压到约 196pt，编辑器窄视口排版崩坏（按钮竖排、文字成列）；agent 输入后报「输入后目标元素已失效」、41 步耗尽失败；小窗约 196×380 盖半屏亦压迫。
+- 内容（案卷 AGENT-VIEWPORT-FIX-2026-11-02.md）：①视口所有权 DockLayoutMode——engine 新增 sessionActive 信号，任务会话活跃期布局锁定展开工作尺寸（任务开始自动展开、会话中收起只走缩放渲染不 resize），会话终结后坞仍小窗态才补落定 resize；无任务时保留 FIX2 真 resize；迁移表 8 行＋呈现真值表在案卷。②小窗调小：宽屏宽×0.40（钳 148–168）、高上限约 300pt（393×759 算例约 155×300）。③引擎失效恢复：state() 取快照前 DOM 静默短轮询（上限约 1.6s）；PageElement 新增 editable，新增 ElementDescriptor＋resolveTarget 按稳定描述重找（宁缺勿错）；click/type 收进 runTargeted，定位失败与执行失效共用单步 ≤2 次重找预算，耗尽记策略切换步交模型按新快照重判，同一目标连败两轮以「页面结构已变」具体口径终止；确认路径同享描述重找；performType 在 idx 节点被重渲染换掉时先按内容兜底校验。失败口径沿用 FIX2 三分类＋新增「页面结构已变」一类。
+- 红线复核：MikaWebApp.swift 持有形态、SafetyPolicy、WebSurface 零改动；标签模型与执行页绑定口径不变；FIX2 注入脚本与硬校验逐字保留；重找重试每轮重跑 Swift 侧安全检查，无绕行。
+- 待 Joey 按案卷复测清单验收（首项＝翻车场景复现：小窗态发起知乎写回答应自动展开并办成；其余：任务中收起不打断、闲时适配仍在、小窗观感、知乎评论、标签页、安全边界、闪退回归）；验收通过前不合 main。
