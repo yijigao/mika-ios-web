@@ -95,6 +95,12 @@ import Combine
     @Published private(set) var activeTabID: UUID
     /// 任务绑定的标签页；nil＝没有任务绑定（state／execute 回落到当前页）
     @Published private(set) var executionTabID: UUID?
+    /// agent 工作驻停标记（BACKGROUND-RESILIENCE，由 AgentEngine 在切后台时置位）：
+    /// 置位期间 agent 通道的加载等待与 DOM 静默轮询立即收敛停手——不再向正在被
+    /// 系统挂起的网页进程发探针（0808 的 scene-update 看门狗终止教训：进后台的
+    /// 场景事务窗口里，主线与网页侧的工作都要第一时间安静下来）。用户手动浏览
+    /// 不走 ready／state 通道，不受此标记影响。
+    var agentWorkSuspended = false
     private var tabCancellables: [UUID: AnyCancellable] = [:]
 
     override init() {
@@ -193,6 +199,8 @@ import Combine
     func beginExecution() { executionTabID = activeTabID }
     /// 任务终结／停止：解除绑定（state／execute 回落当前页）。
     func endExecution() { executionTabID = nil }
+    /// 执行页重载（引擎在页面瞬时失败连败时用）：作用于执行页而非当前页，用户切页不串。
+    func reloadExecutionTab() { executionTab.reload() }
 
     /// agent 的 open_new_tab 动作：新开标签、切换过去并把执行绑定一并移过去，
     /// 后续动作作用于新页。地址先校验后建页，非法地址不留空标签。
@@ -234,6 +242,9 @@ import Combine
     private func ready(in tab: BrowserTab) async throws {
         for _ in 0..<300 {
             try Task.checkCancellation()
+            // 切后台驻停：不再陪等加载（最长 30 秒的轮询不得横跨场景切换），抛
+            // 加载类瞬时错误，引擎会驻停并在回前台后整轮重试（BACKGROUND-RESILIENCE）
+            if agentWorkSuspended { throw MikaError("网页加载失败：页面未就绪") }
             if let pageError = tab.pageError { throw MikaError("网页加载失败：\(pageError)") }
             if !tab.webView.isLoading { return }
             try await Task.sleep(for: .milliseconds(100))
@@ -245,9 +256,12 @@ import Combine
     /// 节点数／文档高度），连续两次相同即认为 DOM 已静默；上限约 1.6 秒，超时照常取快照
     /// （动画／轮播类页面永不完全静默，不为它无限等）。全程尽力而为，不抛错、不拦加载判定。
     private func waitForStability(in tab: BrowserTab) async {
+        // 切后台驻停：DOM 静默轮询整体停手，不向正在被挂起的网页进程连发探针
+        if agentWorkSuspended { return }
         let probe = "(()=>{const b=document.body;return [document.readyState,b?b.innerText.length:0,document.querySelectorAll('*').length,document.documentElement?document.documentElement.scrollHeight:0].join('|');})()"
         var last: String?
         for _ in 0..<8 {
+            if agentWorkSuspended { return }
             let signature = (try? await evaluate(probe, on: tab)) as? String
             if let signature {
                 if signature == last { return }
@@ -274,7 +288,16 @@ import Combine
         case "scroll":
             guard ["up", "down"].contains(action.direction) else { throw MikaError("未知滚动方向") }
             _ = try await evaluate("window.scrollBy(0, \(action.direction == "up" ? "-" : "")window.innerHeight*0.85)", on: tab)
-        case "wait": try await Task.sleep(for: .seconds(min(15, max(0.1, action.seconds))))
+        case "wait":
+            // 按绝对截止时刻等待（BACKGROUND-RESILIENCE）：进程被系统挂起期间墙钟
+            // 照走，分片睡、每片醒来按真实剩余时间重算；解冻时截止已过就直接返回，
+            // 不把挂起时长再补睡一遍（不依赖进程内计时器连续运行）。
+            let deadline = Date().addingTimeInterval(min(15, max(0.1, action.seconds)))
+            while true {
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining <= 0 { break }
+                try await Task.sleep(for: .milliseconds(min(500, max(1, Int(remaining * 1000)))))
+            }
         case "click": try await performClick(action, expected: expected, approved: approved, tab: tab)
         case "type": try await performType(action, expected: expected, approved: approved, tab: tab)
         default: throw MikaError("不可执行动作")

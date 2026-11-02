@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UIKit
 
 enum ChatEntryKind: Equatable { case userTask, userAnswer, process, result, error, pause, question, manual, local }
 enum ChatEntrySource { case userTask, userAnswer, engineStep, engineStatus, localValidation }
@@ -27,9 +28,24 @@ struct ChatEntry: Identifiable {
     private var taskID: UUID?
     private var seenSteps: Set<Int> = []
     private var seenWaits: Set<UUID> = []
+    /// 后台攒批（BACKGROUND-RESILIENCE）：App 离开前台期间，引擎事件条目先攒在
+    /// batchedEntries 里、不逐条刷进消息列表（逐条 append 会连环触发列表 diff 与
+    /// 滚动跟随，正是场景更新窗口里要避开的高频 SwiftUI 更新）；回到前台一次性
+    /// 刷入。顺序与去重口径不变（仍按到达顺序、seenSteps/seenWaits 先行判定）。
+    private var batching = false
+    private var batchedEntries: [ChatEntry] = []
+    private var uiObservers: [NSObjectProtocol] = []
     func bind(to engine: AgentEngine) {
         guard !bound else { return }
         bound = true
+        if uiObservers.isEmpty {
+            uiObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.batching = true }
+            })
+            uiObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.flushBatch() }
+            })
+        }
         engine.$conversationTaskID.sink { [weak self, weak engine] id in
             guard let self, let engine, let id, id != self.taskID else { return }
             self.taskID = id; self.seenSteps = []; self.seenWaits = []
@@ -64,7 +80,15 @@ struct ChatEntry: Identifiable {
     }
     func localFeedback(_ text: String) { append(ChatEntry(taskID: taskID, kind: .local, text: text, source: .localValidation)) }
     func acceptedAnswer(_ text: String) { append(ChatEntry(taskID: taskID, kind: .userAnswer, text: text, source: .userAnswer)) }
-    private func append(_ entry: ChatEntry) { entries.append(entry) }
+    private func append(_ entry: ChatEntry) {
+        if batching { batchedEntries.append(entry) } else { entries.append(entry) }
+    }
+    private func flushBatch() {
+        batching = false
+        guard !batchedEntries.isEmpty else { return }
+        entries.append(contentsOf: batchedEntries)
+        batchedEntries = []
+    }
     private func trimHistory() {
         let older = entries.filter { $0.taskID != taskID }
         if older.count > 500 { entries.removeFirst(older.count - 500) }

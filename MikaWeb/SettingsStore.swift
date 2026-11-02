@@ -57,6 +57,11 @@ struct ModelNameValidationIssue {
         if maxSteps != normalized { maxSteps = normalized; return }
         UserDefaults.standard.set(normalized, forKey: "maxSteps")
     } }
+    /// 任务期防锁屏（BACKGROUND-RESILIENCE 层 4）：默认开，会话活跃期禁用自动锁屏、
+    /// 会话结束恢复；持久化在 UserDefaults，引擎订阅本属性即时应用。
+    @Published var keepScreenAwakeDuringTask = UserDefaults.standard.object(forKey: "keepScreenAwakeDuringTask") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(keepScreenAwakeDuringTask, forKey: "keepScreenAwakeDuringTask") }
+    }
     @Published private(set) var provider: ModelProvider
     @Published private(set) var hasKey = !Keychain.read().isEmpty
     static func validateModelName(_ rawValue: String, provider: ModelProvider) -> ModelNameValidationIssue? {
@@ -173,7 +178,9 @@ struct SettingsView: View {
             Section {
                 HStack { Text("最大步数"); Spacer(); Text("\(settings.maxSteps)").monospacedDigit().fontWeight(.semibold); Stepper("最大步数", value: $settings.maxSteps, in: 5...50).labelsHidden() }
                 Text("达到上限后暂停，可继续任务。").font(.caption).foregroundStyle(.secondary)
-                Text("任务执行时，网页内容及你的任务会发送至所选模型服务。任务只在 App 前台内执行，切到后台会暂停。")
+                Toggle("任务运行时保持屏幕常亮", isOn: $settings.keepScreenAwakeDuringTask)
+                Text("开启时任务执行期间屏幕不会自动锁屏，任务结束自动恢复。").font(.caption).foregroundStyle(.secondary)
+                Text("任务执行时，网页内容及你的任务会发送至所选模型服务。切到后台时任务会驻停并保存进度，回到 App 自动接着跑；单步的页面小错误会自动重试，不再一步失败就停下。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("任务") }
             if let diagnostics { Section { NavigationLink("崩溃报告") { CrashReportsView(store: diagnostics) } } }
