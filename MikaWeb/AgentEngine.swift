@@ -46,6 +46,41 @@ struct AgentStep: Identifiable {
     private let settings: SettingsStore
     private var worker: Task<Void, Never>?
     private var generation = UUID()
+    /// 执行代次绑定（M1，2026-11-02——既有代次机制的正式化）：每次 launch
+    /// 换代，代次与 (runSessionID, conversationTaskID) 一起记入
+    /// activeRunContext；worker 在每轮 checkpoint 与每次模型返回后校验
+    /// 代次，用户接管（stop）、新任务取代或恢复续跑换代后，旧代次的迟到
+    /// 模型回复在执行任何动作前被 CancellationError 丢弃。已发出的动作
+    /// 不靠代次回滚——靠成果台账防重复提交（OUTCOME-LEDGER 既有机制）。
+    private(set) var activeRunContext: (sessionID: UUID, taskID: UUID, generation: UUID)?
+    /// 本次运行的启动时刻：只喂执行异常标记（executionAnomaly）——超时
+    /// 只标异常，绝不据此释放或转移执行权。
+    private var runStartedAt: Date?
+    /// 任务所属会话（M1）：引擎的全部运行时状态（目标/步流/状态卡/快照）
+    /// 只服务这一条会话；查看会话（SessionStore 的当前会话指针）切到别处
+    /// 时它不变。仅在引擎空闲时由 adoptDisplayedSession 变更，或由
+    /// startInSession 在新任务启动时设定。
+    private(set) var runSessionID: UUID = SessionStore.shared.currentSessionID
+
+    // MARK: - M1：全局串行队列
+
+    /// 排队中的任务（M1）：全局一条先进先出队列的一项。只存任务文本与
+    /// 所属会话——不预绑标签：入队到启动之间用户可能关页/切页，执行
+    /// 绑定以启动时刻该会话的现场为准（beginExecution(sessionID:)）。
+    struct QueuedTask: Codable, Identifiable, Equatable {
+        let id: UUID
+        let sessionID: UUID
+        let text: String
+        let localPage: String?
+        let enqueuedAt: Date
+    }
+    /// 队列对 UI 公开（会话列表里可见、可取消）；落盘 task-queue.json，
+    /// 进程被杀后重启仍在（所属会话已删的条目在载入时剔除）。
+    @Published private(set) var queuedTasks: [QueuedTask] = []
+    private static var queueFileURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/task-queue.json")
+    }
     private var goal = ""
     private var limit = 25
     private var stepSeq = 0
@@ -74,7 +109,7 @@ struct AgentStep: Identifiable {
     /// 标签现场还没重建——快照里的标签地址先存放在这里，第一次 resume 时才
     /// 由 applyPendingTabRestore 消费（重建标签＋生成 resumeNote）。restoredSession
     /// 标记「本会话来自快照恢复」，didApplyTabRestore 保证现场只处理一次。
-    private var pendingTabScene: (urls: [String], activeIndex: Int, executionIndex: Int?)?
+    private var pendingTabScene: (urls: [String], activeIndex: Int, executionIndex: Int?, pinned: [Bool])?
     private var restoredSession = false
     private var didApplyTabRestore = false
     /// 续跑提示：恢复会话续跑期间随每次模型调用注入 prompt 的说明段（原页面
@@ -142,6 +177,7 @@ struct AgentStep: Identifiable {
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
         loadOutcomeLedger()
+        loadQueue()
         restoreSnapshotIfNeeded()
     }
     var taskLimit: Int { limit }
@@ -163,7 +199,24 @@ struct AgentStep: Identifiable {
         return nil
     }
     func start(local: String? = nil, task: String? = nil) {
+        startInSession(runSessionID, local: local, task: task)
+    }
+
+    /// UI 新任务入口（M1）：以当前查看会话为归属启动。空闲时
+    /// runSessionID 本与查看会话一致（adopt 在每次切换时保持同步），
+    /// 这里显式对齐，防任何边角下任务落进别的会话；程序化调用
+    /// （自检等）仍走 start() 的 runSessionID 语义。
+    func startFromUI(local: String? = nil, task: String? = nil) {
+        startInSession(SessionStore.shared.currentSessionID, local: local, task: task)
+    }
+
+    /// 新任务启动的统一路径（M1）：当前会话的 start 与队列推进的
+    /// startQueued 共用。先在旧 runSessionID 下 stop() 收尾旧任务，再把
+    /// 归属切到目标会话——此后状态重置、快照与执行绑定都按目标会话走
+    /// （旧会话已暂停任务的快照留在它自己的目录里，切回时可恢复）。
+    private func startInSession(_ sessionID: UUID, local: String?, task: String?) {
         stop()
+        runSessionID = sessionID
         guard active else { status = .paused("任务只能在前台执行"); return }
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
@@ -178,13 +231,17 @@ struct AgentStep: Identifiable {
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = UUID()
-        do { if let local { try web.loadLocal(local) } } catch { status = .failed(error.localizedDescription); return }
-        // 任务绑定到开始时的当前标签页：全程作用于它，用户中途手动切页不影响任务（TABS-IMPL）
-        web.beginExecution()
+        autoTitleSessionIfPlaceholder()
+        // 任务绑定到该会话当时的活跃标签页：全程作用于它，用户中途切页／
+        // 切会话不影响任务（TABS-IMPL＋M1）。本地页加载走执行页通道——
+        // 目标会话不是查看会话时不能借道当前页
+        web.beginExecution(sessionID: sessionID)
+        do { if let local { try web.loadLocalOnExecutionTab(local) } } catch { web.endExecution(); status = .failed(error.localizedDescription); return }
         launch()
     }
     func stop() {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        runStartedAt = nil; activeRunContext = nil
         sessionActive = false; applyIdleTimerPolicy()
         endBackgroundGrace()
         completeContinuedProcessing(success: false)
@@ -226,8 +283,8 @@ struct AgentStep: Identifiable {
         // 再启动主循环——循环第一轮的 state() 会等页面加载稳定后才抽状态，
         // 模型拿到的就是原页面＋原目标＋完整历史，而不是起始页＋一句「继续」。
         applyPendingTabRestore()
-        // 绑定还在（确认／手输等待后继续）则沿用原执行页；已解除（如切后台被 stop）则绑定到当前页
-        if web.executionTabID == nil { web.beginExecution() }
+        // 绑定还在（确认／手输等待后继续）则沿用原执行页；已解除（如切后台被 stop）则绑定到本会话当时的活跃页
+        if web.executionTabID == nil { web.beginExecution(sessionID: runSessionID) }
         pending = nil; launch()
     }
 
@@ -248,8 +305,8 @@ struct AgentStep: Identifiable {
         }()
         let outcome: String
         if let scene, scene.urls.contains(where: { !$0.isEmpty }) {
-            if web.tabsArePristine {
-                web.rebuildTabs(urls: scene.urls, activeIndex: scene.activeIndex, executionIndex: scene.executionIndex)
+            if web.tabsArePristine(for: runSessionID) {
+                web.rebuildTabs(urls: scene.urls, activeIndex: scene.activeIndex, executionIndex: scene.executionIndex, pinned: scene.pinned, owner: runSessionID)
                 outcome = executionURL.isEmpty
                     ? "浏览器已按中断时现场重建，中断时执行页是起始页。"
                     : "浏览器已按中断时现场重建，并已开始载入中断时的页面：\(executionURL)（续跑第一步看到的就是它，加载未稳时先用 wait 等待，不要换页）。"
@@ -263,6 +320,251 @@ struct AgentStep: Identifiable {
         }
         resumeNote = "【中断恢复说明】本会话曾因 App 退出而中断，现在续跑。任务目标见上文「任务」，已完成步骤见「历史」，用户此前的回答见「用户补充问答」。\(outcome)硬性规则：任务目标、网址、已完成进度都在上文里，不要用 ask_user 向用户索要任务内容、网址或进度——用户刚经历中断，正等你接着做；若当前页面与中断前不一致、或原页面已失效，先在你的说明里讲清你记得的目标和已做到哪一步，再自行通过站内导航、搜索或直接打开网址找回入口继续。只有当你需要用户做一个新的决策（而不是重复提供已知信息）时，才可以提问。"
     }
+    // MARK: - M1：串行队列、会话 adopt、代次验证
+
+    /// 任务入队（M1）：执行器忙碌时新任务按会话排队。队列全局一条、
+    /// 先进先出，推进只发生在执行权真正空出的终结点（见 advanceQueue）。
+    func enqueueTask(sessionID: UUID, text: String, localPage: String? = nil) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        queuedTasks.append(QueuedTask(id: UUID(), sessionID: sessionID, text: trimmed, localPage: localPage, enqueuedAt: Date()))
+        persistQueue()
+    }
+
+    /// 取消一条排队任务（会话列表的队列区调用）。
+    func cancelQueuedTask(id: UUID) {
+        queuedTasks.removeAll { $0.id == id }
+        persistQueue()
+    }
+
+    /// 删除会话时清掉该会话的排队任务：会话数据随会话一起消失。
+    func cancelQueuedTasks(forSession sessionID: UUID) {
+        let before = queuedTasks.count
+        queuedTasks.removeAll { $0.sessionID == sessionID }
+        if queuedTasks.count != before { persistQueue() }
+    }
+
+    private func persistQueue() {
+        guard let data = try? JSONEncoder().encode(queuedTasks) else { return }
+        try? FileManager.default.createDirectory(at: Self.queueFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: Self.queueFileURL, options: [.atomic])
+    }
+
+    private func loadQueue() {
+        guard let data = try? Data(contentsOf: Self.queueFileURL),
+              let items = try? JSONDecoder().decode([QueuedTask].self, from: data) else { return }
+        // 所属会话已被删除的条目不再恢复（删除编排通常已清队，这里兜底）
+        let known = Set(SessionStore.shared.sessions.map { $0.id })
+        queuedTasks = items.filter { known.contains($0.sessionID) }
+    }
+
+    /// 队列推进（M1 执行权语义）：仅从终结点调用——任务完成（worker 的
+    /// done 分支）、任务失败落定（worker 外层 catch）、用户手动停止
+    /// （stopFromUser，此时状态为已暂停、靠 afterUserStop 放行）。等待
+    /// 确认／等待人工／步数暂停／循环熔断都不算终结，执行权不转移；
+    /// 执行超时更不触发推进——本函数没有任何按时长的调用点（超时只走
+    /// executionAnomaly 标记）。模型未就绪时不推进：队首留在队里，
+    /// 用户处理完 Key／登录后，下一个终结点会再试。
+    private func advanceQueue(afterUserStop: Bool = false) {
+        guard active, let next = queuedTasks.first else { return }
+        switch status {
+        case .done, .failed, .idle: break
+        case .paused: guard afterUserStop else { return }
+        default: return
+        }
+        guard modelReadinessIssue() == nil else { return }
+        queuedTasks.removeFirst()
+        persistQueue()
+        startQueued(next)
+    }
+
+    private func startQueued(_ item: QueuedTask) {
+        startInSession(item.sessionID, local: item.localPage, task: item.text)
+    }
+
+    /// 用户点「停止」（M1）：在 stop 之外推进队列。start 自身走的是
+    /// stop()、不经这里——新任务取代旧任务时不顺带把队列点着。
+    func stopFromUser() {
+        stop()
+        advanceQueue(afterUserStop: true)
+    }
+
+    /// 执行异常标记（M1 执行权语义）：任务连续执行超过 30 分钟只标
+    /// 异常供用户判断——不自动释放、不转移执行权、不动任务本身（长
+    /// 任务合法存在；自动放权会让两个任务同写一个浏览器现场）。
+    /// 会话列表展示这条标记。
+    var executionAnomaly: String? {
+        guard busy, let runStartedAt else { return nil }
+        let minutes = Int(Date().timeIntervalSince(runStartedAt) / 60)
+        guard minutes >= 30 else { return nil }
+        return "任务已连续执行 \(minutes) 分钟（异常长）——执行权仍在本任务，未自动转移；如确已卡死，可手动停止后再继续或重开。"
+    }
+
+    /// 新任务自动命名会话（M1）：经 UI 新建的会话标题是占位「新会话」，
+    /// 其第一个任务启动时以任务文本命名，列表里才认得出哪个会话干过
+    /// 什么；用户改过名的会话不再动。
+    private func autoTitleSessionIfPlaceholder() {
+        let store = SessionStore.shared
+        guard let meta = store.sessions.first(where: { $0.id == runSessionID }), meta.title == "新会话" else { return }
+        store.renameSession(id: runSessionID, title: String(goal.prefix(16)))
+    }
+
+    /// 切换查看会话时引擎侧的跟随动作（M1）：空闲时把运行时整体切到
+    /// 新会话——内存态清零（resetRuntimeState）、载入新会话的未完成
+    /// 快照（有才恢复）、标签换到新会话的集合。执行中（含等待确认／
+    /// 等待人工／已暂停）只换标签显示：运行现场属于原会话，绝不在此
+    /// 清零或接管，用户切回来时它还在原地——已暂停任务靠它自己的
+    /// 快照，在引擎下次空闲 adopt 回原会话时恢复。
+    /// 前置：编排方已先 setCurrentSession 并让对话存储换源（顺序见
+    /// SessionListView 的切换动作）。
+    func adoptDisplayedSession(_ sessionID: UUID) {
+        guard sessionID != runSessionID, !busy else { web.showSessionTabs(sessionID); return }
+        runSessionID = sessionID
+        resetRuntimeState()
+        restoreSnapshot(for: sessionID, allowLegacy: false)
+        web.showSessionTabs(sessionID)
+    }
+
+    /// 运行时内存态清零（M1）：adopt 切会话用。清单与自检四「模拟进程
+    /// 中断」的清零段同源（漏清任何一项都会把上一会话的步流／等待态
+    /// 串进新会话）；两处刻意不同的是成果台账——自检四连台账本体一并
+    /// 清掉以证明恢复只靠快照，这里不清：台账是 App 级防重证据（按
+    /// 会话隔离的是状态卡里的引用与快照双写），切会话清了它会让别的
+    /// 会话刚提交过的动作失去防重保护；快照恢复时按 id 合并回来。
+    private func resetRuntimeState() {
+        generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
+        lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        conversationTaskID = nil; sessionActive = false; status = .idle
+        pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
+        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
+        runStartedAt = nil; activeRunContext = nil
+    }
+
+    /// 代次失效验证（自检九子项，M1）：捕获当前代次为 stale、换代后对
+    /// stale 代次调 checkpoint 必须抛 CancellationError——证明「旧代次
+    /// 的迟到模型回复不得再执行任何动作」的闸在引擎入口成立（worker
+    /// 在每轮开头与每次模型返回后都过 checkpoint，动作执行前必经此闸，
+    /// runTargeted／runConfirmed 内部同样校验）。仅在引擎空闲时调用
+    /// （换代即 stop 的语义，忙碌时调用会误杀在跑的任务），自检九的
+    /// 编排保证这一点。
+    func verifyStaleGenerationDiscarded() async -> Bool {
+        guard !busy else { return false }
+        let stale = generation
+        generation = UUID()
+        do {
+            try await checkpoint(stale)
+            return false
+        } catch is CancellationError {
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 删除会话时回收其标签（自检九清理与会话列表的删除编排共用口径，
+    /// 转 WebController.discardTabs；前提同该函数：非执行/非查看会话）。
+    func discardTabsForSession(_ sessionID: UUID) { web.discardTabs(for: sessionID) }
+
+    /// 自检九 Tier A（M1）：多会话外壳的程序化核查——建 3 个 scratch
+    /// 会话、各开标签、置顶与关闭守卫、跨会话切换（标签对象/地址/导航
+    /// 计数不变＝未销毁未重载）、队列落盘往返、代次失效。全程不调用
+    /// 模型；要求引擎空闲（忙碌时直接返回未执行说明行）。scratch 会话
+    /// 结束时删除干净、查看会话切回原处；唯一刻意留下的痕迹是原会话
+    /// 的 lastActiveAt 被切换动作刷新（索引层时间戳，无功能影响）。
+    /// 注意：本函数直接操作 SessionStore 指针与标签集合，不经对话
+    /// 存储换源（测试期间对话停留在原会话，报告条目也记在原会话）；
+    /// 结束时指针切回原会话，指针／对话／标签三方重新一致。
+    func verifyMultiSessionShell() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，Tier A 未执行（先等当前任务终结或停止）"] }
+        var lines: [String] = []
+        let store = SessionStore.shared
+        let originalID = store.currentSessionID
+        let originalTabCount = web.tabs(for: originalID).count
+        let a = store.createSession(title: "自检九A")
+        let b = store.createSession(title: "自检九B")
+        let c = store.createSession(title: "自检九C")
+        let scratch = [a.id, b.id, c.id]
+        lines.append(store.sessions.filter { scratch.contains($0.id) }.count == 3
+            ? "✓ 三个 scratch 会话建成并在索引在位"
+            : "✗ scratch 会话创建不全")
+        // —— 会话 A：3 个标签各加载一个本地页 ——
+        store.setCurrentSession(id: a.id)
+        web.showSessionTabs(a.id)
+        let tabA1 = web.tabs(for: a.id)[0]
+        let tabA2 = web.newTab()
+        let tabA3 = web.newTab()
+        try? tabA1.loadLocal("test-form")
+        try? tabA2.loadLocal("test-news")
+        try? tabA3.loadLocal("test-entries")
+        // —— 置顶排序与关闭守卫 ——
+        web.setTabPinned(tabA1.id, true)
+        lines.append(web.visibleTabs.first?.id == tabA1.id
+            ? "✓ 置顶标签排在标签列表最前"
+            : "✗ 置顶标签未排到最前")
+        web.closeTab(tabA1.id)
+        lines.append(web.tabs(for: a.id).count == 3
+            ? "✓ 置顶守卫：置顶标签的关闭被拒绝（须先取消置顶才能关）"
+            : "✗ 置顶标签被关闭了（守卫失效）")
+        try? await Task.sleep(for: .milliseconds(900))
+        let idsA = web.tabs(for: a.id).map { ObjectIdentifier($0) }
+        let revsA = web.tabs(for: a.id).map { $0.revision }
+        let urlsA = web.tabs(for: a.id).map { $0.urlString }
+        lines.append(urlsA.count == 3 && urlsA[0].contains("test-form") && urlsA[1].contains("test-news") && urlsA[2].contains("test-entries")
+            ? "✓ A 的 3 个标签各就各位（表单／资讯／活动页）"
+            : "✗ A 的标签地址不对：\(urlsA)")
+        // —— 切到 B：可见集只剩 B 的，A 的标签原样保留 ——
+        store.setCurrentSession(id: b.id)
+        web.showSessionTabs(b.id)
+        let bTabs = web.visibleTabs
+        lines.append(bTabs.count == 1 && bTabs[0].sessionID == b.id
+            ? "✓ 切到 B：可见标签只剩 B 自己的起始页（A 的标签隐藏不销毁）"
+            : "✗ 切到 B 后可见标签集不对（\(bTabs.count) 个）")
+        if let bTab = bTabs.first { try? bTab.loadLocal("test-news") }
+        let stillA = web.tabs(for: a.id)
+        lines.append(stillA.map { ObjectIdentifier($0) } == idsA && stillA.map { $0.revision } == revsA && stillA.map { $0.urlString } == urlsA
+            ? "✓ A 的标签在切走期间对象／地址／导航计数全不变（未销毁、未重载）"
+            : "✗ A 的标签在切走期间发生变化（对象或导航计数变了）")
+        // —— 切回 A：置顶保留、现场不变 ——
+        store.setCurrentSession(id: a.id)
+        web.showSessionTabs(a.id)
+        let backA = web.visibleTabs
+        lines.append(backA.first?.id == tabA1.id && backA.first?.isPinned == true && web.tabs(for: a.id).map { $0.revision } == revsA
+            ? "✓ 切回 A：置顶保留且仍排最前，标签导航计数不变（切换无重载）"
+            : "✗ 切回 A 后置顶或标签现场有变")
+        // —— 队列落盘往返 ——
+        enqueueTask(sessionID: b.id, text: "自检九排队样本")
+        let inMemory = queuedTasks.contains { $0.sessionID == b.id && $0.text == "自检九排队样本" }
+        var inFile = false
+        if let data = try? Data(contentsOf: Self.queueFileURL),
+           let items = try? JSONDecoder().decode([QueuedTask].self, from: data) {
+            inFile = items.contains { $0.sessionID == b.id && $0.text == "自检九排队样本" }
+        }
+        if let item = queuedTasks.first(where: { $0.sessionID == b.id }) { cancelQueuedTask(id: item.id) }
+        let goneAfterCancel = !queuedTasks.contains { $0.sessionID == b.id }
+        lines.append(inMemory && inFile && goneAfterCancel
+            ? "✓ 队列：入队后内存与落盘文件都在位，取消后消失"
+            : "✗ 队列往返异常（内存 \(inMemory)、落盘 \(inFile)、取消后消失 \(goneAfterCancel)）")
+        // —— 代次失效 ——
+        let staleOK = await verifyStaleGenerationDiscarded()
+        lines.append(staleOK
+            ? "✓ 代次失效：旧代次的 checkpoint 被拒（迟到模型回复不得再执行任何动作）"
+            : "✗ 代次失效验证未通过")
+        // —— 清理：切回原会话、回收 scratch 标签、删 scratch 会话 ——
+        store.setCurrentSession(id: originalID)
+        web.showSessionTabs(originalID)
+        for id in scratch { web.discardTabs(for: id) }
+        var deletedAll = true
+        for id in scratch { if !store.deleteSession(id: id) { deletedAll = false } }
+        let restoredTabs = web.tabs(for: originalID).count == originalTabCount
+        lines.append(deletedAll && restoredTabs && store.currentSessionID == originalID
+            ? "✓ 清理完成：scratch 会话与标签已删净，查看会话与原标签数量已复原"
+            : "✗ 清理不完全（删除 \(deletedAll)、原标签数复原 \(restoredTabs)）")
+        return lines
+    }
+
     func submitAnswer(_ text: String, requestID: UUID) -> AnswerSubmissionResult {
         let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !answer.isEmpty else { return .rejected("请输入回答") }
@@ -296,6 +598,10 @@ struct AgentStep: Identifiable {
         // 本身一字不改，页面对不上仍安全失败，绝不误执行）。
         applyPendingTabRestore()
         generation = UUID(); let token = generation
+        // 代次绑定（M1）：本代次与所属会话、对话任务一并记录；stop/新任务
+        // 换代后，旧代次的 worker 在 checkpoint 处自行退出（见类头注释）
+        runStartedAt = Date()
+        activeRunContext = conversationTaskID.map { (sessionID: runSessionID, taskID: $0, generation: token) }
         worker?.cancel(); status = .running; sessionActive = true; applyIdleTimerPolicy()
         transientStreak = 0
         web.agentWorkSuspended = false // launch 只从前台路径进入，驻停标记在此兜底复位
@@ -342,6 +648,9 @@ struct AgentStep: Identifiable {
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
                             web.endExecution(); clearSnapshot(); resumeNote = nil
+                            // 执行权在此真正空出（M1 串行队列的推进点之一）：
+                            // 队首任务（若有）在它自己的会话里接着启动
+                            advanceQueue()
                             return
                         }
                         if action.action == "ask_user" {
@@ -483,7 +792,7 @@ struct AgentStep: Identifiable {
                 endBackgroundGrace(); completeContinuedProcessing(success: false)
                 web.endExecution(); clearSnapshot(); resumeNote = nil
                 if error is CancellationError { status = .paused("已取消") }
-                else { status = .failed(error.localizedDescription) }
+                else { status = .failed(error.localizedDescription); advanceQueue() }
             }
         }
     }
@@ -1114,6 +1423,10 @@ struct AgentStep: Identifiable {
         var tabURLs: [String]?
         var activeTabIndex: Int?
         var executionTabIndex: Int?
+        // M1 起：标签置顶标记（与 tabURLs 同序）——置顶是会话现场的一
+        // 部分，中断恢复时按它还原，置顶入口不因进程被杀而丢。可选字段，
+        // 此前快照无此键照常解码（恢复时按全未置顶处理）。
+        var tabPinned: [Bool]? = nil
         // OUTCOME-LEDGER 起：成果台账随快照双写——台账本体另有自有持久化，
         // 快照里的这份保证「随会话恢复的正是本会话的条目」，恢复时按 id
         // 合并去重。可选字段，此前快照无此键照常解码。
@@ -1128,13 +1441,16 @@ struct AgentStep: Identifiable {
     /// 迁移/新落盘成功后即清除，防止旧快照被反复当作新状态恢复。
     private static let snapshotKey = "agentSessionSnapshot.v1"
 
-    /// 读取当前会话的快照数据：优先会话文件；文件不存在时走一次性迁移
-    /// ——把旧 UserDefaults 快照复制进会话文件（写成功后才清旧键，写失败
-    /// 则原样返回旧数据、下次启动重试迁移，数据不丢）。
-    private func loadSnapshotData() -> Data? {
-        let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+    /// 读取某会话的快照数据（M1 起按会话取）：优先该会话的快照文件；
+    /// 文件不存在时，仅对当前会话走一次性迁移——把旧 UserDefaults 快照
+    /// 复制进会话文件（写成功后才清旧键，写失败则原样返回旧数据、下次
+    /// 启动重试迁移，数据不丢）。旧键诞生于单会话时代，只属于当前会话，
+    /// 读别的会话时不碰它（allowLegacy=false 时同样不迁）。
+    private func loadSnapshotData(for sessionID: UUID, allowLegacy: Bool = true) -> Data? {
+        let url = SessionStore.shared.snapshotURL(for: sessionID)
         if let data = try? Data(contentsOf: url) { return data }
-        guard let legacy = UserDefaults.standard.data(forKey: Self.snapshotKey) else { return nil }
+        guard allowLegacy, sessionID == SessionStore.shared.currentSessionID,
+              let legacy = UserDefaults.standard.data(forKey: Self.snapshotKey) else { return nil }
         do {
             try legacy.write(to: url, options: [.atomic])
             UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
@@ -1184,8 +1500,8 @@ struct AgentStep: Identifiable {
         // 恢复来的、现场还没被续跑消费（标签仍是冷启动起始页），写下的应是
         // 暂存的中断现场而不是起始页——否则一次后台落盘（setForeground 的
         // persistSnapshot）就会把原地址冲掉，恢复便无从谈起。
-        let scene: (urls: [String], activeIndex: Int, executionIndex: Int?)
-        if let pending = pendingTabScene { scene = pending } else { scene = web.tabScene() }
+        let scene: (urls: [String], activeIndex: Int, executionIndex: Int?, pinned: [Bool])
+        if let pending = pendingTabScene { scene = pending } else { scene = web.tabScene(for: runSessionID) }
         let snapshot = SessionSnapshot(savedAt: Date(), goal: goal, limit: limit, stepSeq: stepSeq,
                                        steps: steps.map { SessionSnapshot.StepDTO(id: $0.id, action: $0.action, reason: $0.reason) },
                                        statusKind: kind, statusText: text,
@@ -1193,14 +1509,16 @@ struct AgentStep: Identifiable {
                                        waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
                                        skillNames: loadedSkillNames,
                                        taskID: conversationTaskID,
-                                       tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex,
+                                       tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex, tabPinned: scene.pinned,
                                        outcomes: outcomeLedger,
                                        stateCard: stateCard,
-                                       sessionID: SessionStore.shared.currentSessionID)
+                                       sessionID: runSessionID)
         if let data = try? JSONEncoder().encode(snapshot) {
-            // H1：快照落当前会话的 snapshot.json（按会话分库）；旧键若还在
-            // （迁移未发生的边角）一并清除，防止旧快照复活盖掉新状态
-            let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+            // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
+            // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
+            // A 的目录）；旧键若还在（迁移未发生的边角）一并清除，防止
+            // 旧快照复活盖掉新状态
+            let url = SessionStore.shared.snapshotURL(for: runSessionID)
             try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             if UserDefaults.standard.object(forKey: Self.snapshotKey) != nil {
                 UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
@@ -1209,7 +1527,8 @@ struct AgentStep: Identifiable {
     }
 
     private func clearSnapshot() {
-        let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+        // 清的是任务所属会话的快照（M1：按 runSessionID，不随查看会话走）
+        let url = SessionStore.shared.snapshotURL(for: runSessionID)
         try? FileManager.default.removeItem(at: url)
         UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
     }
@@ -1224,9 +1543,19 @@ struct AgentStep: Identifiable {
     /// 对话层据此识别「同一任务的恢复」，不重复回放任务与步流（CRASH-1031
     /// 的持久化去重跨进程成立的前提）。
     private func restoreSnapshotIfNeeded() {
-        guard let data = loadSnapshotData(),
+        restoreSnapshot(for: runSessionID, allowLegacy: true)
+    }
+
+    /// 按会话恢复（M1 泛化自冷启动恢复）：只认 24 小时内、且快照自记的
+    /// sessionID 与目标会话一致的非终结快照（H1 起快照带 sessionID；
+    /// 更旧的快照无此字段，只会躺在其诞生会话的目录或旧键里，按目标
+    /// 会话认领）。恢复语义与冷启动一致：停在「可继续」一侧，标签现场
+    /// 暂存待第一次续跑时重建。
+    private func restoreSnapshot(for sessionID: UUID, allowLegacy: Bool) {
+        guard let data = loadSnapshotData(for: sessionID, allowLegacy: allowLegacy),
               let snapshot = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
               Date().timeIntervalSince(snapshot.savedAt) < 24 * 3600, !snapshot.goal.isEmpty else { return }
+        if let owner = snapshot.sessionID, owner != sessionID { return }
         goal = snapshot.goal
         taskText = snapshot.goal
         limit = snapshot.limit
@@ -1269,7 +1598,7 @@ struct AgentStep: Identifiable {
         restoredSession = true
         didApplyTabRestore = false
         if let urls = snapshot.tabURLs {
-            pendingTabScene = (urls: urls, activeIndex: snapshot.activeTabIndex ?? 0, executionIndex: snapshot.executionTabIndex)
+            pendingTabScene = (urls: urls, activeIndex: snapshot.activeTabIndex ?? 0, executionIndex: snapshot.executionTabIndex, pinned: snapshot.tabPinned ?? [])
         }
         switch snapshot.statusKind {
         case "waitingConfirm":
@@ -1299,7 +1628,7 @@ struct AgentStep: Identifiable {
     func simulateInterruptionForResumeTest() -> String {
         let beforeGoal = goal
         let beforeSteps = steps.count
-        let beforeScene = web.tabScene()
+        let beforeScene = web.tabScene(for: runSessionID)
         let beforeExecutionURL: String = {
             if let index = beforeScene.executionIndex, beforeScene.urls.indices.contains(index) { return beforeScene.urls[index] }
             return beforeScene.urls.indices.contains(beforeScene.activeIndex) ? beforeScene.urls[beforeScene.activeIndex] : ""
@@ -1317,7 +1646,7 @@ struct AgentStep: Identifiable {
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; outcomeLedger = []
         // 状态卡与折叠/重试内存态同样清零：恢复出的卡片只能来自快照（H1）
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
-        web.resetTabsToStartPage()
+        web.resetTabsToStartPage(sessionID: runSessionID)
         // —— 仅凭落盘恢复 ——
         restoreSnapshotIfNeeded()
         let restored = !goal.isEmpty

@@ -203,6 +203,11 @@ struct BrowserDockView: View {
     /// 视图只是呈现层，导航／sheet 往返重建视图时状态不丢。下四名为转发
     /// 计算属性，本文件其余代码读写习惯不变。
     @ObservedObject var dock: DockStateStore
+    /// 「返回执行页」回调（M1，ContentView 提供）：任务在别的会话执行时，
+    /// 坞的会话条上给出此入口——把查看侧整体带回任务会话并让执行标签
+    /// 成为当前页（编排在 ContentView.returnToExecution）。经 BrowserView
+    /// 的会话条呈现，本层只透传。
+    var onReturnToExecution: (() -> Void)? = nil
     private var mode: DockMode {
         get { dock.mode }
         nonmutating set { dock.mode = newValue }
@@ -342,7 +347,7 @@ struct BrowserDockView: View {
     private func dockCard(area size: CGSize, scale: CGFloat, visual: CGSize) -> some View {
         let layoutSize = CGSize(width: size.width * layoutScale, height: size.height * layoutScale)
         let renderScale = layoutScale > 0 ? scale / layoutScale : scale
-        return BrowserView(controller: web, showsTabsUI: mode == .expanded)
+        return BrowserView(controller: web, showsTabsUI: mode == .expanded, onReturnToExecution: onReturnToExecution)
             .frame(width: layoutSize.width, height: layoutSize.height)
             .scaleEffect(renderScale)
             .frame(width: visual.width, height: visual.height)

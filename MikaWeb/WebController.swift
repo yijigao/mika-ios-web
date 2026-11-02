@@ -75,6 +75,15 @@ enum SiteMode: String {
 // 地址重载恢复该页（系统行为，见 webViewWebContentProcessDidTerminate）。
 @MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, Identifiable {
     let id = UUID()
+    /// 所属会话（M1，2026-11-02）：标签归属会话——切会话只换可见标签集合，
+    /// 其余会话的标签保留在管理器里隐藏、不销毁、不重载。创建时由
+    /// WebController 按语境指定（查看会话／执行会话／opener 所在会话）。
+    var sessionID: UUID
+    /// 置顶（M1）：纯元数据——在标签列表里排前、关闭被守卫拒绝（见
+    /// WebController.closeTab，含任何批量关闭路径，须先取消置顶才能关）。
+    /// 不承诺网页进程永驻：进程被系统回收时按最后已知地址重载恢复
+    /// （webViewWebContentProcessDidTerminate 既有路径）。
+    @Published var isPinned = false
     let webView: WKWebView
     @Published private(set) var urlString = ""
     @Published private(set) var title = ""
@@ -90,7 +99,8 @@ enum SiteMode: String {
     /// configuration 非空时用于承接 window.open／target=_blank 的新窗口（须用 WebKit 给的
     /// 配置原样建 WKWebView，opener 关系由 WebKit 经该配置维系）；此时不加载起始页，
     /// 弹窗请求由 WebKit 自行载入。
-    init(configuration: WKWebViewConfiguration? = nil, loadStartPage: Bool = true) {
+    init(configuration: WKWebViewConfiguration? = nil, loadStartPage: Bool = true, sessionID: UUID = SessionStore.shared.currentSessionID) {
+        self.sessionID = sessionID
         let config = configuration ?? Self.makeConfiguration()
         // 探针装配走复用器：window.open 所给的配置与发起页共享同一
         // WKUserContentController，逐标签重复注册同名 handler 会抛
@@ -309,6 +319,18 @@ enum SiteMode: String {
     let dockState = DockStateStore()
     /// 任务绑定的标签页；nil＝没有任务绑定（state／execute 回落到当前页）
     @Published private(set) var executionTabID: UUID?
+    /// 正在查看的会话（M1）：当前页与标签列表只呈现本会话的标签集合。
+    /// 与引擎的 runSessionID（任务所属会话）相互独立——任务可在别的会话的
+    /// 标签上继续执行（执行页本就不必在视图层级里，既有「执行页≠当前页」
+    /// 形态的自然延伸）；切换查看会话不打断执行（见 showSessionTabs）。
+    @Published private(set) var displayedSessionID: UUID
+    /// 执行任务所属会话（M1）：由 AgentEngine 经 beginExecution(sessionID:)
+    /// 同步；open_new_tab 等执行通道新建的标签归属它而非查看会话。
+    private(set) var executionSessionID: UUID?
+    /// 每会话离开时的活跃标签（内存态）：切回该会话时恢复到那一页。
+    /// 标签现场本身不跨进程持久（跨进程靠引擎快照的地址现场重建），
+    /// 本表同寿命即可。
+    private var lastActiveTabBySession: [UUID: UUID] = [:]
     /// agent 工作驻停标记（BACKGROUND-RESILIENCE，由 AgentEngine 在切后台时置位）：
     /// 置位期间 agent 通道的加载等待与 DOM 静默轮询立即收敛停手——不再向正在被
     /// 系统挂起的网页进程发探针（0808 的 scene-update 看门狗终止教训：进后台的
@@ -318,10 +340,12 @@ enum SiteMode: String {
     private var tabCancellables: [UUID: AnyCancellable] = [:]
 
     override init() {
-        let first = BrowserTab()
+        let initialSession = SessionStore.shared.currentSessionID
+        let first = BrowserTab(sessionID: initialSession)
         tabs = [first]
         activeTabID = first.id
         executionTabID = nil
+        displayedSessionID = initialSession
         super.init()
         adopt(first)
     }
@@ -333,7 +357,16 @@ enum SiteMode: String {
         }
     }
 
-    var activeTab: BrowserTab { tabs.first(where: { $0.id == activeTabID }) ?? tabs[0] }
+    var activeTab: BrowserTab { tabs.first(where: { $0.id == activeTabID }) ?? visibleTabs.first ?? tabs[0] }
+
+    /// 查看会话的标签集合（M1）：置顶在前、其余按创建顺序——标签列表、
+    /// 标签计数与总览都以它为准；其余会话的标签只存在于 tabs 全集里。
+    var visibleTabs: [BrowserTab] {
+        let mine = tabs.filter { $0.sessionID == displayedSessionID }
+        return mine.filter { $0.isPinned } + mine.filter { !$0.isPinned }
+    }
+    /// 某会话的全部标签（创建顺序，含置顶）。
+    func tabs(for sessionID: UUID) -> [BrowserTab] { tabs.filter { $0.sessionID == sessionID } }
     var executionTab: BrowserTab { executionTabID.flatMap { id in tabs.first(where: { $0.id == id }) } ?? activeTab }
     func tabTitle(for id: UUID) -> String {
         guard let tab = tabs.first(where: { $0.id == id }) else { return "新标签页" }
@@ -365,13 +398,14 @@ enum SiteMode: String {
 
     // MARK: - 标签管理
 
-    /// 新建标签并切换过去；urlString 非空时在新页打开该地址。
+    /// 新建标签并切换过去（归属查看会话）；urlString 非空时在新页打开该地址。
     @discardableResult
     func newTab(urlString: String? = nil) -> BrowserTab {
-        let tab = BrowserTab()
+        let tab = BrowserTab(sessionID: displayedSessionID)
         tabs.append(tab)
         adopt(tab)
         activeTabID = tab.id
+        lastActiveTabBySession[displayedSessionID] = tab.id
         if let urlString, !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             try? tab.load(urlString)
         }
@@ -379,8 +413,9 @@ enum SiteMode: String {
     }
 
     func activateTab(_ id: UUID) {
-        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        guard let tab = tabs.first(where: { $0.id == id && $0.sessionID == displayedSessionID }) else { return }
         activeTabID = id
+        lastActiveTabBySession[displayedSessionID] = id
         // 会话恢复时延迟载入的标签：用户第一次切到它时才真正打开原地址
         if let pending = tab.pendingRestoreURL {
             tab.pendingRestoreURL = nil
@@ -388,20 +423,86 @@ enum SiteMode: String {
         }
     }
 
-    // MARK: - 会话现场快照与恢复（RESUME-CONTEXT-FIX）
-
-    /// 当前全部标签页的地址现场（供 AgentEngine 的会话快照落盘）：每页的当前
-    /// 地址（起始页为空串）、当前页下标、执行页下标（无绑定为 nil）。
-    func tabScene() -> (urls: [String], activeIndex: Int, executionIndex: Int?) {
-        (tabs.map { $0.urlString },
-         tabs.firstIndex(where: { $0.id == activeTabID }) ?? 0,
-         executionTabID.flatMap { id in tabs.firstIndex(where: { $0.id == id }) })
+    /// 切换查看会话（M1）：只换可见标签集合——目标会话一张标签都没有时
+    /// （新建会话）补一张该会话的起始页；活动页恢复到该会话离开时的那张。
+    /// 其余会话的标签对象、页面状态与执行绑定一概不动：不销毁、不重载、
+    /// 不改执行页（任务在自己会话的标签上继续跑）。
+    func showSessionTabs(_ sessionID: UUID) {
+        if sessionID != displayedSessionID {
+            lastActiveTabBySession[displayedSessionID] = activeTabID
+            displayedSessionID = sessionID
+        }
+        var mine = tabs.filter { $0.sessionID == sessionID }
+        if mine.isEmpty {
+            let fresh = BrowserTab(sessionID: sessionID)
+            tabs.append(fresh)
+            adopt(fresh)
+            mine = [fresh]
+        }
+        let target = lastActiveTabBySession[sessionID].flatMap { id in mine.first(where: { $0.id == id }) } ?? mine[0]
+        activeTabID = target.id
+        lastActiveTabBySession[sessionID] = target.id
+        if let pending = target.pendingRestoreURL {
+            target.pendingRestoreURL = nil
+            target.restoreLoad(pending)
+        }
     }
 
-    /// 标签现场是否「全新未动过」：冷启动后用户还没打开过任何网页（只有起始
-    /// 页）。恢复会话时只有现场全新才整组重建——用户重启后已手动浏览过的话，
-    /// 不拿快照覆盖他的手动现场（引擎改走「提示模型原地址、自行导航」口径）。
-    var tabsArePristine: Bool { tabs.allSatisfy { $0.urlString.isEmpty && $0.pendingRestoreURL == nil } }
+    /// 标签置顶开关（M1）：置顶即时生效于列表排序（置顶在前）与关闭守卫；
+    /// 它只是元数据，不改变标签的加载与保活行为。
+    func setTabPinned(_ id: UUID, _ pinned: Bool) {
+        tabs.first(where: { $0.id == id })?.isPinned = pinned
+    }
+
+    /// 「返回执行页」（M1，坞上入口）：把可见标签集合切到执行会话、并让
+    /// 执行标签成为当前页。只动查看侧——执行绑定与任务本身不受影响；
+    /// 会话指针与对话换源由调用方（ContentView）在此之前完成。
+    func revealExecutionTab() {
+        guard let execID = executionTabID,
+              let owner = tabs.first(where: { $0.id == execID })?.sessionID else { return }
+        showSessionTabs(owner)
+        activeTabID = execID
+        lastActiveTabBySession[owner] = execID
+        if let pending = executionTab.pendingRestoreURL {
+            executionTab.pendingRestoreURL = nil
+            executionTab.restoreLoad(pending)
+        }
+    }
+
+    /// 删除会话时回收其全部标签（M1）：标签对象逐个销毁。调用前提由
+    /// 编排方保证：该会话不是执行会话（运行中会话禁删，其标签是任务
+    /// 现场）、也不是查看会话（删查看会话先切换，见 SessionListView）。
+    func discardTabs(for sessionID: UUID) {
+        for tab in tabs where tab.sessionID == sessionID { teardown(tab) }
+        tabs.removeAll { $0.sessionID == sessionID }
+        lastActiveTabBySession[sessionID] = nil
+        if let bound = executionTabID, tabs.first(where: { $0.id == bound }) == nil { executionTabID = nil }
+        if executionSessionID == sessionID { executionSessionID = nil }
+    }
+
+    // MARK: - 会话现场快照与恢复（RESUME-CONTEXT-FIX）
+
+    /// 某会话的标签页地址现场（供 AgentEngine 的会话快照落盘，M1 起按会话
+    /// 取）：该会话每页的当前地址（起始页为空串）、该会话活跃页下标、执行
+    /// 页下标（执行页不在该会话时为 nil）、置顶标记（与地址同序）。其余
+    /// 会话的标签不进现场、也不被恢复波及。
+    func tabScene(for sessionID: UUID) -> (urls: [String], activeIndex: Int, executionIndex: Int?, pinned: [Bool]) {
+        let mine = tabs.filter { $0.sessionID == sessionID }
+        guard !mine.isEmpty else { return ([], 0, nil, []) }
+        let lastActive = lastActiveTabBySession[sessionID] ?? (sessionID == displayedSessionID ? activeTabID : mine[0].id)
+        return (mine.map { $0.urlString },
+                mine.firstIndex(where: { $0.id == lastActive }) ?? 0,
+                executionTabID.flatMap { id in mine.firstIndex(where: { $0.id == id }) },
+                mine.map { $0.isPinned })
+    }
+
+    /// 某会话的标签现场是否「全新未动过」：冷启动后该会话还没打开过任何
+    /// 网页（只有起始页）。恢复该会话时只有现场全新才整组重建——用户重启
+    /// 后已在该会话里手动浏览过的话，不拿快照覆盖他的手动现场（引擎改走
+    /// 「提示模型原地址、自行导航」口径）。
+    func tabsArePristine(for sessionID: UUID) -> Bool {
+        tabs.filter { $0.sessionID == sessionID }.allSatisfy { $0.urlString.isEmpty && $0.pendingRestoreURL == nil }
+    }
 
     private func teardown(_ tab: BrowserTab) {
         tabCancellables[tab.id]?.cancel()
@@ -411,53 +512,68 @@ enum SiteMode: String {
         tab.webView.uiDelegate = nil
     }
 
-    /// 按快照重建标签现场：拆掉现有标签（调用方须先以 tabsArePristine 把关），
-    /// 逐页按原地址建回——当前页与执行页立即载入，其余页只记地址、切到时再
-    /// 载入；空地址页就是起始页。执行绑定按 executionIndex 恢复。
-    func rebuildTabs(urls: [String], activeIndex: Int, executionIndex: Int?) {
-        for tab in tabs { teardown(tab) }
+    /// 按快照重建某会话的标签现场：只拆建该会话的标签（调用方须先以
+    /// tabsArePristine(for:) 把关；其余会话的标签原样保留），逐页按原地址
+    /// 建回——该会话的活跃页与执行页立即载入，其余页只记地址、切到时再
+    /// 载入；空地址页就是起始页；置顶按现场的元数据还原。执行绑定按
+    /// executionIndex 恢复（指向已拆除标签的旧绑定一并清掉）。
+    func rebuildTabs(urls: [String], activeIndex: Int, executionIndex: Int?, pinned: [Bool] = [], owner sessionID: UUID) {
+        for tab in tabs where tab.sessionID == sessionID { teardown(tab) }
+        tabs.removeAll { $0.sessionID == sessionID }
         let source = urls.isEmpty ? [""] : urls
         var created: [BrowserTab] = []
-        for raw in source {
+        for (offset, raw) in source.enumerated() {
             let url = raw.isEmpty ? nil : URL(string: raw)
-            let tab = BrowserTab(loadStartPage: url == nil)
+            let tab = BrowserTab(loadStartPage: url == nil, sessionID: sessionID)
+            if pinned.indices.contains(offset), pinned[offset] { tab.isPinned = true }
             created.append(tab)
             adopt(tab)
             if let url {
-                if created.count - 1 == activeIndex || created.count - 1 == executionIndex {
+                if offset == activeIndex || offset == executionIndex {
                     tab.restoreLoad(url)
                 } else {
                     tab.pendingRestoreURL = url
                 }
             }
         }
-        tabs = created
+        tabs.append(contentsOf: created)
         let clampedActive = min(max(activeIndex, 0), created.count - 1)
-        activeTabID = created[clampedActive].id
+        lastActiveTabBySession[sessionID] = created[clampedActive].id
+        if sessionID == displayedSessionID { activeTabID = created[clampedActive].id }
         if let executionIndex, created.indices.contains(executionIndex) {
             executionTabID = created[executionIndex].id
-        } else {
+        } else if let bound = executionTabID, tabs.first(where: { $0.id == bound }) == nil {
             executionTabID = nil
         }
     }
 
-    /// 回到单页起始页（仅自检四模拟进程中断时用：把标签现场打回冷启动原样，
-    /// 证明恢复只靠落盘快照、不靠内存里残留的标签对象）。
-    func resetTabsToStartPage() {
-        for tab in tabs { teardown(tab) }
-        let fresh = BrowserTab()
-        tabs = [fresh]
+    /// 某会话回到单页起始页（仅自检四模拟进程中断时用：把该会话的标签
+    /// 现场打回冷启动原样，证明恢复只靠落盘快照、不靠内存里残留的标签对象）。
+    func resetTabsToStartPage(sessionID: UUID) {
+        for tab in tabs where tab.sessionID == sessionID { teardown(tab) }
+        tabs.removeAll { $0.sessionID == sessionID }
+        if let bound = executionTabID, tabs.first(where: { $0.id == bound }) == nil { executionTabID = nil }
+        let fresh = BrowserTab(sessionID: sessionID)
+        tabs.append(fresh)
         adopt(fresh)
-        activeTabID = fresh.id
-        executionTabID = nil
+        lastActiveTabBySession[sessionID] = fresh.id
+        if sessionID == displayedSessionID { activeTabID = fresh.id }
     }
 
-    /// 关闭标签：关当前页切到相邻页（优先右侧、其次左侧）；关掉最后一个标签时自动补一个
-    /// 新的空白标签（永不归零）。关掉的若是任务执行页，执行绑定随之解除，任务的后续
-    /// state／execute 回落到新的当前页（其目标校验会拦下不一致的已确认动作，见案卷）。
+    /// 关闭标签：关当前页切到同会话的相邻页（优先右侧、其次左侧）；关掉某会话
+    /// 的最后一个标签时自动补一个该会话的空白标签（每会话永不归零）。关掉的
+    /// 若是任务执行页，执行绑定随之解除，任务的后续 state／execute 回落到当前
+    /// 页（其目标校验会拦下不一致的已确认动作，见案卷）。
+    /// M1 守卫：置顶标签在此直接拒绝关闭——置顶是「保留入口」的承诺，任何
+    /// 关闭路径（逐个关／批量关）都要先取消置顶；页面脚本的 window.close 走
+    /// webViewDidClose 同一条路，同样受守卫。
     func closeTab(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let closing = tabs[index]
+        guard !closing.isPinned else { return }
+        let owner = closing.sessionID
+        let siblingsBefore = tabs.filter { $0.sessionID == owner }
+        let siblingIndex = siblingsBefore.firstIndex(where: { $0.id == id }) ?? 0
         let wasActive = id == activeTabID
         tabs.remove(at: index)
         tabCancellables[id]?.cancel()
@@ -466,35 +582,64 @@ enum SiteMode: String {
         closing.webView.navigationDelegate = nil
         closing.webView.uiDelegate = nil
         if executionTabID == id { executionTabID = nil }
-        if tabs.isEmpty {
-            let fresh = BrowserTab()
-            tabs = [fresh]
+        let siblings = tabs.filter { $0.sessionID == owner }
+        if siblings.isEmpty {
+            let fresh = BrowserTab(sessionID: owner)
+            tabs.append(fresh)
             adopt(fresh)
-            activeTabID = fresh.id
-        } else if wasActive {
-            activeTabID = tabs[min(index, tabs.count - 1)].id
+            lastActiveTabBySession[owner] = fresh.id
+            if owner == displayedSessionID { activeTabID = fresh.id }
+        } else {
+            if wasActive {
+                let next = siblings[min(siblingIndex, siblings.count - 1)]
+                activeTabID = next.id
+                lastActiveTabBySession[owner] = next.id
+            } else if lastActiveTabBySession[owner] == id {
+                lastActiveTabBySession[owner] = siblings[0].id
+            }
         }
     }
 
     // MARK: - 任务执行绑定（AgentEngine 调用）
 
-    /// 任务开始：把执行页绑定到当时的当前页，任务全程作用于它，与用户切页解耦。
-    func beginExecution() { executionTabID = activeTabID }
+    /// 任务开始（M1）：把执行页绑定到该会话离开时的活跃页（查看会话即其
+    /// 当前页），任务全程作用于它，与用户切页/切会话解耦。该会话一张标签
+    /// 都没有时先补一张起始页。查看会话的当前页不随执行绑定变化。
+    func beginExecution(sessionID: UUID) {
+        executionSessionID = sessionID
+        var mine = tabs.filter { $0.sessionID == sessionID }
+        if mine.isEmpty {
+            let fresh = BrowserTab(sessionID: sessionID)
+            tabs.append(fresh)
+            adopt(fresh)
+            mine = [fresh]
+        }
+        let target = lastActiveTabBySession[sessionID].flatMap { id in mine.first(where: { $0.id == id }) }
+            ?? (sessionID == displayedSessionID ? activeTab : mine[0])
+        executionTabID = target.id
+    }
     /// 任务终结／停止：解除绑定（state／execute 回落当前页）。
-    func endExecution() { executionTabID = nil }
+    func endExecution() { executionTabID = nil; executionSessionID = nil }
     /// 执行页重载（引擎在页面瞬时失败连败时用）：作用于执行页而非当前页，用户切页不串。
     func reloadExecutionTab() { executionTab.reload() }
+    /// 在执行页加载本地测试页（M1）：loadLocal 门面作用于当前页，排队任务
+    /// 在非查看会话启动时不能借道当前页，走这里按执行绑定加载。
+    func loadLocalOnExecutionTab(_ name: String) throws { try executionTab.loadLocal(name) }
 
-    /// agent 的 open_new_tab 动作：新开标签、切换过去并把执行绑定一并移过去，
-    /// 后续动作作用于新页。地址先校验后建页，非法地址不留空标签。
+    /// agent 的 open_new_tab 动作：在执行会话里新开标签并把执行绑定移过去，
+    /// 后续动作作用于新页；执行会话正是查看会话时同时切换过去（单会话时代
+    /// 的既有行为），执行会话被隐藏时不抢用户的当前页。地址先校验后建页，
+    /// 非法地址不留空标签。
     @discardableResult
     func openTabForExecution(urlString: String) throws -> BrowserTab {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         let url = trimmed.isEmpty ? nil : try BrowserTab.validatedURL(trimmed)
-        let tab = BrowserTab()
+        let owner = executionSessionID ?? displayedSessionID
+        let tab = BrowserTab(sessionID: owner)
         tabs.append(tab)
         adopt(tab)
-        activeTabID = tab.id
+        if owner == displayedSessionID { activeTabID = tab.id }
+        lastActiveTabBySession[owner] = tab.id
         executionTabID = tab.id
         if let url {
             tab.pageError = nil
@@ -508,10 +653,15 @@ enum SiteMode: String {
     /// target=_blank／window.open：新开标签承接并切换过去，返回用 WebKit 所给配置建的
     /// WKWebView（opener 关系由该配置维系），不顶掉当前页、也不静默失效。
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        let tab = BrowserTab(configuration: configuration, loadStartPage: false)
+        // 新标签继承 opener 所在会话（M1）：opener 在隐藏的执行会话里时，
+        // 新页同归该会话且不抢查看会话的当前页；opener 是当前页时与旧行为
+        // 一致（切换过去）。
+        let owner = tabs.first(where: { $0.webView === webView })?.sessionID ?? displayedSessionID
+        let tab = BrowserTab(configuration: configuration, loadStartPage: false, sessionID: owner)
         tabs.append(tab)
         adopt(tab)
-        activeTabID = tab.id
+        lastActiveTabBySession[owner] = tab.id
+        if owner == displayedSessionID { activeTabID = tab.id }
         return tab.webView
     }
 

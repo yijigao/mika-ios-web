@@ -6,6 +6,7 @@ struct SelfTestView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var resumeTestRunning = false
     @State private var outcomeTestRunning = false
+    @State private var multiSessionTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -57,6 +58,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active)
             Text("自检八预期（H1）：不调用模型、不动现役任务。①会话分库：临时建两个会话各写入 1500 条（超旧全局上限 1000），回读应各 1500 条、互不挤占，当前会话落盘条数不变，临时会话随后连目录删除干净；首次运行新版还应有一条旧对话迁移说明。②确定性折叠：45 步合成历史随折叠级别递减、最紧级别体量有界、首步成单行流水账、最近一步保留全量、旧步长文本被截断出局。③状态卡：pinnedFacts 原文在注入段逐字在场，且不靠历史携带（折叠文本里没有它）。④快照往返：带状态卡的快照编解码后卡片不丢。结论逐条写进对话。").font(.caption).foregroundStyle(.secondary)
+            Button("自检九：多会话外壳") {
+                guard !multiSessionTestRunning else { return }
+                multiSessionTestRunning = true
+                runMultiSessionTest()
+                dismiss()
+            }.disabled(!engine.active || multiSessionTestRunning)
+            Text("自检九预期（M1）：两层。Tier A 不调用模型：临时建 3 个会话各开标签——置顶排最前、置顶标签关不掉、切到别的会话时标签对象／地址／导航计数全不变（未销毁未重载）、切回置顶保留；队列入队后内存与落盘都在位、取消后消失；旧代次的迟到回复被 checkpoint 拒。Tier B 用真实模型：会话甲跑本地表单任务时切到乙入队乙的任务，切回甲等它完成，队列应自动推进、在乙里把乙的任务跑完，两个会话的对话文件互不串（甲只有张三、乙只有李四）。要求引擎空闲；scratch 会话结束时删除干净。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 
@@ -210,5 +218,135 @@ struct SelfTestView: View {
                 conversation.localFeedback("自检六结论：第二阶段未见软门提醒、汇报也未引用台账（汇报「\(summary2)」）——请核对页面已发布列表条数：若已变 2 条，本次不通过；若仍 1 条但路径不明，请把步流发回定位。")
             }
         }
+    }
+
+    /// 自检九编排（M1）：Tier A 程序化核查（引擎 verifyMultiSessionShell，
+    /// 不调用模型——标签/置顶/切换无重载/队列往返/代次失效）＋ Tier B
+    /// 真实任务编排（需模型）：scratch 会话甲跑本地表单任务 → 切到乙
+    /// 入队乙的表单任务 → 切回甲等其完成 → 队列自动推进到乙并跑完 →
+    /// 读两个会话的条目文件验互不串。超时/失败时不强删 scratch 会话
+    /// （引擎可能还占着它），留给用户在会话列表里处理完再删。
+    private func runMultiSessionTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        let settings = self.settings
+        Task { @MainActor in
+            defer { multiSessionTestRunning = false }
+            conversation.localFeedback("自检九：开始——Tier A 多会话外壳程序化核查（不调用模型）")
+            let linesA = await engine.verifyMultiSessionShell()
+            for line in linesA { conversation.localFeedback("自检九：\(line)") }
+            let aFailed = linesA.filter { $0.hasPrefix("✗") }.count
+            guard settings.hasKey || settings.chatGPTAuth.isLoggedIn else {
+                conversation.localFeedback("自检九结论：Tier A \(aFailed == 0 ? "全部通过" : "\(aFailed) 项未通过（见上）")；Tier B（真实任务＋队列推进）因未配置模型未执行")
+                return
+            }
+            guard !engine.busy else {
+                conversation.localFeedback("自检九结论：Tier A 已出（见上）；Tier B 因引擎忙碌未执行，请等当前任务结束重跑")
+                return
+            }
+            conversation.localFeedback("自检九：Tier B 开始——甲会话跑表单任务，切乙入队，切回等甲完成，看队列自动推进到乙")
+            let store = SessionStore.shared
+            let originalID = store.currentSessionID
+            let aMeta = store.createSession(title: "自检九·甲")
+            let bMeta = store.createSession(title: "自检九·乙")
+            switchSessionForTest(bMeta.id) // createSession 后指针在乙，先落到乙占位，下面正式切甲
+            switchSessionForTest(aMeta.id)
+            engine.start(local: "test-form", task: "在表单中填写姓名张三、邮箱 zhangsan@example.com 并提交，然后汇报结果文本")
+            // 等甲跑出至少 1 步（或先行终结）
+            var waited = 0
+            var aRunning = false
+            while waited < 60 {
+                if engine.steps.count >= 1, case .running = engine.status { aRunning = true; break }
+                switch engine.status {
+                case .done: aRunning = true
+                case .failed(let message):
+                    conversation.localFeedback("自检九：Tier B 甲任务提前失败——\(message)，本次终止（两个自检九会话保留，可在会话列表查看/删除）")
+                    return
+                default: break
+                }
+                if aRunning { break }
+                try? await Task.sleep(for: .seconds(1))
+                waited += 1
+            }
+            guard aRunning else {
+                conversation.localFeedback("自检九：Tier B 甲任务未能启动，本次终止（两个自检九会话保留，可在会话列表查看/删除）")
+                return
+            }
+            // 切到乙（引擎忙：只切查看侧），在乙入队乙的任务
+            switchSessionForTest(bMeta.id)
+            let viewOK = conversation.displayedSessionID == bMeta.id && engine.runSessionID == aMeta.id
+            engine.enqueueTask(sessionID: bMeta.id, text: "在表单中填写姓名李四、邮箱 lisi@example.com 并提交，然后汇报结果文本", localPage: "test-form")
+            conversation.queueReceipt("自检九：已在乙会话入队一条任务（甲任务执行中）")
+            let queuedOK = engine.queuedTasks.contains { $0.sessionID == bMeta.id }
+            conversation.localFeedback("自检九：切到乙查看——\(viewOK ? "引擎仍属甲会话（切会话不打断任务）" : "查看/执行归属异常")；入队——\(queuedOK ? "乙的任务已在队列在位" : "入队未在位")")
+            // 切回甲，等甲完成
+            switchSessionForTest(aMeta.id)
+            waited = 0
+            var aDone = false
+            while waited < 240 {
+                switch engine.status {
+                case .done: aDone = true
+                case .failed(let message):
+                    conversation.localFeedback("自检九：Tier B 甲任务失败——\(message)，本次终止（乙的任务仍在队列，自检九会话保留）")
+                    return
+                default: break
+                }
+                if aDone { break }
+                try? await Task.sleep(for: .seconds(2))
+                waited += 2
+            }
+            guard aDone else {
+                conversation.localFeedback("自检九：Tier B 甲任务超时未完成，本次终止（自检九会话保留，处理完后可在会话列表删除）")
+                return
+            }
+            // 等队列自动推进到乙并跑完（推进发生在甲的完成点）
+            waited = 0
+            var bDone = false
+            var bFailed: String?
+            while waited < 240 {
+                if engine.runSessionID == bMeta.id {
+                    switch engine.status {
+                    case .done: bDone = true
+                    case .failed(let message): bFailed = message
+                    default: break
+                    }
+                }
+                if bDone || bFailed != nil { break }
+                try? await Task.sleep(for: .seconds(2))
+                waited += 2
+            }
+            // 条目隔离：甲文件只有张三、乙文件只有李四
+            let aText = entriesFileText(aMeta.id)
+            let bText = entriesFileText(bMeta.id)
+            let isolationOK = aText.contains("张三") && !aText.contains("李四") && bText.contains("李四") && !bText.contains("张三")
+            // 清理：两任务都已终结（引擎空闲）才删 scratch 会话
+            var cleanupNote = "自检九会话保留（引擎未空闲），处理完后可在会话列表删除"
+            if !engine.busy {
+                switchSessionForTest(originalID)
+                for id in [aMeta.id, bMeta.id] {
+                    engine.cancelQueuedTasks(forSession: id)
+                    engine.discardTabsForSession(id)
+                    _ = store.deleteSession(id: id)
+                }
+                cleanupNote = "已切回原会话，自检九会话删除干净"
+            }
+            let verdict = viewOK && queuedOK && bDone && isolationOK
+            conversation.localFeedback("自检九结论（Tier B）：\(verdict ? "通过" : "未完全通过")——甲任务完成 ✓；队列推进到乙并完成 \(bDone ? "✓" : "✗\(bFailed.map { "（失败：\($0)）" } ?? "（超时）")")；条目隔离 \(isolationOK ? "✓（甲只有张三、乙只有李四）" : "✗（两会话条目疑似串话，请人工核对）")；\(cleanupNote)。连同 Tier A：\(aFailed == 0 ? "全部通过" : "\(aFailed) 项未通过")。")
+        }
+    }
+
+    /// 自检九用的会话切换编排（与 SessionListView 同一顺序契约：指针 →
+    /// 对话换源 → 引擎 adopt）。
+    private func switchSessionForTest(_ id: UUID) {
+        SessionStore.shared.setCurrentSession(id: id)
+        conversation.switchDisplayedSession(to: id)
+        engine.adoptDisplayedSession(id)
+    }
+
+    /// 读某会话落盘条目的全文拼接（自检九条目隔离核对用）。
+    private func entriesFileText(_ sessionID: UUID) -> String {
+        guard let data = try? Data(contentsOf: SessionStore.shared.entriesURL(for: sessionID)),
+              let entries = try? JSONDecoder().decode([PersistedChatEntry].self, from: data) else { return "" }
+        return entries.map { $0.text }.joined(separator: "\n")
     }
 }

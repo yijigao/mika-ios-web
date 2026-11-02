@@ -9,6 +9,7 @@ struct AgentChatView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
     @ObservedObject var conversation: AgentConversationStore
+    @ObservedObject private var sessionStore = SessionStore.shared
     /// 对话输入框焦点：由 ContentView 持有并下传（浏览器坞展开盖住对话层时需代为收起）。
     /// 焦点本体绑在 ChatInputBar 的 TextField 上；本层只用它做点按收键盘。
     var inputFocus: FocusState<Bool>.Binding
@@ -21,10 +22,22 @@ struct AgentChatView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Mika 助手").font(.headline)
-                    Text("\(engine.status.label) · 已记录步骤 \(engine.steps.count)／本任务上限 \(engine.conversationTaskID == nil ? settings.maxSteps : engine.taskLimit)")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    if viewingRunSession {
+                        Text("\(engine.status.label) · 已记录步骤 \(engine.steps.count)／本任务上限 \(engine.conversationTaskID == nil ? settings.maxSteps : engine.taskLimit)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    } else {
+                        // 看的不是任务所在会话（M1）：标题行说清两边各是谁，
+                        // 免得把另一个会话的执行状态误读成本会话的
+                        Text("会话「\(sessionTitle(conversation.displayedSessionID))」· 任务在会话「\(sessionTitle(engine.runSessionID))」\(engine.busy ? "执行中" : "（已结束）")")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
                 }
                 Spacer()
+            }
+            if !viewingRunSession, engine.busy {
+                Text("这里写的新任务会加入队列，等当前任务结束后在本会话启动；要给正在跑的任务回答问题或确认动作，请先切回那个会话。")
+                    .font(.caption).foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             ScrollViewReader { proxy in
                 ScrollView {
@@ -51,7 +64,9 @@ struct AgentChatView: View {
                 }
             }
             HStack(spacing: 8) {
-                Button("停止") { engine.stop() }.disabled(!engine.busy || !engine.active)
+                // 停止走 stopFromUser（M1）：停掉当前任务后队列自动推进；
+                // 只在任务所在会话里可点——在别的会话点停会串会话
+                Button("停止") { engine.stopFromUser() }.disabled(!engine.busy || !engine.active || !viewingRunSession)
                 // 手输等待的「已处理，继续」由置顶介入卡独占（同一时刻一个主入口，
                 // 见 InterventionPrompt）；本行「继续」只管暂停／失败的续跑。
                 Button("继续") { engine.resume() }
@@ -67,14 +82,20 @@ struct AgentChatView: View {
         .padding(.bottom, bottomInset)
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
+    /// 正看的就是任务所在会话（M1）：停止／继续／作答都只对本会话的
+    /// 任务生效，看别的会话时这些入口一律让位（队列与浏览不受影响）。
+    private var viewingRunSession: Bool { conversation.displayedSessionID == engine.runSessionID }
+    private func sessionTitle(_ id: UUID) -> String {
+        sessionStore.sessions.first(where: { $0.id == id })?.title ?? "会话"
+    }
     private var canResume: Bool {
-        guard engine.active, questionID == nil else { return false }
+        guard engine.active, questionID == nil, viewingRunSession else { return false }
         // .waitingManual（手输等待）不在此列：续跑入口在置顶介入卡的「已处理，继续」，
         // 本行只处理暂停／失败（同一时刻只有一个可点的主入口，避免双入口打架）。
         switch engine.status { case .paused, .failed: return true; default: return false }
     }
     private var questionID: UUID? {
-        guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
+        guard viewingRunSession, case .some(.question(let id, _)) = engine.waitingInput else { return nil }
         switch engine.status { case .waitingManual, .paused: return id; default: return nil }
     }
     private func entryView(_ entry: ChatEntry) -> some View {
@@ -98,21 +119,27 @@ struct ChatInputBar: View {
     @ObservedObject var conversation: AgentConversationStore
     var inputFocus: FocusState<Bool>.Binding
     var followLatest: Binding<Bool>
+    /// 正看的就是任务所在会话（M1）：作答与续跑短语拦截都只对本会话的
+    /// 任务生效；看别的会话时输入一律按「给本会话的新任务」理解。
+    private var viewingRunSession: Bool { conversation.displayedSessionID == engine.runSessionID }
     private var questionID: UUID? {
-        guard case .some(.question(let id, _)) = engine.waitingInput else { return nil }
+        guard viewingRunSession, case .some(.question(let id, _)) = engine.waitingInput else { return nil }
         switch engine.status { case .waitingManual, .paused: return id; default: return nil }
     }
     private var isNewTask: Bool {
         switch engine.status { case .idle, .done, .failed: return true; case .paused: return questionID == nil; default: return false }
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
-    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil) }
+    /// 可入队（M1）：看着别的会话、而执行器正忙——发送即把任务排进
+    /// 队列（在本会话名下），不打断正在跑的任务、也不串进它的对话。
+    private var canQueue: Bool { !viewingRunSession && engine.busy }
+    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil || canQueue) }
     var body: some View {
         HStack(alignment: .bottom, spacing: 6) {
             TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
                 .lineLimit(1...3).textFieldStyle(.roundedBorder)
                 .focused(inputFocus)
-            Button(questionID != nil ? "回答并继续" : (isNewTask && isPaused ? "新任务" : "发送")) { send() }
+            Button(questionID != nil ? "回答并继续" : (canQueue ? "加入队列" : (isNewTask && isPaused ? "新任务" : "发送"))) { send() }
                 .disabled(!canSend).buttonStyle(.borderedProminent)
         }
         .padding(.horizontal, 12)
@@ -132,7 +159,7 @@ struct ChatInputBar: View {
     /// 19:36）：中断恢复后用户打「现在继续」，agent 随即反问任务内容与网址，
     /// 如同失忆。故续跑类短语在此拦截、改走 resume()（RESUME-CONTEXT-FIX）。
     private var hasLiveSession: Bool {
-        guard questionID == nil, !engine.activeGoal.isEmpty else { return false }
+        guard viewingRunSession, questionID == nil, !engine.activeGoal.isEmpty else { return false }
         switch engine.status { case .paused, .failed: return true; default: return false }
     }
     private func isContinuation(_ text: String) -> Bool {
@@ -143,6 +170,15 @@ struct ChatInputBar: View {
     private func send() {
         guard canSend else { return }
         let text = conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 入队分支（M1）必须排在作答／续跑拦截之前：那些路径都属于任务
+        // 所在会话，在别的会话里输入的文字一律是给本会话排队的新任务
+        if canQueue {
+            engine.enqueueTask(sessionID: conversation.displayedSessionID, text: text)
+            conversation.queueReceipt("已加入队列：当前执行的是另一个会话的任务，这条会按顺序在本会话里启动（在「会话」列表里可查看或取消）。")
+            conversation.draft = ""; followLatest.wrappedValue = true
+            dismissKeyboard()
+            return
+        }
         if questionID == nil, hasLiveSession, isContinuation(text) {
             engine.resume()
             switch engine.status {
@@ -164,7 +200,7 @@ struct ChatInputBar: View {
         } else if isNewTask {
             let previous = engine.conversationTaskID
             engine.taskText = text
-            engine.start()
+            engine.startFromUI()
             if engine.conversationTaskID != previous {
                 conversation.draft = ""; followLatest.wrappedValue = true
                 dismissKeyboard()

@@ -16,6 +16,9 @@ struct ContentView: View {
     /// 「打开浏览器查看／打开浏览器」点击时 +1，下传浏览器坞展开。坞的一切形态
     /// 变化只来自用户动作（护盾点按／收起按钮／本令牌），程序不再自动展开。
     @State private var dockExpandRequest = 0
+    /// 会话列表 sheet（M1）：多会话外壳的管理入口（新建／切换／改名／删除
+    /// 会话、队列查看与取消），编排顺序契约在 SessionListView 文件头。
+    @State private var showSessions = false
     /// 输入栏实测高度：草稿从一行长到三行时随之变高；测得后下传消息层做底部
     /// 避让、下传坞做小窗钳制与展开态介入 UI 避让。初值是单行栏的估算，首帧实测即覆盖。
     @State private var inputBarHeight: CGFloat = 60
@@ -39,7 +42,8 @@ struct ContentView: View {
                               inputFocus: $chatInputFocused, followLatest: $followLatest,
                               bottomInset: inputBarHeight)
                 BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused,
-                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState)
+                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState,
+                                onReturnToExecution: { returnToExecution() })
                 if showsInterventionPrompt {
                     InterventionPrompt(engine: engine, web: web,
                                        onOpenBrowser: { dockExpandRequest += 1 })
@@ -56,8 +60,12 @@ struct ContentView: View {
             }
             .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                Button { showSessions = true } label: { Text("会话") }
                 NavigationLink { SelfTestView(engine: engine, settings: settings, conversation: conversation) } label: { Text("自检") }
                 NavigationLink { SettingsView(settings: settings, diagnostics: diagnostics) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
+            }
+            .sheet(isPresented: $showSessions) {
+                SessionListView(engine: engine, conversation: conversation, web: web)
             }
         }
         .onAppear { consumePending() }
@@ -69,9 +77,26 @@ struct ContentView: View {
     /// 是否需要呈现置顶介入卡：执行前确认，或手输等待（waitingInput 为 .manual）。
     /// ask_user 提问（.question）在输入栏作答、不出卡。与 BrowserDockView 的
     /// needsIntervention 同口径（那边只驱动小窗状态提示）。
+    /// M1 门控：介入卡属于任务所在会话——正看别的会话时不出卡（确认的是
+    /// 另一个会话页面上的动作，在这里点确认会串会话），坞上的会话条与
+    /// 「返回执行页」会把用户领回去；切回任务会话后卡片照常出现。
     private var showsInterventionPrompt: Bool {
+        guard conversation.displayedSessionID == engine.runSessionID else { return false }
         if case .waitingConfirm = engine.status { return true }
         if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput { return true }
         return false
+    }
+    /// 「返回执行页」（M1，坞上入口的落点）：把查看侧整体带回任务所在
+    /// 会话——指针、对话、标签按切换编排切过去，并让执行标签成为当前
+    /// 页。执行本身不受影响（切会话从不打断任务，见引擎 adopt 口径）。
+    private func returnToExecution() {
+        let target = engine.runSessionID
+        if target != conversation.displayedSessionID {
+            SessionStore.shared.setCurrentSession(id: target)
+            conversation.switchDisplayedSession(to: target)
+            engine.adoptDisplayedSession(target)
+        }
+        web.revealExecutionTab()
+        dockExpandRequest += 1
     }
 }

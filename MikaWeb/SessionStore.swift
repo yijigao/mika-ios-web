@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // 会话级存储地基（H1，2026-11-02）：对话条目与任务快照从「全局单文件」改为
 // 「按会话分开存储＋一个轻量索引」。此前对话条目挤在一个 entries.json 里、
@@ -26,6 +27,13 @@ import Foundation
 // 调用方约定：本类只被 @MainActor 的引擎与对话存储调用（与既有落盘代码
 // 同形态：小文件同步原子写）；索引的 lastActiveAt 更新在内存即时生效、
 // 落盘节流（见 touch），避免每次条目追加都连带写索引。
+//
+// M1（多会话外壳，2026-11-02）起，本类的当前会话指针成为「正在查看的会话」
+// （displayed session）：切换会话时由编排方（SessionListView 的切换动作）
+// 依次调用 setCurrentSession＋对话存储换源＋引擎 adopt＋标签换组。注意它与
+// 引擎的 runSessionID（任务所属会话）是两个概念：任务在会话 A 执行期间，
+// 用户可以把当前会话切到 B 浏览——引擎快照仍按 runSessionID 落 A 的目录，
+// 对话条目则按条目所属会话分别落盘（见 AgentConversationStore 的路由）。
 struct SessionMeta: Codable, Identifiable {
     var id: UUID
     var title: String
@@ -35,7 +43,10 @@ struct SessionMeta: Codable, Identifiable {
     var status: String
 }
 
-final class SessionStore {
+// M1 起实现 ObservableObject：会话列表 UI 需要观察索引与当前会话指针
+// 的变化（H1 建存储时还没有会话 UI）。发布面只有 sessions 与
+// currentSessionID 两项，与索引落盘内容一一对应。
+final class SessionStore: ObservableObject {
     static let shared = SessionStore()
 
     private struct IndexFile: Codable {
@@ -43,8 +54,8 @@ final class SessionStore {
         var currentSessionID: UUID
     }
 
-    private(set) var sessions: [SessionMeta] = []
-    private(set) var currentSessionID: UUID
+    @Published private(set) var sessions: [SessionMeta] = []
+    @Published private(set) var currentSessionID: UUID
     /// 本次启动若执行过旧对话迁移，这里留一句人读说明（自检八引用）；
     /// 索引此前已建好（迁移已完成或全新安装）时为 nil。
     private(set) var migrationNote: String?
@@ -125,6 +136,32 @@ final class SessionStore {
         sessions[index].lastActiveAt = Date()
         if let status { sessions[index].status = status }
         if Date().timeIntervalSince(lastIndexPersistAt) > 60 { persistIndex() }
+    }
+
+    /// 切换当前会话指针（M1）：只改指针与索引落盘，不动任何会话目录内容；
+    /// 对话换源、引擎 adopt、标签换组由编排方在本调用前后按序完成。
+    /// 切到的会话标记 active，原当前会话的状态标记回到 idle（其快照状态
+    /// 由引擎在 adopt 时另行处理，这里只维护索引层的人读标记）。
+    func setCurrentSession(id: UUID) {
+        guard id != currentSessionID, sessions.contains(where: { $0.id == id }) else { return }
+        if let old = sessions.firstIndex(where: { $0.id == currentSessionID }), sessions[old].status == "active" {
+            sessions[old].status = "idle"
+        }
+        currentSessionID = id
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[index].status = "active"
+            sessions[index].lastActiveAt = Date()
+        }
+        persistIndex()
+    }
+
+    /// 会话改名（M1）：标题是用户与各处标签（会话列表、坞上标明、队列）里
+    /// 认会话的唯一人读标识，改名即时落盘索引。
+    func renameSession(id: UUID, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        sessions[index].title = trimmed
+        persistIndex()
     }
 
     @discardableResult
