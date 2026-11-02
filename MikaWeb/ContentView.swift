@@ -19,6 +19,9 @@ struct ContentView: View {
     /// 会话列表 sheet（M1）：多会话外壳的管理入口（新建／切换／改名／删除
     /// 会话、队列查看与取消），编排顺序契约在 SessionListView 文件头。
     @State private var showSessions = false
+    /// 附件中心 sheet（F1）：当前会话的附件与浏览器截图（导入／预览／
+    /// 分享导出／删除＋保存当前页截图），见 AttachmentsView。
+    @State private var showAttachments = false
     /// 输入栏实测高度：草稿从一行长到三行时随之变高；测得后下传消息层做底部
     /// 避让、下传坞做小窗钳制与展开态介入 UI 避让。初值是单行栏的估算，首帧实测即覆盖。
     @State private var inputBarHeight: CGFloat = 60
@@ -61,11 +64,15 @@ struct ContentView: View {
             .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 Button { showSessions = true } label: { Text("会话") }
+                Button { showAttachments = true } label: { Text("附件") }
                 NavigationLink { SelfTestView(engine: engine, settings: settings, conversation: conversation) } label: { Text("自检") }
                 NavigationLink { SettingsView(settings: settings, diagnostics: diagnostics) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
             }
             .sheet(isPresented: $showSessions) {
                 SessionListView(engine: engine, conversation: conversation, web: web)
+            }
+            .sheet(isPresented: $showAttachments) {
+                AttachmentsView(web: web)
             }
         }
         .onAppear { consumePending() }
@@ -82,6 +89,7 @@ struct ContentView: View {
     /// 「返回执行页」会把用户领回去；切回任务会话后卡片照常出现。
     private var showsInterventionPrompt: Bool {
         guard conversation.displayedSessionID == engine.runSessionID else { return false }
+        if engine.pendingUpload != nil { return true }
         if case .waitingConfirm = engine.status { return true }
         if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput { return true }
         return false

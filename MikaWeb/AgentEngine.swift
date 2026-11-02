@@ -135,6 +135,30 @@ struct AgentStep: Identifiable {
     /// 编辑器／textarea 的输入，回退任意字段的最近输入。start() 清空——新
     /// 任务的提交若无打字记录，软门按页面＋按钮标识匹配（追问场景正是此路）。
     private var recentTyped: [(text: String, isEditor: Bool)] = []
+    /// 待决网页上传（F1，2026-11-02）：upload_file 动作的人在环现场——
+    /// agent 定位文件控件后任务停在这里等用户：先过 SP-01 确认卡（非本
+    /// 任务生成的私有文件必经，凭据在 AttachmentStore 一次性登记表里、
+    /// 确认时消费、取消时作废），再到选文件等待（引擎尝试触发控件、
+    /// 用户在系统选择器选文件、引擎回读页面持有状态核验，取消可继续
+    /// 任务）。状态以 .waitingManual 呈现、介入卡由 InterventionPrompt
+    /// 按本属性渲染专卡（见 AgentChatView 的 UploadCard）。随快照持久化
+    /// （SessionSnapshot.upload），进程被杀后恢复到等待侧：pickFile 阶段
+    /// 的非任务生成文件会退回确认阶段重走 SP-01（凭据不跨进程复用）。
+    struct PendingUpload: Identifiable {
+        let id: UUID
+        var attachmentID: UUID?
+        /// 卡上展示的文件名：具体附件名，或「（在系统选择器中现选的文件）」
+        var attachmentName: String
+        var isTaskGenerated: Bool
+        var pageURL: String
+        var pageHost: String
+        var elementIndex: Int
+        var elementLabel: String
+        var stage: Stage
+        var confirmationToken: UUID?
+        enum Stage { case confirmUpload, pickFile }
+    }
+    @Published private(set) var pendingUpload: PendingUpload?
     /// 结构化任务状态卡（H1，结构与口径见 TaskStateCard.swift）：程序维护
     /// 的事实账，随快照持久化、每轮 prompt 注入。关键状态由程序在确定事件
     /// 点更新（开始/record 记账/用户答复/用户跳过/等待状态派生），不依赖
@@ -241,6 +265,7 @@ struct AgentStep: Identifiable {
     }
     func stop() {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        discardPendingUpload()
         runStartedAt = nil; activeRunContext = nil
         sessionActive = false; applyIdleTimerPolicy()
         endBackgroundGrace()
@@ -439,6 +464,7 @@ struct AgentStep: Identifiable {
         conversationTaskID = nil; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
+        discardPendingUpload()
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
         runStartedAt = nil; activeRunContext = nil
     }
@@ -717,6 +743,19 @@ struct AgentStep: Identifiable {
                                 persistSnapshot()
                                 return // waitingConfirm／waitingManual 已置位，等用户介入后另行 launch
                             }
+                        } else if action.action == "upload_file" {
+                            // 网页上传人在环（F1）：定位文件控件后停在等待侧
+                            // （SP-01 确认卡→选文件→回读核验），用户在介入卡
+                            // 上解决后由 confirmPendingUpload/finishUploadPick
+                            // 另行 launch 续跑；目标不是文件控件时记策略切换
+                            // 交模型按新快照重新判断，不判失败。
+                            switch try await runUpload(action, modelPage: page, token: token) {
+                            case .waiting:
+                                persistSnapshot()
+                                return
+                            case .strategySwitch:
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: "index:\(action.index)", outcome: "strategy-switch")
+                            }
                         } else {
                             try await checkpoint(token)
                             executionSerial += 1
@@ -847,6 +886,150 @@ struct AgentStep: Identifiable {
             return .halted
         }
     }
+    // MARK: - 网页上传人在环（F1：SP-01 确认门＋系统选择器选文件＋回读核验）
+
+    private enum UploadOutcome { case waiting, strategySwitch }
+
+    /// upload_file 的定位与等待置位：在模型所见快照里按稳定描述重找目标
+    /// （与 click/type 同口径，预算 1 次重取快照），目标必须是文件控件
+    /// （input[type=file]，含被站点隐藏的——抽取层已为文件控件开可见性
+    /// 例外）；不是或已消失 → 记一条说明步并交模型重新判断（strategySwitch）。
+    /// 定位成功后组装 PendingUpload：意图附件按 action.text（附件 id 或
+    /// 文件名）解析，解析不到按「用户将在选择器现选的私有文件」处理；
+    /// SP-01 判定走 SafetyPolicy.uploadDecision——非本任务生成的一律先
+    /// 出确认卡（签发一次性凭据），本任务生成的直接进选文件阶段。
+    private func runUpload(_ action: AgentAction, modelPage: PageState, token: UUID) async throws -> UploadOutcome {
+        guard action.index >= 0, action.index < modelPage.elements.count else {
+            appendStep("upload", "upload_file 的目标序号不在当前页面元素清单里，请按最新页面重新判断")
+            return .strategySwitch
+        }
+        let original = modelPage.elements[action.index]
+        let descriptor = ElementDescriptor(original)
+        var snapshot = modelPage
+        var target: PageElement?
+        for attempt in 0...1 {
+            try await checkpoint(token)
+            if snapshot.url == modelPage.url {
+                target = resolveTarget(descriptor: descriptor, original: original, in: snapshot.elements)
+            }
+            if let found = target, found.tag == "input", found.inputType.lowercased() == "file" { break }
+            target = nil
+            if attempt == 0 { snapshot = try await web.state() }
+        }
+        guard let target else {
+            appendStep("upload", "目标不是文件上传控件或已不在页面上——upload_file 只对 input[type=file] 控件使用，请按最新页面重新判断")
+            return .strategySwitch
+        }
+        let reference = action.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachment = reference.isEmpty ? nil : AttachmentStore.shared.findAttachment(reference: reference, sessionID: runSessionID)
+        let isTaskGenerated = attachment?.origin == .taskGenerated
+        let needsConfirm = SafetyPolicy.uploadDecision(isTaskGenerated: isTaskGenerated) == .confirm
+        var upload = PendingUpload(id: UUID(), attachmentID: attachment?.id,
+                                   attachmentName: attachment?.displayName ?? "（在系统选择器中现选的文件）",
+                                   isTaskGenerated: isTaskGenerated,
+                                   pageURL: snapshot.url,
+                                   pageHost: URL(string: snapshot.url)?.host ?? "",
+                                   elementIndex: target.index,
+                                   elementLabel: !target.ariaLabel.isEmpty ? target.ariaLabel : (!target.name.isEmpty ? target.name : "文件上传控件"),
+                                   stage: needsConfirm ? .confirmUpload : .pickFile,
+                                   confirmationToken: nil)
+        if needsConfirm {
+            upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: attachment?.id, pageURL: snapshot.url)
+            pendingUpload = upload
+            let text = "上传前请确认：将把文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)"
+            waitingInput = .manual(id: upload.id, text: text)
+            status = .waitingManual(text)
+            appendStep("upload", "已定位文件控件（\(upload.elementLabel)），按 SP-01 先出确认卡：文件「\(upload.attachmentName)」→ \(upload.pageHost.isEmpty ? upload.pageURL : upload.pageHost)，等用户确认")
+        } else {
+            pendingUpload = upload
+            appendStep("upload", "已定位文件控件（\(upload.elementLabel)），文件为本任务生成物、SP-01 豁免确认，等用户选文件")
+            await beginUploadPickStage()
+        }
+        return .waiting
+    }
+
+    /// 进入选文件阶段：尝试触发页面上的文件控件（合成点击是否拉起系统
+    /// 选择器由系统决定），无论成败都置等待——选择器没弹时用户照介入卡
+    /// 指引自己在页面上点上传按钮选文件。等待文案与 waitingInput 同步
+    /// 更新（对话里留一条 manual 条目）。
+    private func beginUploadPickStage() async {
+        guard var upload = pendingUpload else { return }
+        upload.stage = .pickFile
+        pendingUpload = upload
+        _ = await web.triggerFileInput(index: upload.elementIndex)
+        let text = "请选择要上传的文件（目标：\(upload.attachmentName)）"
+        // 等待 id 每阶段一换：对话层按 id 去重，复用确认阶段的 id 会把
+        // 选文件这条等待条目吞掉
+        waitingInput = .manual(id: UUID(), text: text)
+        status = .waitingManual(text)
+        persistSnapshot()
+    }
+
+    /// SP-01 确认卡「确认上传」：在此消费一次性凭据——凭据已过期/被消费/
+    /// 与（附件＋页面）不绑定时不放行，记步并把主动权交回模型（它可重新
+    /// 发起 upload_file 拿新卡）；消费成功才进入选文件阶段。
+    func confirmPendingUpload() {
+        guard let upload = pendingUpload, upload.stage == .confirmUpload else { return }
+        if let token = upload.confirmationToken {
+            guard AttachmentStore.shared.consumeUploadConfirmation(token, attachmentID: upload.attachmentID, pageURL: upload.pageURL) else {
+                pendingUpload = nil
+                waitingInput = nil
+                appendStep("upload", "上传确认已失效（一次性确认过期或已被消费），本次没有执行；如仍要上传，请重新发起 upload_file 拿新确认卡")
+                launch()
+                return
+            }
+        }
+        appendStep("upload", "用户已确认上传文件「\(upload.attachmentName)」（SP-01 一次性确认已消费，不可复用）")
+        Task { @MainActor [weak self] in await self?.beginUploadPickStage() }
+    }
+
+    /// 上传等待中取消（确认卡「取消」与选文件卡「取消上传」共用）：
+    /// 作废未消费的凭据、记步、续跑主循环——取消后任务可继续，模型从
+    /// 历史里看得到取消记录，不要反复要求上传同一文件。
+    func cancelPendingUpload() {
+        guard let upload = pendingUpload else { return }
+        discardPendingUpload()
+        waitingInput = nil
+        appendStep("upload", "用户取消了上传（文件「\(upload.attachmentName)」未上传），请继续任务的其他部分，不要反复要求上传同一文件")
+        launch()
+    }
+
+    /// 选文件阶段收口：「已选好」→ 回读页面文件控件的持有状态核验（只报
+    /// 页面持有，不声称已提交服务器——提交与否看页面后续反馈，模型在
+    /// 下一轮快照里判断）；「取消」→ 按取消口径记步。两路都清等待并续跑。
+    func finishUploadPick(completed: Bool) {
+        guard let upload = pendingUpload, upload.stage == .pickFile else { return }
+        pendingUpload = nil
+        waitingInput = nil
+        guard completed else {
+            appendStep("upload", "用户取消了选文件（文件「\(upload.attachmentName)」未上传），请继续任务的其他部分，不要反复要求上传同一文件")
+            launch()
+            return
+        }
+        let index = upload.elementIndex
+        let host = upload.pageHost
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let names = await web.probeFileInput(index: index)
+            if names.isEmpty {
+                appendStep("upload", "上传回读核验：页面文件控件里未读到已选文件——可能还没选完或页面未持有该文件，不要声称已上传成功；确需上传时重新发起 upload_file")
+            } else {
+                appendStep("upload", "上传回读核验：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)）——这是页面侧持有状态，是否已提交到服务器以下一轮页面反馈为准")
+                stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))")
+            }
+            launch()
+        }
+    }
+
+    /// 丢弃待决上传（stop/切会话清零/中断模拟共用）：未消费的 SP-01
+    /// 凭据一并作废——离开这个动作后，旧确认不得再被用起。
+    private func discardPendingUpload() {
+        if let token = pendingUpload?.confirmationToken {
+            AttachmentStore.shared.invalidateUploadConfirmation(token)
+        }
+        pendingUpload = nil
+    }
+
     /// click／type 的执行结果：executed＝已执行；strategySwitch＝目标整轮重找仍无法定位，
     /// 已记策略切换步、交模型按新快照重新判断；waiting＝已进入确认／手输等待（状态已置位）；
     /// duplicateBlocked＝重复提交被成果台账软门拦下未执行，提醒步与模型提醒均已置位。
@@ -1243,6 +1426,10 @@ struct AgentStep: Identifiable {
         // 证据改口的硬口径（见 outcomePromptBlock）
         let outcomeBlock = outcomePromptBlock()
         if !outcomeBlock.isEmpty { prompt += outcomeBlock + "\n" }
+        // 本会话附件（F1）：附件清单＋可读状态＋文本摘录——模型据此用
+        // upload_file 引用附件；存入≠已读≠已上传的三态口径在段内明示
+        let attachmentBlock = AttachmentStore.shared.promptBlock(for: runSessionID)
+        if !attachmentBlock.isEmpty { prompt += attachmentBlock + "\n" }
         prompt += "历史：\(Self.historyText(steps: steps, level: foldLevel))\n用户补充问答：\(answersJSON)"
         if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
         if let loopHint { prompt += "\n\(loopHint)" }
@@ -1435,6 +1622,20 @@ struct AgentStep: Identifiable {
         // 两键照常解码（无卡时恢复路径按步流派生一张，见 restoreSnapshotIfNeeded）。
         var stateCard: TaskStateCard?
         var sessionID: UUID?
+        // F1 起：待决网页上传的等待现场（仅 statusKind=waitingManual 且上传
+        // 等待中才有值）。可选字段，此前快照无此键照常解码。SP-01 一次性
+        // 凭据不落盘：恢复时若原阶段是选文件且文件非本任务生成，退回确认
+        // 阶段重新出卡（见 restoreSnapshot 的 waitingManual 分支）。
+        struct UploadDTO: Codable {
+            var attachmentID: UUID?
+            var attachmentName: String
+            var isTaskGenerated: Bool
+            var pageURL: String
+            var elementIndex: Int
+            var elementLabel: String
+            var wasPickStage: Bool
+        }
+        var upload: UploadDTO? = nil
     }
     /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
     /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
@@ -1512,7 +1713,13 @@ struct AgentStep: Identifiable {
                                        tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex, tabPinned: scene.pinned,
                                        outcomes: outcomeLedger,
                                        stateCard: stateCard,
-                                       sessionID: runSessionID)
+                                       sessionID: runSessionID,
+                                       upload: pendingUpload.map { upload in
+                                           SessionSnapshot.UploadDTO(attachmentID: upload.attachmentID, attachmentName: upload.attachmentName,
+                                                                     isTaskGenerated: upload.isTaskGenerated, pageURL: upload.pageURL,
+                                                                     elementIndex: upload.elementIndex, elementLabel: upload.elementLabel,
+                                                                     wasPickStage: upload.stage == .pickFile)
+                                       })
         if let data = try? JSONEncoder().encode(snapshot) {
             // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
             // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
@@ -1612,6 +1819,28 @@ struct AgentStep: Identifiable {
             }
         case "waitingManual":
             status = .waitingManual(snapshot.statusText)
+            // 待决上传的等待现场恢复（F1）：凭据不跨进程——原阶段是确认卡
+            // 就照旧出卡（恢复时重新签发凭据）；原阶段是选文件且文件非本
+            // 任务生成，退回确认阶段重新确认（旧确认不复用）；本任务生成
+            // 的文件才直接恢复到选文件阶段（用户需在页面上重新点控件）。
+            if let dto = snapshot.upload {
+                var upload = PendingUpload(id: UUID(), attachmentID: dto.attachmentID, attachmentName: dto.attachmentName,
+                                           isTaskGenerated: dto.isTaskGenerated, pageURL: dto.pageURL,
+                                           pageHost: URL(string: dto.pageURL)?.host ?? "",
+                                           elementIndex: dto.elementIndex, elementLabel: dto.elementLabel,
+                                           stage: .confirmUpload, confirmationToken: nil)
+                if dto.wasPickStage && dto.isTaskGenerated {
+                    upload.stage = .pickFile
+                } else {
+                    upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: dto.attachmentID, pageURL: dto.pageURL)
+                }
+                pendingUpload = upload
+                let text = upload.stage == .confirmUpload
+                    ? "上传前请确认：将把文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)"
+                    : "请选择要上传的文件（目标：\(upload.attachmentName)）"
+                waitingInput = .manual(id: upload.id, text: text)
+                status = .waitingManual(text)
+            }
         default:
             status = .paused("上次任务在 App 退出时中断，点继续可接着跑")
         }
@@ -1641,6 +1870,7 @@ struct AgentStep: Identifiable {
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         conversationTaskID = nil; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        discardPendingUpload()
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; outcomeLedger = []

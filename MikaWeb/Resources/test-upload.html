@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地上传页</title>
+<style>body{font:20px system-ui;margin:24px}button{display:block;margin:16px 0;font:inherit;padding:10px 22px}label{display:block;margin:16px 0}</style>
+<h1>模拟文件上传页</h1>
+<p>本页用来验证网页上传人在环：agent 用 upload_file 定位下方文件控件，先出 SP-01 确认卡（上传附件样本时），再由真人在系统选择器里选文件；选好后页面会在这里显示文件名与大小，agent 回读核验的正是这一状态。</p>
+<label>选择文件：<input id="up" type="file" name="attachment"></label>
+<p id="filestate" role="status">尚未选择文件</p>
+<button id="send" type="button">上传</button>
+<p id="result" role="status"></p>
+<script>
+var input=document.getElementById('up');
+input.addEventListener('change',function(){
+  var state=document.getElementById('filestate');
+  if(input.files&&input.files.length){
+    var f=input.files[0];
+    state.textContent='已选择文件：'+f.name+'（'+f.size+' 字节）';
+  }else{
+    state.textContent='尚未选择文件';
+  }
+});
+document.getElementById('send').addEventListener('click',function(){
+  var result=document.getElementById('result');
+  if(input.files&&input.files.length){
+    result.textContent='上传完成：服务器已收到 '+input.files[0].name;
+  }else{
+    result.textContent='未选择文件，无法上传';
+  }
+});
+</script></html>

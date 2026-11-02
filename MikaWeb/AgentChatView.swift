@@ -284,12 +284,65 @@ struct ConfirmCard: View {
 /// 展开——是用户点击、不是自动展开。ask_user 提问（waitingInput 为 .question）不在
 /// 此列：它在输入栏作答，本层不渲染。同一时刻只有这一张卡是可点的主入口：坞底旧
 /// 介入 UI 已收起、消息流内嵌卡已摘除、按钮行的手输续跑已让位（见本文件与坞案卷）。
+/// 上传介入卡（F1）：PendingUpload 的两个阶段各一张——
+/// - confirmUpload（SP-01 确认卡）：展示文件名与目标页面，用户确认才
+///   消费一次性凭据并进入选文件阶段；取消即作废凭据、任务继续。
+/// - pickFile（选文件等待卡）：引擎已尝试触发页面上的文件控件；系统
+///   选择器若没弹出，用户照卡上指引在浏览器里点上传按钮选文件；选好
+///   点「已选好，继续核验」由引擎回读页面持有状态，点「取消上传」按
+///   取消口径继续任务。
+/// 与 ConfirmCard 同口径：本地 locked 防重复点按，解决动作都走引擎的
+/// 既有等待解决路径，不在此新造状态。
+struct UploadCard: View {
+    @ObservedObject var engine: AgentEngine
+    let upload: AgentEngine.PendingUpload
+    var onOpenBrowser: (() -> Void)? = nil
+    @State private var locked = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if upload.stage == .confirmUpload {
+                Text("上传前确认").font(.headline)
+                Text("将把你的文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)（页面上的「\(upload.elementLabel)」）。确认后会进入选文件一步，由你在系统选择器里选定文件；这张确认只对这一个文件、这一个页面有效，取消或失败后不会被复用。")
+                HStack {
+                    Button("确认上传") { lock { engine.confirmPendingUpload() } }.disabled(locked)
+                        .buttonStyle(.borderedProminent)
+                    Button("取消") { lock { engine.cancelPendingUpload() } }.disabled(locked)
+                    if let onOpenBrowser {
+                        Spacer()
+                        Button("打开浏览器查看") { onOpenBrowser() }
+                    }
+                }
+            } else {
+                Text("请选择要上传的文件").font(.headline)
+                Text("已尝试打开页面上的文件控件（「\(upload.elementLabel)」）。如果系统选择器没有弹出，点「打开浏览器查看」，在页面上点该上传按钮/区域，再在系统选择器里选要上传的文件（目标：\(upload.attachmentName)）。选好后回到这里点「已选好，继续核验」，我会回读页面确认它已持有该文件；不想传了点「取消上传」，任务会继续做其他部分。")
+                HStack {
+                    Button("已选好，继续核验") { lock { engine.finishUploadPick(completed: true) } }.disabled(locked)
+                        .buttonStyle(.borderedProminent)
+                    Button("取消上传") { lock { engine.finishUploadPick(completed: false) } }.disabled(locked)
+                }
+                if let onOpenBrowser {
+                    HStack { Button("打开浏览器查看") { onOpenBrowser() } }
+                }
+            }
+        }
+        .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+    }
+    private func lock(_ action: () -> Void) {
+        guard !locked else { return }
+        locked = true
+        action()
+    }
+}
+
 struct InterventionPrompt: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var web: WebController
     var onOpenBrowser: () -> Void
     var body: some View {
-        if case .waitingConfirm(let action) = engine.status {
+        if let upload = engine.pendingUpload {
+            UploadCard(engine: engine, upload: upload, onOpenBrowser: onOpenBrowser)
+        } else if case .waitingConfirm(let action) = engine.status {
             ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID,
                         pageTitle: pageTitle, pageHost: pageHost, onOpenBrowser: onOpenBrowser)
         } else if case .waitingManual = engine.status, case .some(.manual(_, let text)) = engine.waitingInput {

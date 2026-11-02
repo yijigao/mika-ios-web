@@ -622,6 +622,54 @@ enum SiteMode: String {
     func endExecution() { executionTabID = nil; executionSessionID = nil }
     /// 执行页重载（引擎在页面瞬时失败连败时用）：作用于执行页而非当前页，用户切页不串。
     func reloadExecutionTab() { executionTab.reload() }
+
+    // MARK: - 网页上传人在环（F1）：触发文件控件与回读已选文件
+    //
+    // iOS 平台事实：WKWebView 没有 macOS 的 runOpenPanel 回调；文件控件被
+    // 真实点击时由 WebKit 拉起系统选择器，用户选完后文件挂在 input.files
+    // 上、页面自己负责后续提交。合成 click 是否被当作可拉起选择器的手势
+    // 由系统决定（部分场景不认）——所以触发只算「尝试打开」，引擎无论
+    // 结果都进入等待卡：选择器没弹时用户可自己在页面上点上传按钮选文件。
+
+    /// 触发执行页上的文件控件（按 data-mika-idx 定位，含被站点隐藏的
+    /// file input）：滚入视口后点击。返回 false＝控件已不在页面上。
+    func triggerFileInput(index: Int) async -> Bool {
+        let tab = executionTab
+        let result = try? await evaluate("""
+        (()=>{const e=document.querySelector('[data-mika-idx="\(index)"]');
+        if(!e||e.tagName!=='INPUT'||e.type!=='file')return 'missing';
+        try{e.scrollIntoView({block:'center'});}catch(_){}
+        try{e.click();}catch(_){return 'noclick';}
+        return 'clicked';})()
+        """, on: tab)
+        return (result as? String) == "clicked"
+    }
+
+    /// 回读执行页上文件控件已持有的文件（上传核验）：只读文件名与大小
+    /// 元数据，不读内容；控件不在或未选文件返回空数组。
+    func probeFileInput(index: Int) async -> [String] {
+        let tab = executionTab
+        let result = try? await evaluate("""
+        (()=>{const e=document.querySelector('[data-mika-idx="\(index)"]');
+        if(!e||!e.files)return JSON.stringify([]);
+        return JSON.stringify([...e.files].map(f=>f.name+'（'+f.size+' 字节）'));})()
+        """, on: tab)
+        guard let raw = result as? String, let data = raw.data(using: .utf8),
+              let names = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return names
+    }
+
+    /// 某标签页的当前截图 JPEG（附件中心「保存当前页截图」用，与失败
+    /// 快照同一取图口径：afterScreenUpdates=false、质量 0.5）。
+    func captureTabJPEG(_ tab: BrowserTab) async -> Data? {
+        await withCheckedContinuation { continuation in
+            let config = WKSnapshotConfiguration()
+            config.afterScreenUpdates = false
+            tab.webView.takeSnapshot(with: config) { image, _ in
+                continuation.resume(returning: image?.jpegData(compressionQuality: 0.5))
+            }
+        }
+    }
     /// 在执行页加载本地测试页（M1）：loadLocal 门面作用于当前页，排队任务
     /// 在非查看会话启动时不能借道当前页，走这里按执行绑定加载。
     func loadLocalOnExecutionTab(_ name: String) throws { try executionTab.loadLocal(name) }
@@ -1208,7 +1256,15 @@ enum SiteMode: String {
         return JSON.stringify({url:location.href,title:document.title,buttons,editors});})()
         """, on: tab)) as? String ?? ""
         var payload: [String: Any] = ["kind": "agent-action-failure", "context": context, "url": tab.webView.url?.absoluteString ?? "", "domSummary": domSummary]
-        if let shot = await snapshotBase64(tab: tab) { payload["screenshotJPEGBase64"] = shot }
+        if let shot = await snapshotBase64(tab: tab) {
+            payload["screenshotJPEGBase64"] = shot
+            // 附件中心（F1）：失败截图同时登记进所属会话的 browser/ 子目录，
+            // 成为可预览/可导出的附件资产（本任务生成物）；诊断信封口径不变，
+            // 登记失败不影响留证主流程。
+            if let data = Data(base64Encoded: shot) {
+                _ = AttachmentStore.shared.registerScreenshot(data: data, sessionID: tab.sessionID)
+            }
+        }
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

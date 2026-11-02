@@ -48,7 +48,10 @@ enum PageScript {
       }
       const extraSet=new Set(rawExtras.filter(e=>!rawExtras.some(o=>o!==e&&e.contains(o))));
       const merged=[...baseSet,...extraSet].sort((x,y)=>{const p=x.compareDocumentPosition(y);return (p&4)?-1:(p&2)?1:0;});
-      const elements=merged.filter(visible).map((e,index)=>{
+      // 文件控件例外（F1）：input[type=file] 常被站点隐藏（display:none）再用
+      // label/按钮冒充上传入口，可见性过滤会把上传点本身滤掉——文件控件
+      // 数量天然稀少（通常 0–1 个），一律保留进清单，upload_file 据此定位。
+      const elements=merged.filter(e=>visible(e)||(e.tagName==='INPUT'&&e.type==='file')).map((e,index)=>{
         e.setAttribute('data-mika-idx',index);
         const labelText=[...(e.labels||[])].map(l=>l.innerText||'').join(' ');
         const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.autocomplete,labelText].join(' ');

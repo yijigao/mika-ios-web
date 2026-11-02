@@ -65,7 +65,26 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || multiSessionTestRunning)
             Text("自检九预期（M1）：两层。Tier A 不调用模型：临时建 3 个会话各开标签——置顶排最前、置顶标签关不掉、切到别的会话时标签对象／地址／导航计数全不变（未销毁未重载）、切回置顶保留；队列入队后内存与落盘都在位、取消后消失；旧代次的迟到回复被 checkpoint 拒。Tier B 用真实模型：会话甲跑本地表单任务时切到乙入队乙的任务，切回甲等它完成，队列应自动推进、在乙里把乙的任务跑完，两个会话的对话文件互不串（甲只有张三、乙只有李四）。要求引擎空闲；scratch 会话结束时删除干净。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十：附件闭环与上传确认门") {
+                runAttachmentsTest()
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检十预期（F1）：两层。Tier A 不调用模型（本按钮）：临时会话里导入文本／图片／未知格式样本——文本抽取到摘录、图片生成缩放副本且尺寸受限、未知格式只存不假报已读；同名再导入不覆盖（两个稳定 ID 并存、第一份逐字节未变）；截图进 browser/；落盘索引回读与内存逐 ID 一致；注入段三态口径在场；SP-01 判定（本任务生成＝放行、其余＝须确认）与一次性确认绑定四连（错附件消费失败、正消费成功、同凭据二次消费失败、作废后消费失败）逐项核对，结论写进对话、临时会话删净。Tier B 真机人工（步骤见案卷 F1-IMPL 的复测清单）：先把一个文本文件导入附件中心，再开本地自检的上传页（浏览器打开 test-upload），发任务让它把该附件上传到页面——应先出 SP-01 确认卡（文件名与页面在卡上）、确认后进选文件卡、在系统选择器选定该文件、回读核验步显示页面已持有文件名；中途取消一次应能继续任务。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检十 Tier A 编排（F1）：附件存储闭环的程序化核查（AttachmentStore
+    /// .verifyAttachmentsF1：导入/抽取/缩放/同名不覆盖/只存/截图/索引往返/
+    /// 注入段/SP-01 判定与确认绑定），全部结论以「自检十」条目写进对话。
+    /// 不调用模型、不起任务；Tier B（真实上传全链）是真机人工流程，步骤
+    /// 与预期见上方说明与案卷复测清单，不在本按钮内自动执行。
+    private func runAttachmentsTest() {
+        let conversation = self.conversation
+        conversation.localFeedback("自检十：开始——Tier A 附件闭环程序化核查（不调用模型）")
+        let lines = AttachmentStore.shared.verifyAttachmentsF1()
+        for line in lines { conversation.localFeedback("自检十：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检十结论（Tier A）：全部通过——导入落盘、抽取/缩放、只存口径、索引往返、SP-01 判定与确认绑定均成立；Tier B 真机上传全链按案卷清单人工复测" : "自检十结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检八编排（H1）：会话分库隔离（SessionStore 临时会话写入/回读/删除）
