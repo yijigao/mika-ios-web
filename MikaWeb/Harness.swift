@@ -42,7 +42,7 @@ enum Harness {
 // - step 9（A-3 耦合阶 A2+A3）：建 settings＋engine；engine 的 web 参数仅为满足 AgentEngine.init(web:settings:)
 //   签名的依赖实例——不入本持有者的 web 槽（保持 nil）、不下传视图、仅由 engine 的 strong let 引用保活；
 //   BrowserView 实际消费的 controller 仍由根视图自持（A1/A4 缺席）。耦合关系详记案卷 CRASH-LADDER-3 §1。
-final class HarnessObjectGraph: ObservableObject {
+@MainActor final class HarnessObjectGraph: ObservableObject {
     let web: WebController?
     let settings: SettingsStore?
     let engine: AgentEngine?
