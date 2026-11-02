@@ -351,7 +351,7 @@ struct AgentStep: Identifiable {
                             try await web.execute(action, expected: nil)
                             try await checkpoint(token)
                             record(action)
-                            let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : "\(Int(action.seconds))")
+                            let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : (action.action == "set_site_mode" ? action.mode : "\(Int(action.seconds))"))
                             loopFingerprint = LoopDetector.fingerprint(action: action.action, target: target, outcome: "ok")
                             try await Task.sleep(for: .milliseconds(500))
                         }
@@ -368,11 +368,11 @@ struct AgentStep: Identifiable {
                                 persistSnapshot()
                                 return
                             case .severe:
-                                appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已要求模型必须换做法，再重复将自动停下")
-                                pendingLoopHint = "严重警告：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果始终没有变化。若下一步仍原样重复，任务将自动停下交用户决定。必须换一种做法：换目标、换入口、先滚动或等待让页面变化，或用 ask_user 向用户说明卡点。"
+                                appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已下达最后换路指令（无路可换时须按求助口径交代已试路径），再重复将自动停下")
+                                pendingLoopHint = "严重警告（最后一次换路机会）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果始终没有变化。若下一步仍原样重复，任务将自动停下交用户决定。必须换路：换入口／换目标，或用 set_site_mode 换站点模式，或按页面规则／说明里写明的官方路径 navigate 到同功能的电脑版站点／官方后台。若确实已无替代路径，才可以 ask_user 求助——并且必须先交代已试过的每条路径与各自的卡点，再提出需要用户做的那一步。求助是最后手段，不是默认出口。"
                             case .warning:
-                                appendStep("loop", "循环提醒：同一动作已重复 \(verdict.count) 次且结果未变，下一步提示已要求模型换做法")
-                                pendingLoopHint = "注意：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果没有变化。下一步不要原样重复：换目标、换入口、先滚动或等待让页面变化，或用 ask_user 向用户说明卡点。"
+                                appendStep("loop", "循环提醒：同一动作已重复 \(verdict.count) 次且结果未变，下一步提示已升级为必须换路指令（禁止原样重试）")
+                                pendingLoopHint = "警告（必须换路）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果没有变化。下一步禁止原样重试，必须换一种做法：换入口／换目标，或用 set_site_mode 换站点模式，或先读页面规则／说明、按其中写明的官方路径 navigate 到同功能的电脑版站点／官方后台。还没试过至少两条替代路径之前，不要 ask_user 求助。"
                             case .none:
                                 break
                             }

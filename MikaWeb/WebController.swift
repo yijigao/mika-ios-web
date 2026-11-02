@@ -54,6 +54,21 @@ extension Notification.Name {
     }
 }
 
+/// 站点模式（RESOURCEFULNESS）：标签页的 UA 形态。desktop＝iPhone 上一直
+/// 沿用的桌面 UA（立项口径，默认不变）；mobile＝iPhone Safari UA。agent 的
+/// set_site_mode 动作与用户手动需求都经它切换——不少站点按 UA 分发完全不同
+/// 的页面（活动页只给移动版、后台只给电脑版），换模式是「受阻换路」的一条路。
+enum SiteMode: String {
+    case desktop, mobile
+    var userAgent: String {
+        switch self {
+        case .desktop: return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        case .mobile: return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        }
+    }
+    var label: String { self == .desktop ? "电脑版（desktop）" : "手机版（mobile）" }
+}
+
 // 标签页会话（2026-11-02，案卷 TABS-IMPL-2026-11-02.md）：一个标签页＝一个独立 WKWebView
 // ＋独立历史／标题／加载状态。切换标签只是把当前页的 WKWebView 换入视图层级，离屏标签的
 // 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，按最后已知
@@ -85,7 +100,7 @@ extension Notification.Name {
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         WebAuthnProbeMultiplexer.shared.associate(tab: self)
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        webView.customUserAgent = SiteMode.desktop.userAgent
         webView.navigationDelegate = self
         observations = [
             webView.observe(\.url, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
@@ -243,6 +258,22 @@ extension Notification.Name {
     func reload() { webView.reload() }
     func goBack() { webView.goBack() }
     func goForward() { webView.goForward() }
+
+    /// 本标签页当前站点模式（默认 desktop，逐标签独立——一个标签切了手机版
+    /// 不影响其他标签）。
+    private(set) var siteMode: SiteMode = .desktop
+    /// 切换站点模式：UA 只在发出请求时生效，必须重载当前页才换版式；已在
+    /// 目标模式时不重载、返回 false（引擎步流据实记「已是该模式」）。
+    /// 起始页（本地 HTML、无 URL）只改 UA 不重载——没有可重载的请求，
+    /// 后续第一次真实导航自然带上新 UA。
+    @discardableResult
+    func setSiteMode(_ mode: SiteMode) -> Bool {
+        guard mode != siteMode else { return false }
+        siteMode = mode
+        webView.customUserAgent = mode.userAgent
+        if webView.url != nil { webView.reload() }
+        return true
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { revision += 1; pageError = nil; update() }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -544,6 +575,13 @@ extension Notification.Name {
         let tab = executionTab
         switch action.action {
         case "navigate": try tab.load(action.url)
+        case "set_site_mode":
+            // 站点模式切换（RESOURCEFULNESS）：换 UA＋重载执行页。模式串非法
+            // 时如实抛错，不静默当作已切换。
+            guard let mode = SiteMode(rawValue: action.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+                throw MikaError("未知站点模式「\(action.mode)」，只能是 desktop 或 mobile")
+            }
+            tab.setSiteMode(mode)
         case "scroll":
             guard ["up", "down"].contains(action.direction) else { throw MikaError("未知滚动方向") }
             _ = try await evaluate("window.scrollBy(0, \(action.direction == "up" ? "-" : "")window.innerHeight*0.85)", on: tab)

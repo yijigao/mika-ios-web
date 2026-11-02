@@ -32,6 +32,12 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!settings.hasKey || !engine.active || resumeTestRunning)
             Text("自检四预期：本地表单任务跑出至少 2 步后，模拟进程级中断（引擎内存态全丢、标签页打回起始页），仅凭落盘快照恢复出原目标与步骤；随后你点「继续」（或在输入框打「继续」），agent 应先回到表单页、带着原目标把剩下的填写／提交做完并汇报结果，全程不得反问网址或进度。中断与恢复报告、最终结论都会以「自检四」条目写进对话。").font(.caption).foregroundStyle(.secondary)
+            Button("自检五：非语义入口与站点模式") {
+                guard settings.hasKey || settings.chatGPTAuth.isLoggedIn else { return }
+                engine.start(local: "test-entries", task: "这是本地活动页。先汇报页面标注的当前浏览模式；然后把页面切换到手机版格式，再汇报切换后的浏览模式；再点击『发微头条』入口，汇报页面出现的结果文字。")
+                dismiss()
+            }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
+            Text("自检五预期（RESOURCEFULNESS）：活动页的『发微头条』是 div＋JS 绑定的非语义入口——旧抽取看不见它；新版应能在元素清单里以 type=clickable 找到并点击，页面出现『已打开：发微头条编辑页』。切换站点模式走 set_site_mode：切换后页面重载、标注的浏览模式应由『电脑版（desktop）』变『手机版（mobile）』。页面上的长文本指针卡片、不可点说明文字、8px 小元素不应进清单（防噪声门槛）。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 

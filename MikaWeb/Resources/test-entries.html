@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地活动页</title>
+<style>
+body{font:20px system-ui;margin:24px}
+.entry{display:inline-block;padding:14px 18px;margin:8px 6px;background:#e8ecff;border-radius:10px;cursor:pointer}
+.card{cursor:pointer;padding:12px;margin:14px 0;background:#f6f6f6;border-radius:8px}
+.plain{padding:10px;margin:8px 0}
+.tiny{display:inline-block;width:8px;height:8px;cursor:pointer;background:#ccc}
+</style>
+<h1>创作活动页（本地示例）</h1>
+<p>参与方式——电脑端：登录创作者后台，在后台点「发布」投稿；手机端：在本页点下方入口投稿。</p>
+<p>当前浏览模式：<span id="modeText">未知</span></p>
+<div>
+<div class="entry" id="e1">发微头条</div>
+<span class="entry" id="e2" onclick="hit('已打开：写文章编辑页')">写文章</span>
+<div class="entry" id="e3" role="tab">拍视频</div>
+<button id="b1" type="button">普通按钮（对照）</button>
+</div>
+<div class="card" id="card">这是一张文章卡片，整段文字只是用来占位的示例内容，点击它在真实站点里会打开全文；这段文案特意写得很长很长，远远超过一百二十个字，用来验证抽取门槛：长文本的指针容器不应当被当成一个可点入口列进元素清单里去打扰模型判断才对，因为它本质上是一整块内容区域而不是一个按钮，把它误列进入口清单只会给模型增加噪声，还可能让它误点进文章详情页偏离任务目标，所以必须被门槛挡在外面。</div>
+<div class="plain">不可点说明文字</div>
+<span class="tiny" id="tiny">点</span>
+<p id="result" role="status"></p>
+<script>
+function hit(t){document.getElementById('result').textContent=t;}
+document.getElementById('e1').addEventListener('click',function(){hit('已打开：发微头条编辑页');});
+document.getElementById('e3').addEventListener('click',function(){hit('已打开：拍视频页');});
+document.getElementById('b1').addEventListener('click',function(){hit('已打开：普通按钮目标页');});
+document.getElementById('modeText').textContent=/iPhone/.test(navigator.userAgent)?'手机版（mobile）':'电脑版（desktop）';
+</script></html>

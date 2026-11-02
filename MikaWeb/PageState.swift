@@ -19,11 +19,40 @@ enum PageScript {
       if(!document.body){return JSON.stringify({url:location.href,title:document.title||'',text:'',elements:[]});}
       document.querySelectorAll('[data-mika-idx]').forEach(e=>e.removeAttribute('data-mika-idx'));
       const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
-      const elements=[...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"]')].filter(visible).map((e,index)=>{
+      const semSel='a,button,input,textarea,select,[role="button"],[contenteditable="true"]';
+      const roleSel='[role="tab"],[role="link"],[role="menuitem"],[role="option"],[role="switch"],[role="checkbox"],[role="treeitem"],[onclick]';
+      const baseSet=new Set(document.querySelectorAll(semSel+','+roleSel));
+      // 非语义可点元素补盲（RESOURCEFULNESS）：活动页一类的「发微头条／写文章／拍视频」
+      // 入口常是 div/span＋JS 绑定的非语义元素，不在语义选择器内——模型看不见、
+      // 只能请用户手动点。补入判据（须同时满足，防噪声）：不在语义元素内部、
+      // 也不包裹语义元素（真目标在内层时父级不重复列）；有可读文案（纯文本粗筛
+      // ≤120 字，再以 innerText／aria-label／title 复核）；可见且尺寸 ≥12×12；
+      // 计算样式 cursor:pointer。同类嵌套只留最内层（点击事件冒泡到父级处理器，
+      // 点内层等效）。补入上限 200 条（去重前），语义元素不受任何新门槛影响。
+      const scanSel='div,span,li,td,th,p,i,em,b,strong,img,section,article,nav,header,footer,figure,figcaption,dd,dt';
+      const rawExtras=[];
+      for(const e of document.querySelectorAll(scanSel)){
+        if(rawExtras.length>=200)break;
+        if(baseSet.has(e))continue;
+        if(e.closest(semSel)||e.querySelector(semSel))continue;
+        const cheap=(e.textContent||'').trim();
+        if(cheap.length>120)continue;
+        if(!cheap&&!(e.getAttribute('aria-label')||'').trim()&&!(e.title||'').trim())continue;
+        if(!visible(e))continue;
+        const r=e.getBoundingClientRect();
+        if(r.width<12||r.height<12)continue;
+        const label=((e.innerText||'').trim()||(e.getAttribute('aria-label')||'').trim()||(e.title||'').trim());
+        if(!label||label.length>120)continue;
+        if(getComputedStyle(e).cursor!=='pointer')continue;
+        rawExtras.push(e);
+      }
+      const extraSet=new Set(rawExtras.filter(e=>!rawExtras.some(o=>o!==e&&e.contains(o))));
+      const merged=[...baseSet,...extraSet].sort((x,y)=>{const p=x.compareDocumentPosition(y);return (p&4)?-1:(p&2)?1:0;});
+      const elements=merged.filter(visible).map((e,index)=>{
         e.setAttribute('data-mika-idx',index);
         const labelText=[...(e.labels||[])].map(l=>l.innerText||'').join(' ');
         const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.autocomplete,labelText].join(' ');
-        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||e.tagName.toLowerCase(),text:(e.innerText||labelText||e.getAttribute('aria-label')||'').slice(0,300),placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
+        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:(e.innerText||labelText||e.getAttribute('aria-label')||e.getAttribute('title')||'').slice(0,300),placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
       });
       let text='',n;const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
       while((n=walker.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&visible(n.parentElement))text+=n.textContent.trim()+' ';}
