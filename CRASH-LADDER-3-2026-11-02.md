@@ -51,4 +51,32 @@ A 组清单（CRASH-LADDER-2 §5.1）：A1 App 级 @StateObject 持有 WebContro
 
 ## 4. 构建与 ASC 回读证据
 
-（随构建交付逐阶补入：提交、CI/Release Run、build id、processingState、Internal 组回读。）
+分支 `crash-ladder-2`（续第二轮；main 未动）；validate_project.py 每阶全 PASS。以下三阶均经 ASC API 逐台回读：processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false（回读确认）、Internal 组（6a722377-d7f3-4c76-876f-4c35e193e0e4）挂载 POST 204 且组内回读居首。
+
+### 阶 A-1（step=7）— 构建 202611020259
+
+- 代码提交：基座重构 `c3e2d11`（HarnessObjectGraph 持有者＋step=7；含本案卷初版）→ 修复 `b98ec03` → 修复 `20bf19b`（三阶共用基座，A-1 阶的源码差异只在 step 取值，见 §2）。
+- **两次未遂 Release（c3e2d11 对应阶＝A-1，失败原因定性）**：
+  1. 提交 `c3e2d11` 的 Release Run **41379839097** 失败（beta job 46 秒；GitHub 通知邮件 2026-11-02 10:51 所报即此 run，邮件的 3 条 annotations 均为噪音：Node.js 20 弃用警告＋macOS 容量提示，真正原因在 fastlane 日志）：Release archive 编译错误 `MikaWebApp.swift:52:45: error: cannot convert value of type 'AgentEngine?' to expected argument type 'AgentEngine'`——Optional 形态 @StateObject 的 `StateObject(wrappedValue:)` 赋值解析到非 Optional 期望。**同一提交的 CI Run 41379753052（Debug 模拟器构建）却 success**——CI 不构成 Release 门禁（见末尾流程教训）。
+  2. 修复提交 `b98ec03`（改用 HarnessObjectGraph 持有者）的 Release Run **41380202611** 亦失败（beta job 1m4s）：新错 `Harness.swift:69:39: error: call to main actor-isolated initializer 'init()' in a synchronous nonisolated context`——WebController/SettingsStore/AgentEngine 均为 @MainActor 类，其 init 在非隔离的持有者 init 内被调用；Release 的严格并发检查（Complete）下为错误，Debug 的 Minimal 检查下只放行。修复 `20bf19b`：持有者标 `@MainActor`。
+- 成功链：CI Run **41380421273** success → Release Run **41380533879** success（fastlane 上传 03:01:57Z 确认）。
+- build id `0684782b-8814-4c18-bf9b-1c0720009497`；ASC 回读 VALID、expired=false、合规已 PATCH=false；Internal 组挂载 204，组内回读居首。
+
+### 阶 A-2（step=8）— 构建 202611020307
+
+- 代码提交 `9f90663`（与 A-1 的源码 diff 经 git diff 实查恰为 `Harness.step` 7→8 一行）。
+- CI Run **41381189491** success → Release Run **41381285067** success（fastlane 上传 03:10:03Z 确认）。
+- build id `63e62a96-bf49-4c33-a692-798921eca95a`；ASC 回读 VALID、expired=false、合规已 PATCH=false；Internal 组挂载 204，组内回读居首。
+
+### 阶 A-3（step=9，角标 A-2+3）— 构建 202611020316
+
+- 代码提交 `ea07eec`（与 A-2 的源码 diff 经 git diff 实查恰为 `Harness.step` 8→9 一行）。
+- CI Run **41382027953** success → Release Run **41382133911** success（fastlane 上传 03:19:03Z 确认）。
+- build id `53ddbb9d-8a73-4f4d-bf36-6ea749d6d009`；ASC 回读 VALID、expired=false、合规已 PATCH=false；Internal 组挂载 204，组内回读居首。
+
+### 流程教训（记入本轮，避免后轮重蹈）
+
+- **CI（Debug 模拟器构建）不等于 Release 门禁**：本轮两起 Release 编译失败的提交，其 CI 均 success。根因是 Xcode 按配置区分严格并发检查（Debug Minimal / Release Complete），且 archive 与 simulator 构建的检查强度不同。以后「CI 通过」只作编译参考，**交付只认 Release success＋ASC 回读**（本轮三阶均按此口径交付，不以 CI 代替）。
+- 构建号由 fastlane 现场生成（UTC 时间戳 %Y%m%d%H%M），不落仓；三阶构建号分别为 202611020259 / 202611020307 / 202611020316（A-1 首版拟用号 202611020250、修复版拟用号 202611020255 均未上传，不占用）。
+
+待主聊转交 Joey：按 §3 规程按 A-1 → A-2 → A-3 顺序装（TestFlight 内按构建号选装：A-1 为 202611020259、A-2 为 202611020307、A-3 为 202611020316；最新构建为 A-3，测 A-1/A-2 时须从「以前的构建」里手动选号），首崩即停并导出崩溃报告。
