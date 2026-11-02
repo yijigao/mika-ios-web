@@ -4,17 +4,23 @@ import WebKit
 // 触摸网页闪退最小化阶梯（CRASH-LADDER-2026-11-02；第二轮 CRASH-LADDER-2-2026-11-02）。本文件只存在于阶梯分支，主线无此文件。
 // 第一轮阶梯定义：H0 裸 WKWebView → H1 加 1652 形态浏览器 chrome → H2 换现行 BrowserView/WebSurface/WebController 地基。
 // 第二轮阶梯定义（crash-ladder-2，step=3/4）：H3 = App 级装配骨架（1652 形态对象图＋流内静态控制台）→ H4 = 加 1652 动态接线（观察扇出/真控制台/pending/toolbar 目的地/scenePhase）。
-// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同。
+// 第三轮阶梯定义（CRASH-LADDER-3-2026-11-02，step=7/8/9）：H3a/H3b 真机均崩、A 组单独可触发后，自 H2 基线（step=2 源码状态）把 A 组拆单件——
+//   step=7「A-1」只加 A1（App 级持有 WebController＋下传消费）；step=8「A-2」只加 A2（App 级创建 SettingsStore）；
+//   step=9「A-2+3」为 A3 的最小耦合阶（AgentEngine init 签名强制 web+settings 两实例，A3 不能独立，详见案卷 CRASH-LADDER-3 §1）。
+// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同（各阶 App 装配差异由 MikaWebApp.init 内的 step 分阶构造承载）。
 // 三阶共同点：
 // 1. 起始页与生产 App 完全一致——startPageHTML 是 WebController.init 里 loadHTMLString 的原文，
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 6
+    static let step = 7
     static var stepName: String {
         switch step {
         case 5: return "H3a"
         case 6: return "H3b"
+        case 7: return "A-1"
+        case 8: return "A-2"
+        case 9: return "A-2+3"
         default: return "H\(step)"
         }
     }
@@ -50,10 +56,12 @@ struct HarnessBareSurface: UIViewRepresentable {
 }
 
 struct HarnessRootView: View {
-    // 第二轮（step>=3）由 App 入口传入 1652 形态对象图；第一轮各阶（step 0/1/2）不使用这些引用（其 WebController 由各阶视图自持）。
-    let web: WebController
-    let settings: SettingsStore
-    let engine: AgentEngine
+    // 对象图引用由 App 入口按 step 分阶传入，未建的对象为 nil（各阶实际建了哪些对象见 MikaWebApp.init 的分阶构造）：
+    // step 0/1/2 三者皆 nil；step 3/4/5/6 三者皆非 nil；step 7 仅 web；step 8 仅 settings；step 9 为 settings＋engine
+    //（其 engine 的 web 依赖实例不经此下传）。需要全对象图的视图分支均以 if let 解包，解包失败不挂载（按 init 分阶构造不会发生）。
+    let web: WebController?
+    let settings: SettingsStore?
+    let engine: AgentEngine?
     @ObservedObject var diagnostics: DiagnosticStore
     @Environment(\.scenePhase) private var scenePhase
     @State private var showReports = false
@@ -63,21 +71,29 @@ struct HarnessRootView: View {
                 HarnessH0View()
             } else if Harness.step == 1 {
                 HarnessH1View()
-            } else if Harness.step == 3 {
-                HarnessH3View(web: web, settings: settings, engine: engine)
-            } else if Harness.step == 5 {
-                HarnessH3aView(web: web)
-            } else if Harness.step == 6 {
-                HarnessH3View(web: web, settings: settings, engine: engine)
-            } else if Harness.step >= 4 {
-                HarnessH4View(web: web, settings: settings, engine: engine)
+            } else if Harness.step == 3 || Harness.step == 6 {
+                if let web, let settings, let engine {
+                    HarnessH3View(web: web, settings: settings, engine: engine)
+                }
+            } else if Harness.step == 5 || Harness.step == 7 {
+                // step 5＝H3a（全对象图在场、根视图只消费 web）；step 7＝A-1（对象图只有 web，根视图形态与 H3a 逐字相同，
+                // 差异只在 settings/engine 不存在）——两阶共用同一视图，变量纯度由 App 装配承载。
+                if let web {
+                    HarnessH3aView(web: web)
+                }
+            } else if Harness.step == 4 {
+                if let web, let settings, let engine {
+                    HarnessH4View(web: web, settings: settings, engine: engine)
+                }
             } else {
+                // step 2（H2 基线）与 step 8（A-2）/step 9（A-2+3）：根视图逐字同 H2——WebController 由本视图自持，
+                // App 级新建的 settings/engine 不被任何视图消费。
                 HarnessH2View()
             }
         }
-        // 1652 的 scenePhase 接线（App body 的 onChange → engine.setForeground）：本阶梯挂在根包装、仅 H4（step==4）生效（案卷 CRASH-LADDER-2 §2 登记的挂载点差异）。step 5/6（H3a/H3b）必须不生效，否则破坏与 H3 的装配等价性。
+        // 1652 的 scenePhase 接线（App body 的 onChange → engine.setForeground）：本阶梯挂在根包装、仅 H4（step==4）生效（案卷 CRASH-LADDER-2 §2 登记的挂载点差异）。step 5/6（H3a/H3b）与第三轮各阶必须不生效，否则破坏装配等价性。
         .onChange(of: scenePhase, initial: true) { _, phase in
-            if Harness.step == 4 { engine.setForeground(phase == .active) }
+            if Harness.step == 4, let engine { engine.setForeground(phase == .active) }
         }
         .overlay(alignment: .bottomTrailing) {
             VStack(spacing: 2) {
@@ -236,6 +252,7 @@ struct HarnessH4View: View {
 // H3a：H2 ＋ A 组装配（案卷 CRASH-LADDER-2 §6）——App 入口对象图与 H3 逐字相同（App 持有 web/settings/engine 并向下传递），
 // 根视图保持 H2 形态：BrowserView 消费 App 传入的 web（普通 let 持有）、Divider、120pt 静态占位条；不加 1652 布局与静态控制台（B 组归 H3b）。
 // 与 HarnessH2View 的唯一差异：WebController 来源由视图自持 @StateObject 改为 App 传入。
+// 第三轮 step 7（A-1，案卷 CRASH-LADDER-3）共用本视图：彼时对象图只有 web（settings/engine 不存在），视图形态不变，变量差异只在 App 装配。
 struct HarnessH3aView: View {
     let web: WebController
     var body: some View {
