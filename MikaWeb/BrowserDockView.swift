@@ -1,13 +1,22 @@
 import SwiftUI
 
 // 浏览器坞（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md；
-// 真 resize 修复 2026-11-02，案卷 FLOATING-UI-FIX2-2026-11-02.md）：
+// 真 resize 修复 2026-11-02，案卷 FLOATING-UI-FIX2-2026-11-02.md；
+// 视口所有权修复 2026-11-02，案卷 AGENT-VIEWPORT-FIX-2026-11-02.md）：
 // 对话全屏为根层，浏览器改为盖在其上的坞：expanded＝全屏，mini＝可拖动悬浮小窗。
 // 保活原则：坞内承载的 BrowserView（含 WebSurface／同一个 WKWebView 实例）自 App 启动
 // 常驻、永不卸载或重建、永不重载。收放动画期间只走 scaleEffect 渲染变换过渡；状态落定
 // （弹簧结束约 480ms 后）把 BrowserView 的布局尺寸切到当前态的真实尺寸，WKWebView 随之
 // 按新视口响应式重排（内容随窗口适配）；resize 只发生在落定时点，拖动过程中不触发。
 // resize 前后保存／恢复页面滚动比例，页面导航（revision 变化）时不恢复。
+//
+// 视口所有权（布局尺寸归谁管，由 DockLayoutMode 显式表达，不用布尔拼凑）：
+// - 任务会话活跃期间（DockLayoutMode.workingSize）：布局尺寸锁定为展开态工作尺寸——
+//   agent 的工作视口就是这个尺寸，坞收起只把全尺寸布局缩放渲染（回到 0540 的 scale 路径），
+//   绝不因收起而 resize；任务开始时坞自动展开，会话终结后若坞仍是小窗态再补落定 resize。
+// - 无任务时（DockLayoutMode.dockSize）：布局跟随坞态，即 FIX2 的落定真 resize 行为。
+// 视觉呈现（DisplayMode）由 mode（坞形态）×layoutMode（布局所有权）导出：
+// 布局缩放比 layoutScale 与视觉缩放比之商走 scaleEffect，组合真值表见案卷。
 // 位置几何走「中心点＋缩放比」模型：动画由 mode 驱动（弹簧、可被新手势打断重定向），
 // 拖动位移走无动画事务，松手按预测落点（速度采样）弹簧吸附到最近的左／右边缘。
 
@@ -18,6 +27,15 @@ enum DockMode {
     case mini
 }
 
+/// 布局尺寸所有权：布局尺寸（＝WKWebView 的真实视口）当前归谁管。
+/// - workingSize：任务会话活跃期，布局锁定展开态工作尺寸，坞收放只影响视觉呈现；
+/// - dockSize：无任务，布局跟随坞态（展开＝全尺寸、小窗＝小窗真实尺寸，FIX2 行为）。
+/// 迁移点（任务会话开始／终结、坞收放、容器尺寸变化）逐个列在案卷的状态迁移表里。
+enum DockLayoutMode {
+    case workingSize
+    case dockSize
+}
+
 /// 坞几何纯函数：与视图状态解耦，可独立核对。
 enum DockGeometry {
     /// 小窗距容器左／右／上边缘的留白（pt）
@@ -26,18 +44,20 @@ enum DockGeometry {
     /// 小窗的停靠与拖动钳制不越过此线，避免长期遮住输入栏；键盘弹起时的短暂遮挡不在此列。
     static let bottomReserve: CGFloat = 148
     /// 小窗目标宽度占容器宽度比例与绝对范围（pt）。
-    /// FIX2：小窗态布局尺寸＝视觉尺寸（页面按此视口真实排版），旧 0.44／150–184 在真 resize 下
-    /// 视口过窄（约 173pt），故适度调大；整页等比形态不变，手感不合仍可一行调整。
-    static let miniWidthFraction: CGFloat = 0.50
-    static let miniWidthRange: ClosedRange<CGFloat> = 170...210
-    /// 小窗高度上限占容器高度比例
-    static let miniMaxHeightFraction: CGFloat = 0.50
+    /// AGENT-VIEWPORT-FIX：FIX2 的 0.50／170–210（约 196×380）盖住半个对话区、观感压迫，
+    /// 调小为屏宽×0.40（钳 148–168）；高度按整页等比、上限约 300pt。小窗态下 agent 任务的
+    /// 工作视口不再是这个尺寸（布局锁定工作尺寸，见 DockLayoutMode），调小只影响
+    /// 用户闲时浏览的真实视口与任务期的缩放渲染观感。手感不合仍可一行调整。
+    static let miniWidthFraction: CGFloat = 0.40
+    static let miniWidthRange: ClosedRange<CGFloat> = 148...168
+    /// 小窗高度上限（pt，整页等比缩放后的视觉高度封顶）
+    static let miniMaxHeight: CGFloat = 300
 
     /// 小窗缩放比：按目标宽度换算，并受高度上限约束（等比缩放、整页可见）。
     static func miniScale(area: CGSize) -> CGFloat {
         guard area.width > 0, area.height > 0 else { return 1 }
         let targetWidth = min(max(area.width * miniWidthFraction, miniWidthRange.lowerBound), miniWidthRange.upperBound)
-        return min(targetWidth / area.width, miniMaxHeightFraction)
+        return min(targetWidth / area.width, miniMaxHeight / area.height)
     }
 
     /// 给定缩放比时坞的视觉尺寸（＝展开布局尺寸 × 缩放比）
@@ -124,9 +144,13 @@ struct BrowserDockView: View {
     @State private var dragStartCenter: CGPoint?
     @State private var area: CGSize = .zero
     /// 已落定的布局缩放比：BrowserView 按 area×layoutScale 布局；动画期间的视觉缩放比
-    /// （由 mode 决定）与它之商走 scaleEffect 过渡，落定后 layoutScale 追平视觉缩放比、
-    /// 渲染缩放归 1，页面按真实尺寸重排（FIX2 缺陷 1）。
+    /// （由 mode 决定）与它之商走 scaleEffect 过渡，落定后 layoutScale 追平目标缩放比、
+    /// 渲染缩放归 1，页面按真实尺寸重排（FIX2 缺陷 1）。目标缩放比由 layoutMode 决定，
+    /// 不是直接由 mode 决定（任务期布局锁定，见 settleTargetScale）。
     @State private var layoutScale: CGFloat = 1
+    /// 布局尺寸所有权：任务会话活跃＝.workingSize（布局锁定工作尺寸），否则 .dockSize。
+    /// 只在 onChange(engine.sessionActive) 两个迁移点写入，坞自身的收放不改它。
+    @State private var layoutMode: DockLayoutMode = .dockSize
     @State private var settleTask: Task<Void, Never>?
     @AppStorage("dock.miniCenterXFrac") private var storedXFrac: Double = -1
     @AppStorage("dock.miniCenterYFrac") private var storedYFrac: Double = -1
@@ -180,6 +204,20 @@ struct BrowserDockView: View {
         .ignoresSafeArea(.keyboard)
         .onChange(of: needsIntervention) { _, needed in
             if needed, mode != .expanded { expand() }
+        }
+        .onChange(of: engine.sessionActive) { _, active in
+            // 视口所有权迁移点（任务会话开始／终结）：
+            if active {
+                // 会话开始：布局所有权移交工作尺寸，并自动展开坞（用户在小窗态发起任务时，
+                // agent 的工作页面从第一步起就是全尺寸视口，不被小窗压排版）。
+                layoutMode = .workingSize
+                if mode != .expanded { expand() } else { scheduleSettle() }
+            } else {
+                // 会话终结（完成／失败／停止／切后台暂停）：所有权交还坞态；
+                // 坞若仍是小窗态，scheduleSettle 会补做落定 resize 到小窗真实尺寸。
+                layoutMode = .dockSize
+                scheduleSettle()
+            }
         }
     }
 
@@ -280,18 +318,32 @@ struct BrowserDockView: View {
         scheduleSettle()
     }
 
-    /// 落定真 resize（FIX2 缺陷 1）：弹簧（0.42s）结束后，把布局尺寸切到当前态真实尺寸，
+    /// 落定 resize 的目标布局缩放比：由布局所有权决定。
+    /// - workingSize（任务会话活跃）：恒为 1（展开态工作尺寸）——坞收起时 settle 到这里
+    ///   等于「不 resize」，视觉缩小完全由 scaleEffect 渲染承担，agent 工作视口纹丝不动；
+    /// - dockSize（无任务）：跟随坞态，展开＝1、小窗＝小窗缩放比（FIX2 落定真 resize）。
+    private func settleTargetScale() -> CGFloat {
+        switch layoutMode {
+        case .workingSize: return 1
+        case .dockSize: return mode == .expanded ? 1 : DockGeometry.miniScale(area: area)
+        }
+    }
+
+    /// 落定真 resize（FIX2 缺陷 1）：弹簧（0.42s）结束后，把布局尺寸切到目标尺寸，
     /// 页面随之按新视口重排。切换在禁用动画的事务里完成，切换前先存页面滚动比例、
     /// 切换后恢复（页面在等待期间发生导航＝revision 变化则不恢复，避免跳错位置）。
-    /// 拖动不改 mode、不调本方法，故拖动过程中绝不 resize。
+    /// 拖动不改 mode、不调本方法，故拖动过程中绝不 resize。任务会话活跃期目标恒为
+    /// 工作尺寸：若布局已在工作尺寸则直接返回（收起不触发任何 resize），若会话开始时
+    /// 布局还停在小窗真实尺寸（闲时小窗浏览后直接发起任务），则在此一次切回工作尺寸。
     private func scheduleSettle() {
         settleTask?.cancel()
         let targetMode = mode
+        let targetLayoutMode = layoutMode
         let revisionAtSchedule = web.revision
         settleTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(480))
-            guard !Task.isCancelled, mode == targetMode, area.width > 0 else { return }
-            let target = targetMode == .expanded ? 1 : DockGeometry.miniScale(area: area)
+            guard !Task.isCancelled, mode == targetMode, layoutMode == targetLayoutMode, area.width > 0 else { return }
+            let target = settleTargetScale()
             guard abs(layoutScale - target) > 0.001 else { return }
             let fraction = await scrollFraction()
             var transaction = Transaction()
@@ -299,7 +351,7 @@ struct BrowserDockView: View {
             withTransaction(transaction) { layoutScale = target }
             if web.revision == revisionAtSchedule, let fraction {
                 try? await Task.sleep(for: .milliseconds(150))
-                guard mode == targetMode else { return }
+                guard mode == targetMode, layoutMode == targetLayoutMode else { return }
                 await restoreScrollFraction(fraction)
             }
         }

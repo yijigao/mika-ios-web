@@ -240,12 +240,29 @@ import Combine
         }
         throw MikaError("网页加载超时")
     }
+    /// 等页面短暂稳定再取快照（AGENT-VIEWPORT-FIX）：动作（输入／点击）常引发框架重渲染，
+    /// 立刻抽取会拿到中间态快照、元素引用随即失效。短轮询页面签名（就绪态／正文文本量／
+    /// 节点数／文档高度），连续两次相同即认为 DOM 已静默；上限约 1.6 秒，超时照常取快照
+    /// （动画／轮播类页面永不完全静默，不为它无限等）。全程尽力而为，不抛错、不拦加载判定。
+    private func waitForStability(in tab: BrowserTab) async {
+        let probe = "(()=>{const b=document.body;return [document.readyState,b?b.innerText.length:0,document.querySelectorAll('*').length,document.documentElement?document.documentElement.scrollHeight:0].join('|');})()"
+        var last: String?
+        for _ in 0..<8 {
+            let signature = (try? await evaluate(probe, on: tab)) as? String
+            if let signature {
+                if signature == last { return }
+                last = signature
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
     /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
     func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
     private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
     func state() async throws -> PageState {
         let tab = executionTab
         try await ready(in: tab)
+        await waitForStability(in: tab)
         guard let json = try await evaluate(PageScript.extract, on: tab) as? String else { throw MikaError("无法抽取页面状态") }
         do { return try JSONDecoder().decode(PageState.self, from: Data(json.utf8)) }
         catch { throw MikaError("页面状态解析失败，请刷新页面后重试") }
@@ -369,6 +386,34 @@ import Combine
         return decoded
     }
 
+    /// 按内容兜底回读（verifyType 的节点被重渲染换掉时）：不认 data-mika-idx，直接在全页
+    /// 可见编辑器里找正文（归一化后）包含目标文本的那个；提交按钮候选取与该编辑器共享
+    /// 近层祖先的候选（同 verifyType 口径）。没有任何编辑器含目标文本时返回 found=false。
+    private func verifyTypeByContent(action: AgentAction, tab: BrowserTab) async throws -> TypeVerification? {
+        let data = try JSONSerialization.data(withJSONObject: ["text": action.text])
+        let json = String(decoding: data, as: UTF8.self)
+        guard let raw = try await evaluate("""
+        (()=>{const a=\(json);
+        const norm=s=>(s||'').replace(/[\\s\\u200b\\ufeff]+/g,'');
+        const want=norm(a.text);
+        if(!want)return JSON.stringify({found:false,textOK:false,editorLike:false,submits:[]});
+        const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        const editors=[...document.querySelectorAll('[contenteditable="true"],textarea')].filter(vis);
+        const e=editors.find(x=>{const cur=x.tagName==='TEXTAREA'?(x.value||''):((x.innerText||x.textContent||''));return norm(cur).includes(want);});
+        if(!e)return JSON.stringify({found:false,textOK:false,editorLike:false,submits:[]});
+        const labelRe=/发布|发表|提交|发送|评论|回复|publish|post|submit|send|comment|reply/i;
+        const lab=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim();
+        const dis=x=>x.disabled===true||x.getAttribute('aria-disabled')==='true';
+        let cands=[...document.querySelectorAll('button,[role="button"],input[type="submit"],a')].filter(x=>vis(x)&&labelRe.test(lab(x)));
+        const near=cands.filter(x=>{let n=e;for(let i=0;i<8&&n;i++){if(n.contains(x))return true;n=n.parentElement;}return false;});
+        if(near.length)cands=near;
+        return JSON.stringify({found:true,textOK:true,editorLike:true,submits:cands.slice(0,8).map(x=>({text:lab(x).slice(0,40),disabled:dis(x)}))});})()
+        """, on: tab) as? String, let decoded = try? JSONDecoder().decode(TypeVerification.self, from: Data(raw.utf8)) else {
+            return nil
+        }
+        return decoded
+    }
+
     /// type 总流程：写入→回读；不过关换备用路径重试一次；仍不过关如实报「没输入进去」，
     /// 不再误报成「找不到发表按钮」。文字已进但提交按钮全员禁用时单独报「按钮是灰的」。
     private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
@@ -377,8 +422,17 @@ import Combine
             let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, tab: tab)
             if status == "exec-failed" { continue }
             try await Task.sleep(for: .milliseconds(400))
-            let v = try await verifyType(action: action, tab: tab)
-            guard v.found else { throw MikaError("输入后目标元素已失效，请重新开始或继续") }
+            var v = try await verifyType(action: action, tab: tab)
+            if !v.found {
+                // 框架编辑器在输入后重渲染、把带 data-mika-idx 的旧节点换掉时，idx 回读会
+                // 报「找不到节点」——但文字可能已经真正落在新节点里。先按内容兜底核对：
+                // 全页找正文含目标文本的编辑器，找得到即视为写入成功（AGENT-VIEWPORT-FIX）。
+                if let byContent = try await verifyTypeByContent(action: action, tab: tab), byContent.textOK {
+                    v = byContent
+                } else {
+                    throw MikaError("输入后目标元素已失效，请重新开始或继续")
+                }
+            }
             if v.textOK {
                 if v.editorLike, !v.submits.isEmpty, v.submits.allSatisfy({ $0.disabled }) {
                     await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
