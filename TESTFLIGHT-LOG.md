@@ -92,3 +92,10 @@
 - 修复：分支 `fix/app-holding-form`（自 main 新开，未合 main），提交 `4419fbd`，全仓仅 `MikaWeb/MikaWebApp.swift` 一文件（+33/−15）：生产 App 原 5 个 @StateObject（web/settings/engine/conversation/diagnostics）全部移入新增持有者 `AppObjectGraph`（@MainActor ObservableObject，App init 内同步构造、构造顺序与 bind/start 副作用与原 init 逐字等价），App 只以一个 @StateObject 持有该持有者，五件经原参数通道下传 ContentView。WebSurface/WebController/AgentEngine/UI/模型/Keychain/网络全部零改动；validate_project.py 全 PASS。修复记录 FIX-PROD-HOLDING-FORM-2026-11-02.md（含 @StateObject 枚举附注与 X-1 对应关系表）。
 - **生产修复构建＝202611020450**（build id `791d0160-70cd-4b90-a77e-e902ba27ce9b`）：CI Run 41390473187 success → Release Run 41390586904 success（日志实查真上传）；ASC 回读 processingState=VALID、expired=false、usesNonExemptEncryption 已 PATCH=false、Internal 组挂载 POST 204 且组内回读居首。
 - 待 Joey 真机验收：TestFlight 更新到 202611020450 后产品级复测（点网页多次＋滚动、跑低风险任务、作答续跑、确认卡片、模型名防呆）；验收通过前不合 main。
+
+## 增补（2026-11-02）：悬浮窗改造构建（对话全屏＋浏览器悬浮小窗），新构建已上
+
+- 构建 **202611020540**（0.1.0），build id `3175f80c-b228-4384-b8ea-67d059a64382`：分支 `feat/floating-browser-dock`（自 fix/app-holding-form 新开，未合 main、未合 fix 分支），代码提交 `619feaa`；CI Run 41395277316 success、Release Run 41395382176 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false、Internal 组挂载 POST 204 且组内回读居首；validate_project.py 全 PASS。
+- 内容（Joey 13:27 亲令、13:33 批准；选型＝自研不引库，案卷 FLOATING-UI-IMPL-2026-11-02.md）：ContentView 改 ZStack——对话全屏常驻根层，浏览器坞盖其上双态（expanded 全屏／mini 约 0.44 等比缩放悬浮小窗，可拖动、松手按预测落点吸附左右边缘、停靠位跨启动记忆并钳制在输入栏之上）；保活靠「BrowserView 恒以展开尺寸布局＋scaleEffect 渲染缩放」，WKWebView frame 永不变化、不重排不重载；mini 态手势护盾拦截全部页面触摸（点按展开／拖动移动）；接 engine 既有信号自动展开（waitingConfirm＋确认卡片随坞底呈现、waitingManual 的 .manual 密码手输＋同口径「已处理，继续」）。
+- 红线复核：MikaWebApp.swift 持有形态、WebController/WebSurface/AgentEngine 全部零改动（git diff 实查）；安全边界与确认／手输语义不变。
+- 待 Joey 按案卷真机清单验收（重点：展开态点网页不崩回归、连续收放 30 次不重载、mini 态长任务持续运行、两类自动展开、键盘与位置记忆）；验收通过前不合 main。
