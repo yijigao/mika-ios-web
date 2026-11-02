@@ -224,6 +224,22 @@ extension Notification.Name {
         guard let url = Bundle.main.url(forResource: name, withExtension: "html") else { throw MikaError("缺少测试页 \(name)") }
         pageError = nil; webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
     }
+    /// 会话恢复待载入地址（RESUME-CONTEXT-FIX）：重建非当前标签时先只记下地址，
+    /// 用户切到该标签时才真正载入（由 WebController.activateTab 消费），避免恢复
+    /// 一次把所有标签页全量加载一遍。
+    var pendingRestoreURL: URL?
+    /// 按快照里存下的地址重新载入本页（中断恢复专用，地址来自 App 自己写下的
+    /// 会话快照、不是用户输入，不走 validatedURL 的 http/https 输入校验）：
+    /// file URL 须走 loadFileURL 并给同目录读权限（本地自检页同此路径），
+    /// http/https 走普通请求。页面自身的 JS／表单状态不跨进程保留，只有地址。
+    func restoreLoad(_ url: URL) {
+        pageError = nil
+        if url.isFileURL {
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else {
+            webView.load(URLRequest(url: url))
+        }
+    }
     func reload() { webView.reload() }
     func goBack() { webView.goBack() }
     func goForward() { webView.goForward() }
@@ -332,8 +348,77 @@ extension Notification.Name {
     }
 
     func activateTab(_ id: UUID) {
-        guard tabs.contains(where: { $0.id == id }) else { return }
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
         activeTabID = id
+        // 会话恢复时延迟载入的标签：用户第一次切到它时才真正打开原地址
+        if let pending = tab.pendingRestoreURL {
+            tab.pendingRestoreURL = nil
+            tab.restoreLoad(pending)
+        }
+    }
+
+    // MARK: - 会话现场快照与恢复（RESUME-CONTEXT-FIX）
+
+    /// 当前全部标签页的地址现场（供 AgentEngine 的会话快照落盘）：每页的当前
+    /// 地址（起始页为空串）、当前页下标、执行页下标（无绑定为 nil）。
+    func tabScene() -> (urls: [String], activeIndex: Int, executionIndex: Int?) {
+        (tabs.map { $0.urlString },
+         tabs.firstIndex(where: { $0.id == activeTabID }) ?? 0,
+         executionTabID.flatMap { id in tabs.firstIndex(where: { $0.id == id }) })
+    }
+
+    /// 标签现场是否「全新未动过」：冷启动后用户还没打开过任何网页（只有起始
+    /// 页）。恢复会话时只有现场全新才整组重建——用户重启后已手动浏览过的话，
+    /// 不拿快照覆盖他的手动现场（引擎改走「提示模型原地址、自行导航」口径）。
+    var tabsArePristine: Bool { tabs.allSatisfy { $0.urlString.isEmpty && $0.pendingRestoreURL == nil } }
+
+    private func teardown(_ tab: BrowserTab) {
+        tabCancellables[tab.id]?.cancel()
+        tabCancellables[tab.id] = nil
+        tab.webView.stopLoading()
+        tab.webView.navigationDelegate = nil
+        tab.webView.uiDelegate = nil
+    }
+
+    /// 按快照重建标签现场：拆掉现有标签（调用方须先以 tabsArePristine 把关），
+    /// 逐页按原地址建回——当前页与执行页立即载入，其余页只记地址、切到时再
+    /// 载入；空地址页就是起始页。执行绑定按 executionIndex 恢复。
+    func rebuildTabs(urls: [String], activeIndex: Int, executionIndex: Int?) {
+        for tab in tabs { teardown(tab) }
+        let source = urls.isEmpty ? [""] : urls
+        var created: [BrowserTab] = []
+        for raw in source {
+            let url = raw.isEmpty ? nil : URL(string: raw)
+            let tab = BrowserTab(loadStartPage: url == nil)
+            created.append(tab)
+            adopt(tab)
+            if let url {
+                if created.count - 1 == activeIndex || created.count - 1 == executionIndex {
+                    tab.restoreLoad(url)
+                } else {
+                    tab.pendingRestoreURL = url
+                }
+            }
+        }
+        tabs = created
+        let clampedActive = min(max(activeIndex, 0), created.count - 1)
+        activeTabID = created[clampedActive].id
+        if let executionIndex, created.indices.contains(executionIndex) {
+            executionTabID = created[executionIndex].id
+        } else {
+            executionTabID = nil
+        }
+    }
+
+    /// 回到单页起始页（仅自检四模拟进程中断时用：把标签现场打回冷启动原样，
+    /// 证明恢复只靠落盘快照、不靠内存里残留的标签对象）。
+    func resetTabsToStartPage() {
+        for tab in tabs { teardown(tab) }
+        let fresh = BrowserTab()
+        tabs = [fresh]
+        adopt(fresh)
+        activeTabID = fresh.id
+        executionTabID = nil
     }
 
     /// 关闭标签：关当前页切到相邻页（优先右侧、其次左侧）；关掉最后一个标签时自动补一个

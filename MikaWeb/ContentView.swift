@@ -56,7 +56,7 @@ struct ContentView: View {
             }
             .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                NavigationLink { SelfTestView(engine: engine, settings: settings) } label: { Text("自检") }
+                NavigationLink { SelfTestView(engine: engine, settings: settings, conversation: conversation) } label: { Text("自检") }
                 NavigationLink { SettingsView(settings: settings, diagnostics: diagnostics) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
             }
         }

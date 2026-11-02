@@ -126,9 +126,34 @@ struct ChatInputBar: View {
             .ignoresSafeArea(edges: .bottom)
         }
     }
+    /// 有可续跑的会话上下文（暂停／失败且目标还在、当前不在等回答）：此时
+    /// 输入框的语义对用户是「跟这个任务对话」，一句「继续」若按新任务处理，
+    /// start() 会把已恢复的目标、步骤、问答整体冲掉——真机实证（2026-11-02
+    /// 19:36）：中断恢复后用户打「现在继续」，agent 随即反问任务内容与网址，
+    /// 如同失忆。故续跑类短语在此拦截、改走 resume()（RESUME-CONTEXT-FIX）。
+    private var hasLiveSession: Bool {
+        guard questionID == nil, !engine.activeGoal.isEmpty else { return false }
+        switch engine.status { case .paused, .failed: return true; default: return false }
+    }
+    private func isContinuation(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ["继续", "现在继续", "继续吧", "继续跑", "接着", "接着跑", "接着来", "继续任务", "continue", "resume", "go on"].contains(t) { return true }
+        return t.count <= 6 && t.contains("继续")
+    }
     private func send() {
         guard canSend else { return }
         let text = conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if questionID == nil, hasLiveSession, isContinuation(text) {
+            engine.resume()
+            switch engine.status {
+            case .running, .waitingConfirm, .waitingManual:
+                conversation.acceptedAnswer(text); conversation.draft = ""; followLatest.wrappedValue = true
+                dismissKeyboard()
+            default:
+                conversation.localFeedback("没能接着跑（当前状态：\(engine.status.label)），请点上方「继续」按钮再试，或先检查模型设置")
+            }
+            return
+        }
         if let questionID {
             switch engine.submitAnswer(text, requestID: questionID) {
             case .accepted:

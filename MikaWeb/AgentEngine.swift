@@ -70,6 +70,19 @@ struct AgentStep: Identifiable {
     /// 随每次模型调用注入任务上下文；playbook 只是提示层，安全判定不读它。
     private var loadedSkillNames: [String] = []
     private var loadedSkillBodies = ""
+    /// 中断恢复现场（RESUME-CONTEXT-FIX）：冷启动按快照恢复出的会话，浏览器
+    /// 标签现场还没重建——快照里的标签地址先存放在这里，第一次 resume 时才
+    /// 由 applyPendingTabRestore 消费（重建标签＋生成 resumeNote）。restoredSession
+    /// 标记「本会话来自快照恢复」，didApplyTabRestore 保证现场只处理一次。
+    private var pendingTabScene: (urls: [String], activeIndex: Int, executionIndex: Int?)?
+    private var restoredSession = false
+    private var didApplyTabRestore = false
+    /// 续跑提示：恢复会话续跑期间随每次模型调用注入 prompt 的说明段（原页面
+    /// 恢复结果＋「不得向用户索要目标／网址／进度」的硬性口径），会话终结
+    /// （done／failed）或新任务开始时清除。
+    private var resumeNote: String?
+    /// 当前会话目标（对话层判定「有可续跑上下文」用，只读）。
+    var activeGoal: String { goal }
     /// 后台宽限断言（层 2）：进后台时申请、回前台／会话终结／到期时释放。
     private var backgroundGraceID: UIBackgroundTaskIdentifier = .invalid
     /// iOS 26 持续处理（层 3）的类型擦除盒：BGContinuedProcessingTask 只在 #available
@@ -94,20 +107,30 @@ struct AgentStep: Identifiable {
     var busy: Bool {
         switch status { case .running, .waitingConfirm, .waitingManual, .paused: return true; default: return false }
     }
+    /// 模型就绪检查（start／resume／submitAnswer 共用同一口径）：按当前模型
+    /// 来源分支——ChatGPT 订阅查登录态与模型名，API Key 查 Key 与模型名合法性。
+    /// 旧 resume／submitAnswer 只查 hasKey：订阅来源的会话（无 API Key 时）
+    /// 中断恢复后点继续会被误拦为「未配置 API Key」（RESUME-CONTEXT-FIX）。
+    private func modelReadinessIssue() -> String? {
+        if settings.modelSource == .chatGPT {
+            if !settings.chatGPTAuth.isLoggedIn { return "尚未登录 ChatGPT 订阅：进入设置页，在「模型来源」选「ChatGPT 订阅」，点「用 ChatGPT 登录」后再开始" }
+            if settings.chatGPTModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "订阅模型名不能为空：请在设置页填写模型名" }
+            return nil
+        }
+        if !settings.hasKey { return "未配置 API Key：点控制台下方的橙色提示进入设置页，选服务商、粘贴 Key、测试连接后再开始" }
+        if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { return issue.message }
+        return nil
+    }
     func start(local: String? = nil, task: String? = nil) {
         stop()
         guard active else { status = .paused("任务只能在前台执行"); return }
-        if settings.modelSource == .chatGPT {
-            guard settings.chatGPTAuth.isLoggedIn else { status = .failed("尚未登录 ChatGPT 订阅：进入设置页，在「模型来源」选「ChatGPT 订阅」，点「用 ChatGPT 登录」后再开始"); return }
-            guard !settings.chatGPTModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("订阅模型名不能为空：请在设置页填写模型名"); return }
-        } else {
-            guard settings.hasKey else { status = .failed("未配置 API Key：点控制台下方的橙色提示进入设置页，选服务商、粘贴 Key、测试连接后再开始"); return }
-            if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { status = .failed(issue.message); return }
-        }
+        if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
+        pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = UUID()
         do { if let local { try web.loadLocal(local) } } catch { status = .failed(error.localizedDescription); return }
         // 任务绑定到开始时的当前标签页：全程作用于它，用户中途手动切页不影响任务（TABS-IMPL）
@@ -152,16 +175,53 @@ struct AgentStep: Identifiable {
     }
     func resume() {
         guard active, !goal.isEmpty else { return }
-        guard settings.hasKey else { status = .failed("未配置 API Key：请先在设置页配置并测试连接"); return }
+        if let issue = modelReadinessIssue() { status = .failed(issue); return }
+        // 中断恢复的会话：先把浏览器现场带回中断时（重建标签＋导航回原页面），
+        // 再启动主循环——循环第一轮的 state() 会等页面加载稳定后才抽状态，
+        // 模型拿到的就是原页面＋原目标＋完整历史，而不是起始页＋一句「继续」。
+        applyPendingTabRestore()
         // 绑定还在（确认／手输等待后继续）则沿用原执行页；已解除（如切后台被 stop）则绑定到当前页
         if web.executionTabID == nil { web.beginExecution() }
         pending = nil; launch()
+    }
+
+    /// 消费冷启动恢复时暂存的标签现场（只处理一次）：现场全新（用户重启后
+    /// 没动过浏览器）才整组按快照重建；已被手动浏览过则不覆盖，只把中断
+    /// 时的执行页地址写进续跑提示、由模型自行导航回去。旧快照没有标签
+    /// 记录时同样只写提示。无论哪条分支，resumeNote 都带上「目标／网址／
+    /// 进度已在上下文里，不得反问用户」的硬性口径（RESUME-CONTEXT-FIX）。
+    private func applyPendingTabRestore() {
+        guard restoredSession, !didApplyTabRestore else { return }
+        didApplyTabRestore = true
+        let scene = pendingTabScene
+        pendingTabScene = nil
+        let executionURL: String = {
+            guard let scene else { return "" }
+            if let index = scene.executionIndex, scene.urls.indices.contains(index) { return scene.urls[index] }
+            return scene.urls.indices.contains(scene.activeIndex) ? scene.urls[scene.activeIndex] : ""
+        }()
+        let outcome: String
+        if let scene, scene.urls.contains(where: { !$0.isEmpty }) {
+            if web.tabsArePristine {
+                web.rebuildTabs(urls: scene.urls, activeIndex: scene.activeIndex, executionIndex: scene.executionIndex)
+                outcome = executionURL.isEmpty
+                    ? "浏览器已按中断时现场重建，中断时执行页是起始页。"
+                    : "浏览器已按中断时现场重建，并已开始载入中断时的页面：\(executionURL)（续跑第一步看到的就是它，加载未稳时先用 wait 等待，不要换页）。"
+            } else {
+                outcome = "App 重启后浏览器里已有手动打开的页面，未自动覆盖。中断时你正在页面：\(executionURL)。如现页面不是它，请直接 navigate 到这个网址或经站内入口回去，不要向用户询问网址。"
+            }
+        } else if scene != nil {
+            outcome = "中断时浏览器停在起始页，继续从起始页按目标行动即可。"
+        } else {
+            outcome = "这份恢复记录里没有浏览器页面信息（旧版快照），浏览器现在停在起始页。请根据任务目标与历史步骤自行判断要打开的站点并 navigate 过去，不要向用户询问网址。"
+        }
+        resumeNote = "【中断恢复说明】本会话曾因 App 退出而中断，现在续跑。任务目标见上文「任务」，已完成步骤见「历史」，用户此前的回答见「用户补充问答」。\(outcome)硬性规则：任务目标、网址、已完成进度都在上文里，不要用 ask_user 向用户索要任务内容、网址或进度——用户刚经历中断，正等你接着做；若当前页面与中断前不一致、或原页面已失效，先在你的说明里讲清你记得的目标和已做到哪一步，再自行通过站内导航、搜索或直接打开网址找回入口继续。只有当你需要用户做一个新的决策（而不是重复提供已知信息）时，才可以提问。"
     }
     func submitAnswer(_ text: String, requestID: UUID) -> AnswerSubmissionResult {
         let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !answer.isEmpty else { return .rejected("请输入回答") }
         guard active, !goal.isEmpty, conversationTaskID != nil else { return .rejected("当前任务已失效") }
-        guard settings.hasKey else { return .rejected("请先在设置页配置 API Key") }
+        if let issue = modelReadinessIssue() { return .rejected(issue) }
         guard case .some(.question(let id, let question)) = waitingInput, id == requestID else { return .rejected("这条问题已失效") }
         switch status { case .waitingManual, .paused: break; default: return .rejected("当前不能提交回答") }
         answerContext.append(QuestionAnswer(questionID: id, question: question, answer: answer))
@@ -200,7 +260,12 @@ struct AgentStep: Identifiable {
                         let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                         let history = steps.map { "\($0.id). \($0.action): \($0.reason)" }.joined(separator: "\n")
                         let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
-                        var prompt = "任务：\(goal)\n历史：\(history)\n用户补充问答：\(answers)"
+                        var prompt = "任务：\(goal)\n"
+                        // 中断恢复的续跑提示（RESUME-CONTEXT-FIX）：恢复会话的
+                        // 每一轮都带上——原页面恢复结果＋不得反问目标／网址／
+                        // 进度的硬性口径，直到会话终结或新任务开始才清除。
+                        if let resumeNote { prompt += resumeNote + "\n" }
+                        prompt += "历史：\(history)\n用户补充问答：\(answers)"
                         if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
                         if let hint = pendingLoopHint { prompt += "\n\(hint)"; pendingLoopHint = nil }
                         prompt += "\n当前页面 JSON：\(json)"
@@ -215,7 +280,7 @@ struct AgentStep: Identifiable {
                             record(action); status = .done(action.summary)
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
-                            web.endExecution(); clearSnapshot()
+                            web.endExecution(); clearSnapshot(); resumeNote = nil
                             return
                         }
                         if action.action == "ask_user" {
@@ -332,7 +397,7 @@ struct AgentStep: Identifiable {
                 guard token == generation else { return }
                 sessionActive = false; applyIdleTimerPolicy()
                 endBackgroundGrace(); completeContinuedProcessing(success: false)
-                web.endExecution(); clearSnapshot()
+                web.endExecution(); clearSnapshot(); resumeNote = nil
                 if error is CancellationError { status = .paused("已取消") }
                 else { status = .failed(error.localizedDescription) }
             }
@@ -674,7 +739,7 @@ struct AgentStep: Identifiable {
     private struct SessionSnapshot: Codable {
         struct StepDTO: Codable { let id: Int; let action: String; let reason: String }
         struct WaitingDTO: Codable { let kind: String; let id: UUID; let text: String }
-        var version = 1
+        var version = 2
         var savedAt: Date
         var goal: String
         var limit: Int
@@ -688,6 +753,14 @@ struct AgentStep: Identifiable {
         var waiting: WaitingDTO?
         var answersJSON: String // [QuestionAnswer] 的 JSON
         var skillNames: [String]? // 已加载 playbook 名（正文恢复时按名从 SkillStore 重读；可选字段，旧快照无此键照常解码）
+        // v2 起（RESUME-CONTEXT-FIX）：工作现场——对话任务标识（恢复后沿用原
+        // taskID，对话层的持久化去重才跨进程成立）与全部标签页地址＋当前页／
+        // 执行页下标（页面本身不可序列化，只存地址，恢复时重新导航）。全部
+        // 可选：v1 旧快照无此三键照常解码、恢复时降级为「无页面记录」口径。
+        var taskID: UUID?
+        var tabURLs: [String]?
+        var activeTabIndex: Int?
+        var executionTabIndex: Int?
     }
     private static let snapshotKey = "agentSessionSnapshot.v1"
 
@@ -726,12 +799,20 @@ struct AgentStep: Identifiable {
             }
         }
         let answersData = (try? JSONEncoder().encode(answerContext)) ?? Data("[]".utf8)
+        // 工作现场（RESUME-CONTEXT-FIX）：标签地址跟会话一起落盘。若本会话是
+        // 恢复来的、现场还没被续跑消费（标签仍是冷启动起始页），写下的应是
+        // 暂存的中断现场而不是起始页——否则一次后台落盘（setForeground 的
+        // persistSnapshot）就会把原地址冲掉，恢复便无从谈起。
+        let scene: (urls: [String], activeIndex: Int, executionIndex: Int?)
+        if let pending = pendingTabScene { scene = pending } else { scene = web.tabScene() }
         let snapshot = SessionSnapshot(savedAt: Date(), goal: goal, limit: limit, stepSeq: stepSeq,
                                        steps: steps.map { SessionSnapshot.StepDTO(id: $0.id, action: $0.action, reason: $0.reason) },
                                        statusKind: kind, statusText: text,
                                        pendingActionJSON: pendingJSON, pendingElement: pendingElement, pendingURL: pendingURL,
                                        waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
-                                       skillNames: loadedSkillNames)
+                                       skillNames: loadedSkillNames,
+                                       taskID: conversationTaskID,
+                                       tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex)
         if let data = try? JSONEncoder().encode(snapshot) {
             UserDefaults.standard.set(data, forKey: Self.snapshotKey)
         }
@@ -741,8 +822,13 @@ struct AgentStep: Identifiable {
 
     /// 冷启动恢复：只认 24 小时内的非终结快照。恢复后停在「可继续」一侧——运行中
     /// 变已暂停待继续；等待确认／手输原样恢复等待（确认时会重新复核目标，页面已
-    /// 变则安全失败，不误执行）。执行页绑定与页面状态不跨进程恢复：继续时重新
-    /// 绑定当前页、重新取快照，目标与历史不丢。
+    /// 变则安全失败，不误执行）。目标、步骤、问答、playbook 在此全量恢复；
+    /// 浏览器标签现场（v2 起有地址记录）先暂存，第一次续跑时由
+    /// applyPendingTabRestore 重建标签并导航回中断页面（RESUME-CONTEXT-FIX；
+    /// 此前不存地址，续跑只能落在起始页、模型无从知道原网址，是「上下文
+    /// 记忆丢失」的断点之一）。对话任务标识沿用快照里的原 taskID（v2 起），
+    /// 对话层据此识别「同一任务的恢复」，不重复回放任务与步流（CRASH-1031
+    /// 的持久化去重跨进程成立的前提）。
     private func restoreSnapshotIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.snapshotKey),
               let snapshot = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
@@ -764,7 +850,12 @@ struct AgentStep: Identifiable {
         if let waiting = snapshot.waiting {
             waitingInput = waiting.kind == "question" ? .question(id: waiting.id, text: waiting.text) : .manual(id: waiting.id, text: waiting.text)
         }
-        conversationTaskID = UUID()
+        conversationTaskID = snapshot.taskID ?? UUID()
+        restoredSession = true
+        didApplyTabRestore = false
+        if let urls = snapshot.tabURLs {
+            pendingTabScene = (urls: urls, activeIndex: snapshot.activeTabIndex ?? 0, executionIndex: snapshot.executionTabIndex)
+        }
         switch snapshot.statusKind {
         case "waitingConfirm":
             if let json = snapshot.pendingActionJSON,
@@ -780,5 +871,41 @@ struct AgentStep: Identifiable {
         default:
             status = .paused("上次任务在 App 退出时中断，点继续可接着跑")
         }
+    }
+
+    // MARK: - 自检四：进程级中断模拟（RESUME-CONTEXT-FIX）
+
+    /// 模拟「任务执行中进程被杀」：先按现状落盘快照，然后把引擎的全部内存
+    /// 态与浏览器标签现场打回冷启动原样（工作任务代次作废、标签只剩起始页），
+    /// 再只调用冷启动恢复路径——恢复出来的目标／步数／待重建现场全部来自
+    /// 落盘数据，与真机强退重开走同一条路。整段同步执行：工作任务被代次
+    /// 作废后只会在后续回合按代次守卫自行退出，不会与恢复交错写状态。
+    /// 返回人类可读的模拟与恢复报告（自检页写进对话作自检记录）。
+    func simulateInterruptionForResumeTest() -> String {
+        let beforeGoal = goal
+        let beforeSteps = steps.count
+        let beforeScene = web.tabScene()
+        let beforeExecutionURL: String = {
+            if let index = beforeScene.executionIndex, beforeScene.urls.indices.contains(index) { return beforeScene.urls[index] }
+            return beforeScene.urls.indices.contains(beforeScene.activeIndex) ? beforeScene.urls[beforeScene.activeIndex] : ""
+        }()
+        persistSnapshot()
+        // —— 内存态清零（等同进程死亡后冷启动前的状态） ——
+        generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
+        lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        conversationTaskID = nil; sessionActive = false; status = .idle
+        pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        web.resetTabsToStartPage()
+        // —— 仅凭落盘恢复 ——
+        restoreSnapshotIfNeeded()
+        let restored = !goal.isEmpty
+        let pendingTabs = pendingTabScene?.urls.filter { !$0.isEmpty }.count ?? 0
+        return """
+        中断模拟完成：中断前目标「\(beforeGoal)」，已记录 \(beforeSteps) 步，执行页 \(beforeExecutionURL.isEmpty ? "（起始页）" : beforeExecutionURL)。\
+        内存态与标签现场已清零并仅凭落盘快照恢复：\(restored ? "目标已恢复为「\(goal)」，步数 \(steps.count) 步在位，待重建标签 \(pendingTabScene?.urls.count ?? 0) 个（其中带地址 \(pendingTabs) 个）" : "未恢复出会话（快照缺失或已过期）")。\
+        现在点「继续」：应先回到中断前页面、带着原目标接着完成剩余步骤，不得向你索要网址或进度。
+        """
     }
 }
