@@ -1,28 +1,69 @@
 import SwiftUI
 import WebKit
-@MainActor final class WebController: NSObject, ObservableObject, WKNavigationDelegate {
+import Combine
+
+// 标签页会话（2026-11-02，案卷 TABS-IMPL-2026-11-02.md）：一个标签页＝一个独立 WKWebView
+// ＋独立历史／标题／加载状态。切换标签只是把当前页的 WKWebView 换入视图层级，离屏标签的
+// 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，按最后已知
+// 地址重载恢复该页（系统行为，见 webViewWebContentProcessDidTerminate）。
+@MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, Identifiable {
+    let id = UUID()
     let webView: WKWebView
-    @Published var address = ""
-    @Published var progress = 0.0
-    @Published var canGoBack = false
-    @Published var canGoForward = false
+    @Published private(set) var urlString = ""
+    @Published private(set) var title = ""
+    @Published private(set) var estimatedProgress = 0.0
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
     @Published var pageError: String?
-    private var observations: [NSKeyValueObservation] = []
     private(set) var revision = 0
-    override init() {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
+    private var observations: [NSKeyValueObservation] = []
+    /// 网页进程终止时 webView.url 可能已被清空，重载恢复以此为准
+    private var lastKnownURL: URL?
+
+    /// configuration 非空时用于承接 window.open／target=_blank 的新窗口（须用 WebKit 给的
+    /// 配置原样建 WKWebView，opener 关系由 WebKit 经该配置维系）；此时不加载起始页，
+    /// 弹窗请求由 WebKit 自行载入。
+    init(configuration: WKWebViewConfiguration? = nil, loadStartPage: Bool = true) {
+        let config = configuration ?? Self.makeConfiguration()
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         webView.navigationDelegate = self
-        webView.loadHTMLString("<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>", baseURL: nil)
-        observations = [webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } }, webView.observe(\.url, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } }]
+        observations = [
+            webView.observe(\.url, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
+            webView.observe(\.title, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
+            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
+            webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
+            webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in Task { @MainActor in self?.update() } },
+        ]
+        if loadStartPage {
+            webView.loadHTMLString("<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>", baseURL: nil)
+        }
     }
-    private func update() { address = webView.url?.absoluteString ?? ""; progress = webView.estimatedProgress; canGoBack = webView.canGoBack; canGoForward = webView.canGoForward }
-    func load(_ value: String) throws {
+
+    private static func makeConfiguration() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        return config
+    }
+
+    private func update() {
+        urlString = webView.url?.absoluteString ?? ""
+        title = webView.title ?? ""
+        estimatedProgress = webView.estimatedProgress
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
+        if let url = webView.url { lastKnownURL = url }
+    }
+
+    static func validatedURL(_ value: String) throws -> URL {
         let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: value.contains("://") ? value : "https://" + value), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { throw MikaError("请输入有效 http/https 地址") }
+        return url
+    }
+
+    func load(_ value: String) throws {
+        let url = try Self.validatedURL(value)
         pageError = nil; webView.load(URLRequest(url: url))
     }
     func loadLocal(_ name: String) throws {
@@ -32,40 +73,199 @@ import WebKit
     func reload() { webView.reload() }
     func goBack() { webView.goBack() }
     func goForward() { webView.goForward() }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { revision += 1; pageError = nil; update() }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { update() }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
-    func ready() async throws {
+    /// 系统在内存压力下杀掉网页进程时，该标签页内容已丢失——按最后已知地址重载恢复
+    ///（该页的 JS／表单状态无法保留，属系统行为；其余标签不受影响）。
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        if let url = webView.url ?? lastKnownURL { webView.load(URLRequest(url: url)) }
+    }
+}
+
+// 浏览器标签管理器＋当前页门面（标签页改造前的 WebController API 逐个保留、语义改为
+// 「作用于当前标签页」，既有调用点 BrowserView／BrowserDockView／AgentEngine 不需改签名）：
+// address／progress／canGoBack／canGoForward／pageError／revision／webView／load／reload／
+// goBack／goForward／evaluate 均为当前页门面；state／execute 则路由到「执行页」——任务开始
+// 时由 AgentEngine 捕获的标签页（executionTabID），用户中途手动切页不影响正在跑的任务。
+@MainActor final class WebController: NSObject, ObservableObject, WKUIDelegate {
+    @Published private(set) var tabs: [BrowserTab]
+    @Published private(set) var activeTabID: UUID
+    /// 任务绑定的标签页；nil＝没有任务绑定（state／execute 回落到当前页）
+    @Published private(set) var executionTabID: UUID?
+    private var tabCancellables: [UUID: AnyCancellable] = [:]
+
+    override init() {
+        let first = BrowserTab()
+        tabs = [first]
+        activeTabID = first.id
+        executionTabID = nil
+        super.init()
+        adopt(first)
+    }
+
+    private func adopt(_ tab: BrowserTab) {
+        tab.webView.uiDelegate = self
+        tabCancellables[tab.id] = tab.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in self?.objectWillChange.send() }
+        }
+    }
+
+    var activeTab: BrowserTab { tabs.first(where: { $0.id == activeTabID }) ?? tabs[0] }
+    var executionTab: BrowserTab { executionTabID.flatMap { id in tabs.first(where: { $0.id == id }) } ?? activeTab }
+    func tabTitle(for id: UUID) -> String {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return "新标签页" }
+        if !tab.title.isEmpty { return tab.title }
+        return tab.urlString.isEmpty ? "新标签页" : tab.urlString
+    }
+
+    // MARK: - 当前页门面（语义与标签页改造前的单页 WebController 一致）
+
+    var webView: WKWebView { activeTab.webView }
+    var address: String { activeTab.urlString }
+    var progress: Double { activeTab.estimatedProgress }
+    var canGoBack: Bool { activeTab.canGoBack }
+    var canGoForward: Bool { activeTab.canGoForward }
+    var pageError: String? {
+        get { activeTab.pageError }
+        set { activeTab.pageError = newValue }
+    }
+    /// 当前页的导航修订号（BrowserDockView 的滚动恢复判定用）
+    var revision: Int { activeTab.revision }
+    /// 执行页的导航修订号（AgentEngine 的目标一致性判定用；用户切页不影响）
+    var executionRevision: Int { executionTab.revision }
+
+    func load(_ value: String) throws { try activeTab.load(value) }
+    func loadLocal(_ name: String) throws { try activeTab.loadLocal(name) }
+    func reload() { activeTab.reload() }
+    func goBack() { activeTab.goBack() }
+    func goForward() { activeTab.goForward() }
+
+    // MARK: - 标签管理
+
+    /// 新建标签并切换过去；urlString 非空时在新页打开该地址。
+    @discardableResult
+    func newTab(urlString: String? = nil) -> BrowserTab {
+        let tab = BrowserTab()
+        tabs.append(tab)
+        adopt(tab)
+        activeTabID = tab.id
+        if let urlString, !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? tab.load(urlString)
+        }
+        return tab
+    }
+
+    func activateTab(_ id: UUID) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        activeTabID = id
+    }
+
+    /// 关闭标签：关当前页切到相邻页（优先右侧、其次左侧）；关掉最后一个标签时自动补一个
+    /// 新的空白标签（永不归零）。关掉的若是任务执行页，执行绑定随之解除，任务的后续
+    /// state／execute 回落到新的当前页（其目标校验会拦下不一致的已确认动作，见案卷）。
+    func closeTab(_ id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let closing = tabs[index]
+        let wasActive = id == activeTabID
+        tabs.remove(at: index)
+        tabCancellables[id]?.cancel()
+        tabCancellables[id] = nil
+        closing.webView.stopLoading()
+        closing.webView.navigationDelegate = nil
+        closing.webView.uiDelegate = nil
+        if executionTabID == id { executionTabID = nil }
+        if tabs.isEmpty {
+            let fresh = BrowserTab()
+            tabs = [fresh]
+            adopt(fresh)
+            activeTabID = fresh.id
+        } else if wasActive {
+            activeTabID = tabs[min(index, tabs.count - 1)].id
+        }
+    }
+
+    // MARK: - 任务执行绑定（AgentEngine 调用）
+
+    /// 任务开始：把执行页绑定到当时的当前页，任务全程作用于它，与用户切页解耦。
+    func beginExecution() { executionTabID = activeTabID }
+    /// 任务终结／停止：解除绑定（state／execute 回落当前页）。
+    func endExecution() { executionTabID = nil }
+
+    /// agent 的 open_new_tab 动作：新开标签、切换过去并把执行绑定一并移过去，
+    /// 后续动作作用于新页。地址先校验后建页，非法地址不留空标签。
+    @discardableResult
+    func openTabForExecution(urlString: String) throws -> BrowserTab {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = trimmed.isEmpty ? nil : try BrowserTab.validatedURL(trimmed)
+        let tab = BrowserTab()
+        tabs.append(tab)
+        adopt(tab)
+        activeTabID = tab.id
+        executionTabID = tab.id
+        if let url {
+            tab.pageError = nil
+            tab.webView.load(URLRequest(url: url))
+        }
+        return tab
+    }
+
+    // MARK: - WKUIDelegate：新窗口链接承接
+
+    /// target=_blank／window.open：新开标签承接并切换过去，返回用 WebKit 所给配置建的
+    /// WKWebView（opener 关系由该配置维系），不顶掉当前页、也不静默失效。
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        let tab = BrowserTab(configuration: configuration, loadStartPage: false)
+        tabs.append(tab)
+        adopt(tab)
+        activeTabID = tab.id
+        return tab.webView
+    }
+
+    /// 网页脚本 window.close()：按同一套关闭规则关掉对应标签。
+    func webViewDidClose(_ webView: WKWebView) {
+        if let tab = tabs.first(where: { $0.webView === webView }) { closeTab(tab.id) }
+    }
+
+    // MARK: - agent 执行通道（路由到执行页）
+
+    private func ready(in tab: BrowserTab) async throws {
         for _ in 0..<300 {
             try Task.checkCancellation()
-            if let pageError { throw MikaError("网页加载失败：\(pageError)") }
-            if !webView.isLoading { return }
+            if let pageError = tab.pageError { throw MikaError("网页加载失败：\(pageError)") }
+            if !tab.webView.isLoading { return }
             try await Task.sleep(for: .milliseconds(100))
         }
         throw MikaError("网页加载超时")
     }
-    func evaluate(_ script: String) async throws -> Any? { try await webView.evaluateJavaScript(script) }
+    /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
+    func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
+    private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
     func state() async throws -> PageState {
-        try await ready()
-        guard let json = try await evaluate(PageScript.extract) as? String else { throw MikaError("无法抽取页面状态") }
+        let tab = executionTab
+        try await ready(in: tab)
+        guard let json = try await evaluate(PageScript.extract, on: tab) as? String else { throw MikaError("无法抽取页面状态") }
         do { return try JSONDecoder().decode(PageState.self, from: Data(json.utf8)) }
         catch { throw MikaError("页面状态解析失败，请刷新页面后重试") }
     }
     func execute(_ action: AgentAction, expected: PageElement? = nil, approved: Bool = false) async throws {
+        let tab = executionTab
         switch action.action {
-        case "navigate": try load(action.url)
+        case "navigate": try tab.load(action.url)
         case "scroll":
             guard ["up", "down"].contains(action.direction) else { throw MikaError("未知滚动方向") }
-            _ = try await evaluate("window.scrollBy(0, \(action.direction == "up" ? "-" : "")window.innerHeight*0.85)")
+            _ = try await evaluate("window.scrollBy(0, \(action.direction == "up" ? "-" : "")window.innerHeight*0.85)", on: tab)
         case "wait": try await Task.sleep(for: .seconds(min(15, max(0.1, action.seconds))))
-        case "click": try await performClick(action, expected: expected, approved: approved)
-        case "type": try await performType(action, expected: expected, approved: approved)
+        case "click": try await performClick(action, expected: expected, approved: approved, tab: tab)
+        case "type": try await performType(action, expected: expected, approved: approved, tab: tab)
         default: throw MikaError("不可执行动作")
         }
     }
 
     // MARK: - FIX2 硬化：输入注入（缺陷 2 主攻）与点击等待重扫
+    // 以下脚本与流程与单页时代逐字一致，仅执行目标由唯一 webView 改为传入的执行页 tab。
 
     /// 校验前导（与旧版单脚本同口径）：抽取快照比对 expected、安全词与敏感字段检查、取回 DOM 节点。
     /// 返回 JS 片段，执行后上下文里有 a／target／e 三个变量；校验不过直接 throw（与旧行为一致）。
@@ -90,7 +290,7 @@ import WebKit
     /// 框架编辑器 Draft/Slate/ProseMirror 都认这条）；path=range：Selection/Range 直接写 DOM
     /// 再补带 inputType/data 的 InputEvent（备用路径）。表单字段两条路径同法：原生 value setter
     /// ＋InputEvent（React 受控组件认 setter＋input 事件）。返回 'ok' 或 'exec-failed'。
-    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String) async throws -> String {
+    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, tab: BrowserTab) async throws -> String {
         let prefix = try guardScript(action: action, expected: expected, approved: approved)
         let result = try await evaluate("""
         (()=>{\(prefix)
@@ -128,7 +328,7 @@ import WebKit
           return 'ok';
         }
         throw new Error('目标不是可填写元素');})()
-        """)
+        """, on: tab)
         return (result as? String) ?? ""
     }
 
@@ -142,7 +342,7 @@ import WebKit
 
     /// 写后回读校验：编辑器当前文本（归一化后须包含目标文本）、编辑器邻域内提交类按钮的存在/禁用状态。
     /// 按钮候选优先取与编辑器共享近层祖先的（回复编辑器自带的那颗），没有才退到全文档可见候选。
-    private func verifyType(action: AgentAction) async throws -> TypeVerification {
+    private func verifyType(action: AgentAction, tab: BrowserTab) async throws -> TypeVerification {
         let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": action.text])
         let json = String(decoding: data, as: UTF8.self)
         guard let raw = try await evaluate("""
@@ -163,7 +363,7 @@ import WebKit
         const near=cands.filter(x=>{let n=e;for(let i=0;i<8&&n;i++){if(n.contains(x))return true;n=n.parentElement;}return false;});
         if(near.length)cands=near;
         return JSON.stringify({found:true,textOK,editorLike,submits:cands.slice(0,8).map(x=>({text:lab(x).slice(0,40),disabled:dis(x)}))});})()
-        """) as? String, let decoded = try? JSONDecoder().decode(TypeVerification.self, from: Data(raw.utf8)) else {
+        """, on: tab) as? String, let decoded = try? JSONDecoder().decode(TypeVerification.self, from: Data(raw.utf8)) else {
             throw MikaError("输入后回读校验失败（页面无响应）")
         }
         return decoded
@@ -171,30 +371,30 @@ import WebKit
 
     /// type 总流程：写入→回读；不过关换备用路径重试一次；仍不过关如实报「没输入进去」，
     /// 不再误报成「找不到发表按钮」。文字已进但提交按钮全员禁用时单独报「按钮是灰的」。
-    private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool) async throws {
+    private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
         for path in ["exec", "range"] {
-            let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path)
+            let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, tab: tab)
             if status == "exec-failed" { continue }
             try await Task.sleep(for: .milliseconds(400))
-            let v = try await verifyType(action: action)
+            let v = try await verifyType(action: action, tab: tab)
             guard v.found else { throw MikaError("输入后目标元素已失效，请重新开始或继续") }
             if v.textOK {
                 if v.editorLike, !v.submits.isEmpty, v.submits.allSatisfy({ $0.disabled }) {
-                    await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)")
+                    await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
                     throw MikaError("文字已输入，但「\(v.submits[0].text)」按钮仍是灰的（禁用状态），没能发布")
                 }
                 return
             }
         }
-        await captureFailureSnapshot(context: "type 回读校验失败：\(action.reason)")
+        await captureFailureSnapshot(context: "type 回读校验失败：\(action.reason)", tab: tab)
         throw MikaError("文字没能输入到编辑器：两种写入方式都已尝试、回读仍为空或对不上，请在网页手动输入后点继续")
     }
 
     /// click 单次尝试脚本，返回 'clicked'／'disabled'／'missing'（校验不过仍走 JS throw，与旧口径一致）。
     /// rescan=true 时不做快照一致性校验（页面可能已重渲染），按原 data-mika-idx 节点或同文案候选重新定位，
     /// 并对命中节点复用同一套安全词检查。
-    private func runClickScript(action: AgentAction, expected: PageElement, approved: Bool, rescan: Bool) async throws -> String {
+    private func runClickScript(action: AgentAction, expected: PageElement, approved: Bool, rescan: Bool, tab: BrowserTab) async throws -> String {
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
         let script: String
         if rescan {
@@ -228,27 +428,27 @@ import WebKit
             e.scrollIntoView({block:'center'});e.focus();e.click();return 'clicked';})()
             """
         }
-        let result = try await evaluate(script)
+        let result = try await evaluate(script, on: tab)
         return (result as? String) ?? "missing"
     }
 
     /// click 总流程：先按已校验元素点；禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后
     /// 按钮常延迟启用或被重渲染替换）；最终按「是灰的／找不到」两种口径分别报错并留诊断快照。
-    private func performClick(_ action: AgentAction, expected: PageElement?, approved: Bool) async throws {
+    private func performClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
-        var status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: false)
+        var status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: false, tab: tab)
         if status == "clicked" { return }
         for _ in 0..<12 {
             try await Task.sleep(for: .milliseconds(300))
-            status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true)
+            status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
             if status == "clicked" { return }
         }
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         if status == "disabled" {
-            await captureFailureSnapshot(context: "click 目标禁用：\(action.reason)")
+            await captureFailureSnapshot(context: "click 目标禁用：\(action.reason)", tab: tab)
             throw MikaError("「\(label)」按钮是灰的（存在但被禁用），无法点击")
         }
-        await captureFailureSnapshot(context: "click 目标缺失：\(action.reason)")
+        await captureFailureSnapshot(context: "click 目标缺失：\(action.reason)", tab: tab)
         throw MikaError("页面上找不到要点的按钮「\(label)」（可能还没渲染出来或已经关闭）")
     }
 
@@ -256,7 +456,7 @@ import WebKit
 
     /// agent 操作失败时存一份快照：页面截图（JPEG base64）＋精简 DOM 摘要（候选按钮与禁用状态）。
     /// 全程尽力而为：抓取失败不掩盖原始错误。
-    private func captureFailureSnapshot(context: String) async {
+    private func captureFailureSnapshot(context: String, tab: BrowserTab) async {
         let domSummary = (try? await evaluate("""
         (()=>{const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
         const lab=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim().slice(0,40);
@@ -264,9 +464,9 @@ import WebKit
         const buttons=[...document.querySelectorAll('button,[role="button"],input[type="submit"],a')].filter(vis).slice(0,12).map(x=>({text:lab(x),tag:x.tagName.toLowerCase(),disabled:dis(x)}));
         const editors=[...document.querySelectorAll('[contenteditable="true"],textarea')].filter(vis).map(x=>({tag:x.tagName.toLowerCase(),textLength:(x.innerText||x.value||'').length}));
         return JSON.stringify({url:location.href,title:document.title,buttons,editors});})()
-        """)) as? String ?? ""
-        var payload: [String: Any] = ["kind": "agent-action-failure", "context": context, "url": webView.url?.absoluteString ?? "", "domSummary": domSummary]
-        if let shot = await snapshotBase64() { payload["screenshotJPEGBase64"] = shot }
+        """, on: tab)) as? String ?? ""
+        var payload: [String: Any] = ["kind": "agent-action-failure", "context": context, "url": tab.webView.url?.absoluteString ?? "", "domSummary": domSummary]
+        if let shot = await snapshotBase64(tab: tab) { payload["screenshotJPEGBase64"] = shot }
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -277,11 +477,11 @@ import WebKit
         try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
     }
 
-    private func snapshotBase64() async -> String? {
+    private func snapshotBase64(tab: BrowserTab) async -> String? {
         await withCheckedContinuation { continuation in
             let config = WKSnapshotConfiguration()
             config.afterScreenUpdates = false
-            webView.takeSnapshot(with: config) { image, _ in
+            tab.webView.takeSnapshot(with: config) { image, _ in
                 if let image, let data = image.jpegData(compressionQuality: 0.5) {
                     continuation.resume(returning: data.base64EncodedString())
                 } else {

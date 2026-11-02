@@ -189,13 +189,26 @@ struct BrowserDockView: View {
     private func dockCard(area size: CGSize, scale: CGFloat, visual: CGSize) -> some View {
         let layoutSize = CGSize(width: size.width * layoutScale, height: size.height * layoutScale)
         let renderScale = layoutScale > 0 ? scale / layoutScale : scale
-        return BrowserView(controller: web)
+        return BrowserView(controller: web, showsTabsUI: mode == .expanded)
             .frame(width: layoutSize.width, height: layoutSize.height)
             .scaleEffect(renderScale)
             .frame(width: visual.width, height: visual.height)
             .background(Color(.systemBackground))
             .clipShape(RoundedRectangle(cornerRadius: mode == .mini ? 14 : 0, style: .continuous))
             .shadow(color: .black.opacity(mode == .mini ? 0.28 : 0), radius: 12, x: 0, y: 4)
+            .overlay(alignment: .top) {
+                // 任务绑定在别的标签页执行时（用户已切到其他页），在地址栏下方给一行最小提示；
+                // 纯视觉不拦截触摸。小窗态不显示（坞内只呈现当前页，见 TABS-IMPL 案卷）。
+                if mode == .expanded, engine.busy, let execID = web.executionTabID, execID != web.activeTabID {
+                    Text("任务在标签页「\(web.tabTitle(for: execID))」执行中")
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.orange.opacity(0.18), in: Capsule())
+                        .padding(.top, 46)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay {
                 if mode == .mini {
                     MiniShieldView(onDragChanged: shieldDragChanged, onDragEnded: shieldDragEnded)

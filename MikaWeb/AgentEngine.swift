@@ -59,9 +59,11 @@ struct AgentStep: Identifiable {
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         conversationTaskID = UUID()
         do { if let local { try web.loadLocal(local) } } catch { status = .failed(error.localizedDescription); return }
+        // 任务绑定到开始时的当前标签页：全程作用于它，用户中途手动切页不影响任务（TABS-IMPL）
+        web.beginExecution()
         launch()
     }
-    func stop() { generation = UUID(); worker?.cancel(); worker = nil; pending = nil; if busy { status = .paused("用户已停止，可继续或重新开始") } }
+    func stop() { generation = UUID(); worker?.cancel(); worker = nil; pending = nil; web.endExecution(); if busy { status = .paused("用户已停止，可继续或重新开始") } }
     func setForeground(_ foreground: Bool) {
         active = foreground
         if !foreground && busy { stop(); status = .paused("App 已离开前台；返回后点继续") }
@@ -69,6 +71,8 @@ struct AgentStep: Identifiable {
     func resume() {
         guard active, !goal.isEmpty else { return }
         guard settings.hasKey else { status = .failed("未配置 API Key：请先在设置页配置并测试连接"); return }
+        // 绑定还在（确认／手输等待后继续）则沿用原执行页；已解除（如切后台被 stop）则绑定到当前页
+        if web.executionTabID == nil { web.beginExecution() }
         pending = nil; launch()
     }
     func submitAnswer(_ text: String, requestID: UUID) -> AnswerSubmissionResult {
@@ -98,7 +102,7 @@ struct AgentStep: Identifiable {
                 if let saved = confirmed {
                     let page = try await web.state()
                     try check(token)
-                    guard page.url == saved.2, web.revision == saved.3, let target = page.elements.first(where: { $0.index == saved.1.index }), target == saved.1 else { throw MikaError("确认期间页面目标已变化，请重新开始或继续") }
+                    guard page.url == saved.2, web.executionRevision == saved.3, let target = page.elements.first(where: { $0.index == saved.1.index }), target == saved.1 else { throw MikaError("确认期间页面目标已变化，请重新开始或继续") }
                     if SafetyPolicy.check(saved.0, target) == .manual { waitingInput = .manual(id: UUID(), text: "请手动填写密码或验证码后继续"); status = .waitingManual("请手动填写密码或验证码后继续"); return }
                     executionSerial += 1
                     try await web.execute(saved.0, expected: target, approved: true)
@@ -110,19 +114,28 @@ struct AgentStep: Identifiable {
                     try check(token)
                     let page = try await web.state()
                     try check(token)
-                    let revision = web.revision
+                    let revision = web.executionRevision
                     let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                     let history = steps.map { "\($0.id). \($0.action): \($0.reason)" }.joined(separator: "\n")
                     let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
                     let action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: "任务：\(goal)\n历史：\(history)\n用户补充问答：\(answers)\n当前页面 JSON：\(json)")
                     try check(token)
-                    if action.action == "done" { record(action); status = .done(action.summary); return }
+                    if action.action == "done" { record(action); status = .done(action.summary); web.endExecution(); return }
                     if action.action == "ask_user" { record(action); waitingInput = .question(id: UUID(), text: action.question); status = .waitingManual(action.question); return }
+                    if action.action == "open_new_tab" {
+                        // 在新标签页打开指定网址：新页成为当前页且执行绑定随之移过去，后续动作作用于新页
+                        executionSerial += 1
+                        _ = try web.openTabForExecution(urlString: action.url)
+                        try check(token)
+                        record(action)
+                        try await Task.sleep(for: .milliseconds(500))
+                        continue
+                    }
                     var checkedTarget: PageElement?
                     if ["click", "type"].contains(action.action) {
                         let current = try await web.state()
                         try check(token)
-                        guard current.url == page.url, revision == web.revision,
+                        guard current.url == page.url, revision == web.executionRevision,
                               let old = page.elements.first(where: { $0.index == action.index }),
                               let target = current.elements.first(where: { $0.index == action.index }), old == target else { throw MikaError("模型思考期间页面目标已变化，请继续重试") }
                         checkedTarget = target
@@ -142,6 +155,7 @@ struct AgentStep: Identifiable {
                 status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
             } catch {
                 guard token == generation else { return }
+                web.endExecution()
                 if error is CancellationError { status = .paused("已取消") }
                 else { status = .failed(error.localizedDescription) }
             }
