@@ -34,7 +34,7 @@ extension Notification.Name {
     /// 探针脚本自身另有页面级防重入标记，属第三重保险）。
     func equip(_ controller: WKUserContentController) {
         guard !equippedControllers.contains(controller) else { return }
-        controller.removeScriptMessageHandler(forName: BrowserTab.webAuthnHandlerName, in: .page)
+        controller.removeScriptMessageHandler(forName: BrowserTab.webAuthnHandlerName, contentWorld: .page)
         controller.add(self, contentWorld: .page, name: BrowserTab.webAuthnHandlerName)
         controller.addUserScript(WKUserScript(source: BrowserTab.webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         equippedControllers.add(controller)
