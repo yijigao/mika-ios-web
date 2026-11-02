@@ -13,7 +13,9 @@ import SwiftUI
 // 视口所有权（布局尺寸归谁管，由 DockLayoutMode 显式表达，不用布尔拼凑）：
 // - 任务会话活跃期间（DockLayoutMode.workingSize）：布局尺寸锁定为展开态工作尺寸——
 //   agent 的工作视口就是这个尺寸，坞收起只把全尺寸布局缩放渲染（回到 0540 的 scale 路径），
-//   绝不因收起而 resize；任务开始时坞自动展开，会话终结后若坞仍是小窗态再补落定 resize。
+//   绝不因收起而 resize；会话终结后若坞仍是小窗态再补落定 resize。任务开始**不改变坞
+//   形态**：原「任务开始自动展开」经 Joey 问题 2（2026-11-02）摘除，用户停在哪态就
+//   保持哪态；只有介入场景（确认／手输）的自动展开保留（needsIntervention 信号）。
 // - 无任务时（DockLayoutMode.dockSize）：布局跟随坞态，即 FIX2 的落定真 resize 行为。
 // 视觉呈现（DisplayMode）由 mode（坞形态）×layoutMode（布局所有权）导出：
 // 布局缩放比 layoutScale 与视觉缩放比之商走 scaleEffect，组合真值表见案卷。
@@ -142,7 +144,9 @@ struct BrowserDockView: View {
     /// 用户无从收起——故在切到 expanded 的瞬间代为收起（见 mode 的 onChange）。
     /// 仅此一个写入点；mini 态不动它（边看小窗边在对话打字是常态路径）。
     /// 网页内的手输焦点是 WKWebView 自己的 first responder，与本状态无关、不受影响。
-    var chatInputFocus: Binding<Bool>
+    /// 类型须是 FocusState 的 Binding（与对话层 TextField 绑定的同一个），
+    /// 普通 Binding<Bool> 与之不互通（首版 Release 编译实证，见案卷）。
+    var chatInputFocus: FocusState<Bool>.Binding
 
     @State private var mode: DockMode = .mini
     @State private var miniCenter: CGPoint?
@@ -220,10 +224,15 @@ struct BrowserDockView: View {
         .onChange(of: engine.sessionActive) { _, active in
             // 视口所有权迁移点（任务会话开始／终结）：
             if active {
-                // 会话开始：布局所有权移交工作尺寸，并自动展开坞（用户在小窗态发起任务时，
-                // agent 的工作页面从第一步起就是全尺寸视口，不被小窗压排版）。
+                // 会话开始：只移交布局所有权到工作尺寸（settle 会把布局从小窗真实尺寸
+                // 一次切回工作尺寸，视觉仍按坞当前形态呈现），**不改变坞的形态**——
+                // 任务开始自动展开已被 Joey 否掉（问题 2，2026-11-02：「消息发出后
+                // 自动放大到全屏，没有必要，很突兀」）：用户停在小窗就保持小窗（工作
+                // 尺寸布局＋缩放渲染，页面实时可见），停在展开态就保持展开。
+                // 介入场景（waitingConfirm／waitingManual）的自动展开是另一条信号
+                // （上方 needsIntervention 的 onChange），不在此处、本轮保留不动。
                 layoutMode = .workingSize
-                if mode != .expanded { expand() } else { scheduleSettle() }
+                scheduleSettle()
             } else {
                 // 会话终结（完成／失败／停止／切后台暂停）：所有权交还坞态；
                 // 坞若仍是小窗态，scheduleSettle 会补做落定 resize 到小窗真实尺寸。
