@@ -123,3 +123,11 @@
 - 内容（案卷 AGENT-VIEWPORT-FIX-2026-11-02.md）：①视口所有权 DockLayoutMode——engine 新增 sessionActive 信号，任务会话活跃期布局锁定展开工作尺寸（任务开始自动展开、会话中收起只走缩放渲染不 resize），会话终结后坞仍小窗态才补落定 resize；无任务时保留 FIX2 真 resize；迁移表 8 行＋呈现真值表在案卷。②小窗调小：宽屏宽×0.40（钳 148–168）、高上限约 300pt（393×759 算例约 155×300）。③引擎失效恢复：state() 取快照前 DOM 静默短轮询（上限约 1.6s）；PageElement 新增 editable，新增 ElementDescriptor＋resolveTarget 按稳定描述重找（宁缺勿错）；click/type 收进 runTargeted，定位失败与执行失效共用单步 ≤2 次重找预算，耗尽记策略切换步交模型按新快照重判，同一目标连败两轮以「页面结构已变」具体口径终止；确认路径同享描述重找；performType 在 idx 节点被重渲染换掉时先按内容兜底校验。失败口径沿用 FIX2 三分类＋新增「页面结构已变」一类。
 - 红线复核：MikaWebApp.swift 持有形态、SafetyPolicy、WebSurface 零改动；标签模型与执行页绑定口径不变；FIX2 注入脚本与硬校验逐字保留；重找重试每轮重跑 Swift 侧安全检查，无绕行。
 - 待 Joey 按案卷复测清单验收（首项＝翻车场景复现：小窗态发起知乎写回答应自动展开并办成；其余：任务中收起不打断、闲时适配仍在、小窗观感、知乎评论、标签页、安全边界、闪退回归）；验收通过前不合 main。
+
+## 增补（2026-11-02）：键盘修复＋同批问题 2/3 构建，新构建已上
+
+- 构建 **202611020708**（0.1.0），build id `47c67ce2-5eae-48c9-a4a2-9ec536f4d28b`：分支 `fix/chat-keyboard-dismiss`（自 fix/agent-viewport-lock 新开，未合 main/fix/feat），代码提交 `24033de`＋`1bea7b3`＋`88c44c5`；CI Run 41403751627、41404192796 success（Debug 模拟器真编译）；Release Run 41404357991 success（首轮 41403473732 因 FocusState Binding 类型不匹配编译失败、已修，见案卷过程注记）；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 回读确认、Internal 组挂载 POST 204 且组内回读居首 [202611020708, 202611020645, 202611020636]；validate_project.py 全 PASS。
+- 背景：Joey 在 0645 上连续报三项——问题 1（14:57）消息发出后键盘不自动收回、占半屏且手动收不下去；问题 2（15:02）发消息后浏览器自动放大到全屏很突兀；问题 3（15:03）聊天输入口必须始终在最上层、不能被浮窗盖住。
+- 内容（案卷 CHAT-KEYBOARD-FIX-2026-11-02.md）：①键盘——ContentView 集中持有 @FocusState 下传输入栏与坞；发送仅在两条真成功路径收键盘（被拒保留焦点与草稿），多行输入框高度随草稿清空自动复位；消息列表 .scrollDismissesKeyboard(.interactively)＋点按 simultaneousGesture 收键盘；坞切 expanded 瞬间代收对话焦点（遮挡路径）。护盾实查结论：不是成因（只覆盖小窗面积、不及输入区），全因是对话层此前零焦点管理。②摘除任务开始（sessionActive）的坞自动展开，只保留视口所有权迁移；介入（waitingConfirm/waitingManual）自动展开本轮保留、已登记待 Joey 后续口径。③输入栏拆为独立 ChatInputBar 成为 ZStack 最上层（消息层＜坞＜输入栏），材质背景延伸底部安全区；输入栏高度实测下传——消息层等高底部避让、坞的底部保留线改实测推导（实测高＋42，对应关系见案卷；DockGeometry 兜底常量 148 保留）、展开态介入 UI 与收起按钮抬到输入栏之上。
+- 红线复核：MikaWebApp.swift 持有形态、SafetyPolicy、WebSurface、AgentEngine、WebController 零改动（git diff 实查，仅 3 个布局/对话文件变更）；ConfirmCard 防重复守卫全字段保留；视口所有权、标签、FIX2 注入均未动。
+- 待 Joey 按案卷复测清单验收（键盘三项、问题 2 小窗/展开各发一次、问题 3 拖到底/展开态输入/介入不重叠，顺带介入自动展开去留口径）；验收通过前不合 main。
