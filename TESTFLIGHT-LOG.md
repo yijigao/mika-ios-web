@@ -71,3 +71,8 @@
 - 背景：开关版定位终局——10 开关逐个单关全崩、10 个全关仍崩（Joey 真机 03:40–03:49，栈报告 5/6 佐证同签名），单因素矩阵整体证伪；CRASH-HUNT-2 审计收敛嫌疑至开关覆盖外的结构残件（S-A 浮层共存容器结构、S-B 根图常驻 FocusState），Astra 结论「只做一次完整的 UI 结构回退」。
 - 内容：ContentView 回 1652 骨架（NavigationStack→VStack：BrowserView 流内分区＋Divider＋聊天区流内分区），删 GeometryReader 与全部 overlay；删根图 @FocusState 声明/onChange 写回/`.focused` 绑定，聊天输入改 1652 控制台同款无绑定 TextField；FloatingPanelStore 与悬浮球退出 UI（文件整体删除）；BrowserView 按钮回 1652 形态（与基线零 diff）；DebugSwitches 整体移除（残留 dbg.* 键无代码读取、零影响）。**数据层逐字保留**：AgentConversationStore＋binds、AgentEngine 全部增量、DiagnosticStore/MetricKit、模型名防呆、ask_user/确认卡片业务语义，仅聊天呈现位置由浮层改流内分区。红线文件全部零改动（git 实查），validate_project.py 全 PASS。详见 FIX-LOG-V023-2026-11-02.md。
 - 结论口径：「回退该组 UI 结构变化后待真机验证」——根因机制未分离、未确认。Joey 在 TestFlight 更新到 202611012002 后按 FIX-LOG-V023 §6 做产品级复测（点网页 5 次＋滚动、跑任务、ask_user 作答、确认卡片、模型名防呆），不再做开关实验。
+
+## 增补（2026-11-02）：基线确认构建（1652 逐字源码），新构建已上
+
+- 构建 **202611020016**（0.1.0），build id `f9ab837d-fdd8-483f-aba6-ee731d91d192`：源码＝提交 `3165943` 逐字（分支 `baseline-1652-confirm` 直接指向该提交，diff 为空、tree hash 一致，零夹带）；CI Run 41366049681 success、Release Run 41366185979 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false、已挂 Internal 组（组内回读 [202611020016, 202611012002, 202611011920, 202611011811, 202611011747, 202611011652, 202611011544]）。构建号由 fastlane 现场生成、不落仓；版本串保持基线 0.1.0（改版本串会破坏零 diff，取舍理由见 BASELINE-CONFIRM-2026-11-02.md）。
+- 背景：v0.2.3 结构修复版 202611012002 真机复测仍闪退（Joey 2026-11-02 08:12），UI 结构组整体回退不足以止崩。本版按 CRASH-HUNT-2 预写退路验证「1652 基线在当前设备仍不崩」这一前提：Joey 装 202611020016 后点网页 5 次＋滚动、口头报崩/不崩即可（此版无崩溃报告导出）。基线不崩→逐个回加 1652 后增量（DiagnosticStore＋MetricKit、conversation store＋binds、AgentEngine 增量、App 装配）；基线也崩→增量整体脱罪、转查设备/iOS/页面环境。两种结论均非根因确认。
