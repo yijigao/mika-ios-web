@@ -89,3 +89,38 @@
 - build id `177fb3f5-a8b9-422c-a878-57be49cccfc9`；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 并回读确认；Internal 组挂载 POST 204，组内回读居首：[202611020210, 202611020205, 202611020054, 202611020045, 202611020036, 202611020016]。
 
 两阶均未改 main、未动起始页与 WebSurface/WebController/BrowserView 本体。待主聊转交 Joey 按 §3 规程逐阶真机测（H3 先、首崩即停）。
+
+## 5. H3 真机结果（2026-11-02 10:11）：崩，二分命中装配骨架层
+
+- Joey 实测：H3（构建 **202611020205**，与本轮 H3 为同一构建——ASC 上传 VALID 且挂 Internal 组在先，崩溃时间 10:11:14 在交付之后，时间链吻合）**点击网页即闪退**（Joey 确认崩法＝点击网页崩、非启动崩，与历代一致）。
+- 崩溃报告（Joey 导出，证据摘录存 ~/workspace/mika-ios-eval/CRASH-H3-EVIDENCE-2026-11-02.md）：iPhone14,5、iOS 27.2 (24B5110a)；异常与历代完全一致 NSInvalidArgumentException `-[__NSArrayM insertObject:atIndex:]: object cannot be nil`，归因链含 UpdateCycle 与单个 MikaWeb 帧，offsetIntoBinaryTextSegment＝**98532**（对照：1747→94536、1811→97816、1920→99412，各构建偏移不同、签名同源）。
+- 判读（按 §3 预写）：H2 稳、H3 崩 ⇒ 触发点在 **H3 相对 H2 的装配增量**之内（装配骨架层）。H4（202611020210）＝H3＋更多接线，对定位无新增信息，主聊已令停止按原计划推进 H4 测试，改拆 H3 增量二分（§6）。
+
+### 5.1 H3 相对 H2 的完整增量清单（以 H3 实际提交 5e81bf1 相对 H2 提交 2e9a33d 的 diff 为准）
+
+文件层：仅 MikaWebApp.swift（入口重写）与 Harness.swift（根包装签名＋H3/H4 视图新增）两文件；起始页、WebSurface/WebController/BrowserView 本体零改动。装配层逐项：
+
+| # | 增量项 | 内容 |
+|---|---|---|
+| A1 | App 级 @StateObject 持有 WebController | WebController 构造与持有由根视图（H2 的 HarnessH2View 自持）上移 App 入口 init（D1/D9） |
+| A2 | SettingsStore 对象创建 | App init 构造、@StateObject 持有（D2）；H3 子树不观察它 |
+| A3 | AgentEngine 对象创建 | App init 构造 `AgentEngine(web:settings:)`、@StateObject 持有（D3）；只创建不执行、init 无副作用 |
+| A4 | 对象图向下传递 | App 将 web/settings/engine 传给根包装与 H3 根视图（根视图以普通 let 持有；BrowserView 改为消费 App 的 web） |
+| B1 | 根视图布局换 1652 ContentView 结构 | NavigationStack { VStack(spacing:0) { BrowserView.frame(maxHeight:.infinity); Divider(); 控制台区 } }（H2 为 BrowserView＋Divider＋120pt 静态占位条，骨架相近，差异在底部区与背景） |
+| B2 | 控制台静态形态（消息区/输入栏） | 底部占位换 HarnessStaticConsole：流内纵向 TextField（本地 @State、roundedBorder、lineLimit 1...3，不绑 engine、无 .focused）＋禁用按钮行＋静态「步骤 0/待命」文案（D8 静态形态） |
+
+注：DiagnosticStore 构造＋start() 在 H2 阶梯入口已有（两轮恒定），不在增量内；scenePhase/观察扇出/真控制台/pending/toolbar 目的地均属 H4，未进入 H3。
+
+## 6. H3 增量二分：H3a / H3b（2026-11-02 主聊令）
+
+按主聊拆分优先级（App 级持有与根视图布局/静态形态分开），增量 6 项分两组（>3 项，按组拆半，不逐项）：
+
+- **H3a（step=5）＝ H2 ＋ A 组（A1–A4）**：App 入口与 H3 逐字相同（1652 形态对象图：App 持有 web/settings/engine/diagnostics 并向下传递，BrowserView 消费 App 的 web）；根视图保持 H2 形态（BrowserView＋Divider＋120pt 静态占位条，根视图以 let 持有 web、不观察 settings/engine）。即：只加「App 级对象图创建/持有」，不加 1652 布局与静态控制台。
+- **H3b（step=6）＝ H3a ＋ B 组（B1–B2）**：根视图换 HarnessH3View（与 H3 的根视图逐字相同），装配与 H3 完全等价。即 H3b 是 H3 的复刻锚点：H3b 应崩（若不崩，则阶梯包装出现未登记差异，须先查包装再谈定位）。
+
+判读预写：
+- **H3a 崩** → 触发点在 A 组：App 级对象图创建/持有（WebController 持有上移、SettingsStore/AgentEngine 创建、对象图传递）之内，下一轮在 A 组内逐项拆（A1 单独、A2+A3 等）。
+- **H3a 稳、H3b 崩** → 触发点在 B 组：根视图 1652 布局结构或控制台静态形态（流内 TextField 的存在）之内，下一轮在 B 组内拆（布局 vs TextField）。
+- **H3a/H3b 全稳** → 与 H3 实测矛盾，先查阶梯包装/构建差异（H3b 与 H3 的等价性复核），不直接下结论。
+
+（构建完成后回填：H3a/H3b 提交号、CI/Release Run、构建号、build id、ASC 回读。）

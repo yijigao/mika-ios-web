@@ -10,8 +10,14 @@ import WebKit
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 4
-    static var stepName: String { "H\(step)" }
+    static let step = 5
+    static var stepName: String {
+        switch step {
+        case 5: return "H3a"
+        case 6: return "H3b"
+        default: return "H\(step)"
+        }
+    }
     static let startPageHTML = "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>"
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 }
@@ -59,15 +65,19 @@ struct HarnessRootView: View {
                 HarnessH1View()
             } else if Harness.step == 3 {
                 HarnessH3View(web: web, settings: settings, engine: engine)
+            } else if Harness.step == 5 {
+                HarnessH3aView(web: web)
+            } else if Harness.step == 6 {
+                HarnessH3View(web: web, settings: settings, engine: engine)
             } else if Harness.step >= 4 {
                 HarnessH4View(web: web, settings: settings, engine: engine)
             } else {
                 HarnessH2View()
             }
         }
-        // 1652 的 scenePhase 接线（App body 的 onChange → engine.setForeground）：本阶梯挂在根包装、仅 step>=4 生效（案卷 CRASH-LADDER-2 §2 登记的挂载点差异）。
+        // 1652 的 scenePhase 接线（App body 的 onChange → engine.setForeground）：本阶梯挂在根包装、仅 H4（step==4）生效（案卷 CRASH-LADDER-2 §2 登记的挂载点差异）。step 5/6（H3a/H3b）必须不生效，否则破坏与 H3 的装配等价性。
         .onChange(of: scenePhase, initial: true) { _, phase in
-            if Harness.step >= 4 { engine.setForeground(phase == .active) }
+            if Harness.step == 4 { engine.setForeground(phase == .active) }
         }
         .overlay(alignment: .bottomTrailing) {
             VStack(spacing: 2) {
@@ -220,5 +230,32 @@ struct HarnessH4View: View {
     }
     private func consumePending() {
         if let task = pending.task { engine.stop(); engine.taskText = task; pending.task = nil }
+    }
+}
+
+// H3a：H2 ＋ A 组装配（案卷 CRASH-LADDER-2 §6）——App 入口对象图与 H3 逐字相同（App 持有 web/settings/engine 并向下传递），
+// 根视图保持 H2 形态：BrowserView 消费 App 传入的 web（普通 let 持有）、Divider、120pt 静态占位条；不加 1652 布局与静态控制台（B 组归 H3b）。
+// 与 HarnessH2View 的唯一差异：WebController 来源由视图自持 @StateObject 改为 App 传入。
+struct HarnessH3aView: View {
+    let web: WebController
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                BrowserView(controller: web).frame(maxHeight: .infinity)
+                Divider()
+                Text("阶梯占位：底部区域（无控制台 / 无对话）")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 120)
+                    .background(Color(uiColor: .secondarySystemBackground))
+            }
+            .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Text(Harness.stepName).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }
