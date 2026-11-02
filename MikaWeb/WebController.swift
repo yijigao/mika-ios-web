@@ -125,7 +125,7 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 
     private static func installWebAuthnProbe(into config: WKWebViewConfiguration, handler: WKScriptMessageHandler) {
         let controller = config.userContentController
-        controller.addScriptMessageHandler(handler, contentWorld: .page, name: webAuthnHandlerName)
+        controller.add(handler, contentWorld: .page, name: webAuthnHandlerName)
         controller.addUserScript(WKUserScript(source: webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
     }
 
