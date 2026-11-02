@@ -145,34 +145,47 @@ struct PersistedChatEntry: Codable {
         persistNow()
     }
     private func trimHistory() {
-        let older = entries.filter { $0.taskID != taskID }
-        if older.count > 500 { entries.removeFirst(older.count - 500); persistNow() }
+        // H1 前的旧口径是「旧任务条目全局只留 500 条」——那正是新任务挤掉
+        // 旧历史的机制。H1 起只保留按会话计的防爆上限（见 sessionEntryCap），
+        // 任务之间不再互相挤占。
+        if entries.count > Self.sessionEntryCap { entries.removeFirst(entries.count - Self.sessionEntryCap); persistNow() }
     }
 
-    // MARK: - 条目持久化（CRASH-1031 追加项：任务完成后切后台再回来对话被清空）
+    // MARK: - 条目持久化（CRASH-1031 追加项：任务完成后切后台再回来对话被清空；H1 改按会话分库）
 
     // 对话记录是用户的事后凭证（发了什么任务、agent 做了什么、结果如何都在
     // 里面），与引擎的会话执行快照（终结／停止即清除）解耦、独立落盘：
     // 切后台、回前台、进程被系统杀掉后重开都不丢。落盘口径：每次条目变化
     // 写全量逻辑列表（entries＋攒批中的 batchedEntries，杀进程发生在攒批期
-    // 也不丢），上限最近 1000 条；当前产品没有任何「清空对话」的用户动作，
-    // 条目只随 trimHistory 的上限滚动——将来若加显式清空，须同步删本文件。
-    private static var persistenceFileURL: URL {
-        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MikaWeb/Conversation", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory.appendingPathComponent("entries.json")
+    // 也不丢）；当前产品没有任何「清空对话」的用户动作，条目只随
+    // trimHistory 的防爆上限滚动——将来若加显式清空，须同步删本文件。
+    //
+    // H1（会话级分库）：落盘位置改由 SessionStore 按会话给出（当前会话的
+    // entries.json），旧版单文件已在 SessionStore 初始化时迁入默认会话。
+    // 条数上限按会话计：每会话 5000 条是防爆值（单条条目约百字节量级，
+    // 5000 条约亚 MB 到数 MB），不是产品策略上限——它的作用只是防病态
+    // 膨胀撑爆磁盘，正常使用够不到；新会话不再挤掉旧会话的历史。
+    static let sessionEntryCap = 5000
+
+    private var persistenceFileURL: URL {
+        SessionStore.shared.entriesURL(for: SessionStore.shared.currentSessionID)
     }
 
     private func loadPersisted() {
-        guard let data = try? Data(contentsOf: Self.persistenceFileURL),
+        guard let data = try? Data(contentsOf: persistenceFileURL),
               let decoded = try? JSONDecoder().decode([PersistedChatEntry].self, from: data) else { return }
-        entries = decoded.suffix(1000).map { ChatEntry(restoring: $0) }
+        entries = decoded.suffix(Self.sessionEntryCap).map { ChatEntry(restoring: $0) }
     }
 
     private func persistNow() {
-        let logical = (entries + batchedEntries).suffix(1000)
+        let logical = (entries + batchedEntries).suffix(Self.sessionEntryCap)
         guard let data = try? JSONEncoder().encode(logical.map { PersistedChatEntry($0) }) else { return }
-        try? data.write(to: Self.persistenceFileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try? data.write(to: persistenceFileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        SessionStore.shared.touch(id: SessionStore.shared.currentSessionID, status: "active")
+    }
+
+    /// 自检八口径：当前会话落盘文件里的条数（解码失败为 nil）。
+    func onDiskEntryCount() -> Int? {
+        SessionStore.shared.entryCountOnDisk(for: SessionStore.shared.currentSessionID)
     }
 }

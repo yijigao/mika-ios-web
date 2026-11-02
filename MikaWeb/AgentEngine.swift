@@ -100,6 +100,27 @@ struct AgentStep: Identifiable {
     /// 编辑器／textarea 的输入，回退任意字段的最近输入。start() 清空——新
     /// 任务的提交若无打字记录，软门按页面＋按钮标识匹配（追问场景正是此路）。
     private var recentTyped: [(text: String, isEditor: Bool)] = []
+    /// 结构化任务状态卡（H1，结构与口径见 TaskStateCard.swift）：程序维护
+    /// 的事实账，随快照持久化、每轮 prompt 注入。关键状态由程序在确定事件
+    /// 点更新（开始/record 记账/用户答复/用户跳过/等待状态派生），不依赖
+    /// 模型散文摘要；历史折叠再紧，卡片也不参与折叠。
+    private(set) var stateCard = TaskStateCard()
+    /// 确定性折叠（H1）：步数超过 foldStepThreshold 后，旧步骤在 prompt 里
+    /// 折叠为单行流水账（最近若干步保留全量）；原始 steps 记录 append-only
+    /// 不动，折叠只发生在组装。级别：1＝留最近 6 步全量、2＝留 3 步、
+    /// 3＝留 1 步且行更短。forcedFoldLevel 由预算升级/上下文超限重试抬升，
+    /// 会话内只升不降（保守侧）。
+    private var forcedFoldLevel = 0
+    static let foldStepThreshold = 12
+    /// 组装 prompt 的字符预算（H1）：保守默认值——组装后超此值先逐级加大
+    /// 折叠再发送；它管的是「我们发出去的体量有界」，不是某个模型的窗口
+    /// 断言（各通道窗口不同，真超限由受控重试兜底，见 isContextOverflowError）。
+    static let promptCharBudget = 16000
+    /// 上下文超限受控重试是否已用（H1）：每轮任务运行只许一次——命中超限
+    /// 错误时把折叠升到最紧再发，绝不原样重发全量；再超限则照常判失败，
+    /// 不循环（防 Issue #181 式「全量重发＋重试」死循环）。进程恢复后随
+    /// 内存态重置（恢复出的步数已多、自动折叠级别本就更高，不构成循环）。
+    private var contextRetryUsed = false
     /// 当前会话目标（对话层判定「有可续跑上下文」用，只读）。
     var activeGoal: String { goal }
     /// 后台宽限断言（层 2）：进后台时申请、回前台／会话终结／到期时释放。
@@ -149,6 +170,8 @@ struct AgentStep: Identifiable {
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
+        stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
         // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
@@ -248,6 +271,9 @@ struct AgentStep: Identifiable {
         guard case .some(.question(let id, let question)) = waitingInput, id == requestID else { return .rejected("这条问题已失效") }
         switch status { case .waitingManual, .paused: break; default: return .rejected("当前不能提交回答") }
         answerContext.append(QuestionAnswer(questionID: id, question: question, answer: answer))
+        // 用户答复是程序可确定的关键事实：钉进状态卡 pinnedFacts，折叠与
+        // 摘要都动不了它（H1）——长任务后段模型仍能看到用户早先的明确口径
+        stateCard.pinFact("用户对「\(question)」的答复：\(answer)")
         waitingInput = nil
         resume()
         return .accepted
@@ -255,7 +281,12 @@ struct AgentStep: Identifiable {
     func confirm(execute: Bool) {
         guard active, let saved = pending else { return }
         pending = nil
-        if !execute { appendStep("skip", "用户跳过：\(saved.0.reason)"); launch(); return }
+        if !execute {
+            appendStep("skip", "用户跳过：\(saved.0.reason)")
+            // 用户明确跳过是关键事实：钉进状态卡，后续轮次不得再提议同一步
+            stateCard.pinFact("用户决定跳过：\(saved.0.reason)")
+            launch(); return
+        }
         launch(confirmed: saved)
     }
     private func launch(confirmed: (AgentAction, PageElement, String, Int)? = nil) {
@@ -286,23 +317,16 @@ struct AgentStep: Identifiable {
                         let page = try await web.state()
                         try await checkpoint(token)
                         let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
-                        let history = steps.map { "\($0.id). \($0.action): \($0.reason)" }.joined(separator: "\n")
                         let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
-                        var prompt = "任务：\(goal)\n"
-                        // 中断恢复的续跑提示（RESUME-CONTEXT-FIX）：恢复会话的
-                        // 每一轮都带上——原页面恢复结果＋不得反问目标／网址／
-                        // 进度的硬性口径，直到会话终结或新任务开始才清除。
-                        if let resumeNote { prompt += resumeNote + "\n" }
-                        // 成果台账注入（OUTCOME-LEDGER）：与【中断恢复说明】并列
-                        // ——已留痕的提交逐条在目，附不得重复提交／先查列表／
-                        // 已核实结论不得无新证据改口的硬口径（见 outcomePromptBlock）
-                        let outcomeBlock = outcomePromptBlock()
-                        if !outcomeBlock.isEmpty { prompt += outcomeBlock + "\n" }
-                        prompt += "历史：\(history)\n用户补充问答：\(answers)"
-                        if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
-                        if let hint = pendingLoopHint { prompt += "\n\(hint)"; pendingLoopHint = nil }
-                        if let hint = pendingOutcomeHint { prompt += "\n\(hint)"; pendingOutcomeHint = nil }
-                        prompt += "\n当前页面 JSON：\(json)"
+                        // 一次性提示在本轮组装前消费（组装可能因预算多遍重建，
+                        // 消费动作不能放进组装函数里重复执行）
+                        let loopHint = pendingLoopHint; pendingLoopHint = nil
+                        let outcomeHint = pendingOutcomeHint; pendingOutcomeHint = nil
+                        // prompt 组装（H1）：任务→状态卡→恢复说明→成果台账→
+                        // 历史（确定性折叠）→问答→playbook→提示→当前页面；
+                        // 体量由 promptCharBudget 约束，超预算逐级加大折叠
+                        // （见 assemblePrompt）。各注入段的口径注释见组装函数。
+                        let prompt = assemblePrompt(pageJSON: json, answersJSON: answers, loopHint: loopHint, outcomeHint: outcomeHint)
                         let action: AgentAction
                         if settings.modelSource == .chatGPT {
                             action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
@@ -421,18 +445,34 @@ struct AgentStep: Identifiable {
                     } catch {
                         guard token == generation else { return }
                         if error is CancellationError { throw error }
-                        guard let kind = Self.transientKind(of: error) else { throw error }
-                        transientStreak += 1
-                        writeTransientDiagnostic(kind: kind, error: error, streak: transientStreak)
-                        if transientStreak >= Self.maxTransientStreak {
-                            throw MikaError(Self.transientFailureMessage(kind: kind, error: error))
+                        if Self.isContextOverflowError(error), !contextRetryUsed {
+                            // 上下文超限受控重试（H1）：只许一次，且重试必须
+                            // 是「缩小后」的——折叠升到最紧（forcedFoldLevel
+                            // =3），下一轮组装自动带上；绝不原样重发全量历史
+                            // （Issue #181 式死循环正是全量重发＋无限重试）。
+                            // 本次重试步照常经 appendStep 计入步数预算，退避
+                            // 与瞬时错误同档（600ms），不新造循环。
+                            contextRetryUsed = true
+                            forcedFoldLevel = 3
+                            writeDiagnostic(types: ["上下文超限"], payload: ["kind": "context-overflow-retry", "message": error.localizedDescription, "goal": goal, "stepsRecorded": steps.count])
+                            appendStep("retry", "模型报告上下文超限：已把旧步骤折叠到最紧（状态卡与最近步骤保留）后重试一次，不会重发全量历史")
+                            if !active { try await checkpoint(token) }
+                            try await Task.sleep(for: .milliseconds(600))
+                        } else if let kind = Self.transientKind(of: error) {
+                            transientStreak += 1
+                            writeTransientDiagnostic(kind: kind, error: error, streak: transientStreak)
+                            if transientStreak >= Self.maxTransientStreak {
+                                throw MikaError(Self.transientFailureMessage(kind: kind, error: error))
+                            }
+                            appendStep("retry", Self.transientRetryNote(kind: kind, streak: transientStreak))
+                            if (kind == .pageLoad || kind == .webContentProcess) && transientStreak == 2 {
+                                web.reloadExecutionTab() // 连败第 2 次：先重载执行页一次再试
+                            }
+                            if !active { try await checkpoint(token) } // 后台出的错先驻停、回前台再重试
+                            try await Task.sleep(for: .milliseconds(600 * transientStreak))
+                        } else {
+                            throw error
                         }
-                        appendStep("retry", Self.transientRetryNote(kind: kind, streak: transientStreak))
-                        if (kind == .pageLoad || kind == .webContentProcess) && transientStreak == 2 {
-                            web.reloadExecutionTab() // 连败第 2 次：先重载执行页一次再试
-                        }
-                        if !active { try await checkpoint(token) } // 后台出的错先驻停、回前台再重试
-                        try await Task.sleep(for: .milliseconds(600 * transientStreak))
                     }
                 }
                 status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
@@ -691,7 +731,11 @@ struct AgentStep: Identifiable {
         persistSnapshot()
         syncContinuedProgress()
     }
-    private func record(_ action: AgentAction, suffix: String = "") { appendStep(action.action, action.reason + suffix) }
+    private func record(_ action: AgentAction, suffix: String = "") {
+        appendStep(action.action, action.reason + suffix)
+        // 状态卡的已完成里程碑在记账点同步（程序事实，不经模型转述，H1）
+        stateCard.addCompleted("\(action.action)：\(action.reason)")
+    }
 
     // MARK: - 成果台账（OUTCOME-LEDGER-2026-11-02.md）
 
@@ -831,6 +875,113 @@ struct AgentStep: Identifiable {
         outcomeLedger.last.map { "\($0.host.isEmpty ? "本地页面" : $0.host) · \($0.contentPrefix.isEmpty ? "（无正文指纹）" : $0.contentPrefix) · \($0.statusNote)" }
     }
 
+    // MARK: - prompt 组装：状态卡、确定性折叠与预算（H1）
+
+    /// 状态卡的派生字段刷新：待办/未决问题/台账引用都由当前引擎状态直接
+    /// 派生（等待谁、等什么、台账里有什么），不经模型转述；已完成与关键
+    /// 事实在各自事件点增量维护（见 record/submitAnswer/confirm）。在每次
+    /// 组装 prompt 与每次快照落盘前调用，保证卡片与现场一致。
+    private func refreshStateCard() {
+        if goal.isEmpty { return }
+        if stateCard.goal != goal { stateCard.goal = goal }
+        switch waitingInput {
+        case .question(_, let text): stateCard.openQuestions = [text]
+        default: stateCard.openQuestions = []
+        }
+        if let pending {
+            stateCard.todos = ["等待用户确认：\(pending.0.reason)"]
+        } else if let waitingInput {
+            switch waitingInput {
+            case .question(_, _): stateCard.todos = ["等待用户回答未决问题"]
+            case .manual(_, let text): stateCard.todos = ["等待用户处理：\(text)"]
+            }
+        } else if case .waitingManual(let text) = status {
+            stateCard.todos = ["等待用户处理：\(text)"]
+        } else if sessionActive {
+            stateCard.todos = ["继续执行任务（已进行 \(steps.count) 步）"]
+        } else {
+            stateCard.todos = []
+        }
+        stateCard.outcomeRefs = outcomeLedger.map {
+            "\(Self.outcomeTime($0.recordedAt)) \($0.host.isEmpty ? "本地页面" : $0.host)「\($0.elementLabel)」：\($0.statusNote)"
+        }
+        stateCard.updatedAt = Date()
+    }
+
+    /// 组装一轮 prompt：从自动级别（步数超阈值→1）或受控重试抬升的级别
+    /// 起，超字符预算就逐级加大折叠，直到有界或到最紧级别 3 为止。
+    private func assemblePrompt(pageJSON: String, answersJSON: String, loopHint: String?, outcomeHint: String?) -> String {
+        refreshStateCard()
+        var level = max(forcedFoldLevel, steps.count > Self.foldStepThreshold ? 1 : 0)
+        while true {
+            let prompt = buildPrompt(pageJSON: pageJSON, answersJSON: answersJSON, foldLevel: level, loopHint: loopHint, outcomeHint: outcomeHint)
+            if prompt.count <= Self.promptCharBudget || level >= 3 { return prompt }
+            level += 1
+        }
+    }
+
+    private func buildPrompt(pageJSON: String, answersJSON: String, foldLevel: Int, loopHint: String?, outcomeHint: String?) -> String {
+        var prompt = "任务：\(goal)\n"
+        // 状态卡（H1）：程序维护的事实账，每轮在场；折叠只动历史段，动不了它
+        let cardBlock = stateCard.promptBlock()
+        if !cardBlock.isEmpty { prompt += cardBlock + "\n" }
+        // 中断恢复的续跑提示（RESUME-CONTEXT-FIX）：恢复会话的每一轮都带上
+        // ——原页面恢复结果＋不得反问目标／网址／进度的硬性口径，直到会话
+        // 终结或新任务开始才清除。
+        if let resumeNote { prompt += resumeNote + "\n" }
+        // 成果台账注入（OUTCOME-LEDGER）：与【中断恢复说明】并列——已留痕
+        // 的提交逐条在目，附不得重复提交／先查列表／已核实结论不得无新
+        // 证据改口的硬口径（见 outcomePromptBlock）
+        let outcomeBlock = outcomePromptBlock()
+        if !outcomeBlock.isEmpty { prompt += outcomeBlock + "\n" }
+        prompt += "历史：\(Self.historyText(steps: steps, level: foldLevel))\n用户补充问答：\(answersJSON)"
+        if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
+        if let loopHint { prompt += "\n\(loopHint)" }
+        if let outcomeHint { prompt += "\n\(outcomeHint)" }
+        prompt += "\n当前页面 JSON：\(pageJSON)"
+        return prompt
+    }
+
+    /// 历史文本的确定性折叠（H1）：级别 0 或步数未超阈值时与旧形态逐字
+    /// 一致（全量「id. action: reason」）；级别 ≥1 时，把最近 keepFull 步
+    /// 之前的旧步逐条折叠为单行流水账「[Step N] action → 结果摘要」，
+    /// 结果摘要＝reason 折叠空白后的前 foldCap 字——旧步携带的长文本
+    /// （含粘进 reason 的页面内容）就此退出 prompt。折叠是纯函数：原始
+    /// steps 记录 append-only 不改写，级别只影响组装。
+    static func historyText(steps: [AgentStep], level: Int) -> String {
+        guard level > 0, steps.count > foldStepThreshold else {
+            return steps.map { "\($0.id). \($0.action): \($0.reason)" }.joined(separator: "\n")
+        }
+        let keepFull: Int
+        let foldCap: Int
+        switch level {
+        case 1: keepFull = 6; foldCap = 48
+        case 2: keepFull = 3; foldCap = 32
+        default: keepFull = 1; foldCap = 24
+        }
+        let split = max(0, steps.count - keepFull)
+        return steps.enumerated().map { index, step in
+            if index < split {
+                let collapsed = step.reason.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                return "[Step \(step.id)] \(step.action) → \(String(collapsed.prefix(foldCap)))"
+            }
+            return "\(step.id). \(step.action): \(step.reason)"
+        }.joined(separator: "\n")
+    }
+
+    /// 上下文超限类错误的识别（H1）：只认服务商原文里明确的上下文长度
+    /// 信号（HTTP 400 的服务商说明会被 ModelClient 拼进错误文案、订阅
+    /// 通道的失败消息同理）；一般 400（模型名/参数问题）不含这些标记、
+    /// 不会被误判进来。命中也只触发一次性的「折叠后重试」，不进瞬时
+    /// 错误的连败重试口径。
+    private static func isContextOverflowError(_ error: Error) -> Bool {
+        let text = (error.localizedDescription + "|" + String(describing: (error as NSError).userInfo)).lowercased()
+        if text.contains("context_length_exceeded") || text.contains("context length") || text.contains("maximum context") { return true }
+        if text.contains("too many tokens") || text.contains("input is too long") || text.contains("prompt is too long") || text.contains("reduce the length") { return true }
+        if text.contains("上下文") && (text.contains("超") || text.contains("过长") || text.contains("上限") || text.contains("长度")) { return true }
+        return false
+    }
+
     // MARK: - 后台韧性（BACKGROUND-RESILIENCE-2026-11-02.md；层 1 驻停/续跑在 checkpoint）
 
     /// 任务期防锁屏（层 4）：会话活跃且设置开启时禁用自动锁屏，会话终结即恢复。
@@ -967,8 +1118,31 @@ struct AgentStep: Identifiable {
         // 快照里的这份保证「随会话恢复的正是本会话的条目」，恢复时按 id
         // 合并去重。可选字段，此前快照无此键照常解码。
         var outcomes: [OutcomeRecord]?
+        // H1 起：结构化任务状态卡与所属会话 id。可选字段，此前快照无此
+        // 两键照常解码（无卡时恢复路径按步流派生一张，见 restoreSnapshotIfNeeded）。
+        var stateCard: TaskStateCard?
+        var sessionID: UUID?
     }
+    /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
+    /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
+    /// 迁移/新落盘成功后即清除，防止旧快照被反复当作新状态恢复。
     private static let snapshotKey = "agentSessionSnapshot.v1"
+
+    /// 读取当前会话的快照数据：优先会话文件；文件不存在时走一次性迁移
+    /// ——把旧 UserDefaults 快照复制进会话文件（写成功后才清旧键，写失败
+    /// 则原样返回旧数据、下次启动重试迁移，数据不丢）。
+    private func loadSnapshotData() -> Data? {
+        let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+        if let data = try? Data(contentsOf: url) { return data }
+        guard let legacy = UserDefaults.standard.data(forKey: Self.snapshotKey) else { return nil }
+        do {
+            try legacy.write(to: url, options: [.atomic])
+            UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
+        } catch {
+            // 迁移写入失败：不删旧键，恢复仍用旧数据，下次启动再迁
+        }
+        return legacy
+    }
 
     private func currentStatusKind() -> (kind: String, text: String)? {
         switch status {
@@ -1004,6 +1178,7 @@ struct AgentStep: Identifiable {
             case .manual(let id, let text): waitingDTO = SessionSnapshot.WaitingDTO(kind: "manual", id: id, text: text)
             }
         }
+        refreshStateCard()
         let answersData = (try? JSONEncoder().encode(answerContext)) ?? Data("[]".utf8)
         // 工作现场（RESUME-CONTEXT-FIX）：标签地址跟会话一起落盘。若本会话是
         // 恢复来的、现场还没被续跑消费（标签仍是冷启动起始页），写下的应是
@@ -1019,13 +1194,25 @@ struct AgentStep: Identifiable {
                                        skillNames: loadedSkillNames,
                                        taskID: conversationTaskID,
                                        tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex,
-                                       outcomes: outcomeLedger)
+                                       outcomes: outcomeLedger,
+                                       stateCard: stateCard,
+                                       sessionID: SessionStore.shared.currentSessionID)
         if let data = try? JSONEncoder().encode(snapshot) {
-            UserDefaults.standard.set(data, forKey: Self.snapshotKey)
+            // H1：快照落当前会话的 snapshot.json（按会话分库）；旧键若还在
+            // （迁移未发生的边角）一并清除，防止旧快照复活盖掉新状态
+            let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+            try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            if UserDefaults.standard.object(forKey: Self.snapshotKey) != nil {
+                UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
+            }
         }
     }
 
-    private func clearSnapshot() { UserDefaults.standard.removeObject(forKey: Self.snapshotKey) }
+    private func clearSnapshot() {
+        let url = SessionStore.shared.snapshotURL(for: SessionStore.shared.currentSessionID)
+        try? FileManager.default.removeItem(at: url)
+        UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
+    }
 
     /// 冷启动恢复：只认 24 小时内的非终结快照。恢复后停在「可继续」一侧——运行中
     /// 变已暂停待继续；等待确认／手输原样恢复等待（确认时会重新复核目标，页面已
@@ -1037,7 +1224,7 @@ struct AgentStep: Identifiable {
     /// 对话层据此识别「同一任务的恢复」，不重复回放任务与步流（CRASH-1031
     /// 的持久化去重跨进程成立的前提）。
     private func restoreSnapshotIfNeeded() {
-        guard let data = UserDefaults.standard.data(forKey: Self.snapshotKey),
+        guard let data = loadSnapshotData(),
               let snapshot = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
               Date().timeIntervalSince(snapshot.savedAt) < 24 * 3600, !snapshot.goal.isEmpty else { return }
         goal = snapshot.goal
@@ -1045,6 +1232,16 @@ struct AgentStep: Identifiable {
         limit = snapshot.limit
         stepSeq = snapshot.stepSeq
         steps = snapshot.steps.map { AgentStep(id: $0.id, action: $0.action, reason: $0.reason) }
+        // 状态卡恢复（H1）：快照带卡则原样恢复（关键事实跨进程不丢）；旧
+        // 快照无卡时按已恢复的步流派生一张（目标＋步流里程碑），关键事实
+        // 无从派生则留空——不编造
+        if let card = snapshot.stateCard {
+            stateCard = card
+        } else {
+            var derived = TaskStateCard(goal: snapshot.goal)
+            for step in snapshot.steps { derived.addCompleted("\(step.action)：\(step.reason)") }
+            stateCard = derived
+        }
         if let answers = try? JSONDecoder().decode([QuestionAnswer].self, from: Data(snapshot.answersJSON.utf8)) { answerContext = answers }
         if let names = snapshot.skillNames {
             for name in names {
@@ -1118,6 +1315,8 @@ struct AgentStep: Identifiable {
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; outcomeLedger = []
+        // 状态卡与折叠/重试内存态同样清零：恢复出的卡片只能来自快照（H1）
+        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
         web.resetTabsToStartPage()
         // —— 仅凭落盘恢复 ——
         restoreSnapshotIfNeeded()
@@ -1128,5 +1327,79 @@ struct AgentStep: Identifiable {
         内存态与标签现场已清零并仅凭落盘快照恢复：\(restored ? "目标已恢复为「\(goal)」，步数 \(steps.count) 步在位，待重建标签 \(pendingTabScene?.urls.count ?? 0) 个（其中带地址 \(pendingTabs) 个）" : "未恢复出会话（快照缺失或已过期）")。\
         现在点「继续」：应先回到中断前页面、带着原目标接着完成剩余步骤，不得向你索要网址或进度。
         """
+    }
+
+    // MARK: - 自检八：历史与上下文地基验证（H1）
+
+    /// 纯函数验证（不调模型、不动现役任务状态）：①45 步合成历史在各级
+    /// 折叠下的体量——全量 vs 折叠递减、最紧级别有界、首步成单行流水账、
+    /// 最近一步保留全量；②状态卡——pinnedFacts 原文在卡片注入段里在场，
+    /// 且它不靠历史携带（折叠文本里没有它、卡片独立注入）；③快照往返
+    /// ——带状态卡的快照编解码后卡片字段不丢。返回逐项人读结论（✓/✗ 开头）。
+    func verifyHistoryContextH1() -> [String] {
+        var lines: [String] = []
+        // 合成步流：每步 reason 带一段长文本（模拟粘进 reason 的页面内容）
+        let synthetic: [AgentStep] = (1...45).map { i in
+            AgentStep(id: i, action: "click", reason: "在页面定位并点击目标按钮，页面返回结果 DOMSNIPPET-\(i) " + String(repeating: "长", count: 40))
+        }
+        let full = Self.historyText(steps: synthetic, level: 0)
+        let folded1 = Self.historyText(steps: synthetic, level: 1)
+        let folded2 = Self.historyText(steps: synthetic, level: 2)
+        let folded3 = Self.historyText(steps: synthetic, level: 3)
+        if folded1.count < full.count && folded2.count < folded1.count && folded3.count < folded2.count {
+            lines.append("✓ 确定性折叠递减：45 步历史全量 \(full.count) 字 → 级别1 \(folded1.count) → 级别2 \(folded2.count) → 级别3 \(folded3.count)")
+        } else {
+            lines.append("✗ 确定性折叠未递减：全量 \(full.count)、级别1 \(folded1.count)、级别2 \(folded2.count)、级别3 \(folded3.count)")
+        }
+        if folded3.count < 4000 {
+            lines.append("✓ prompt 有界：最紧折叠下 45 步历史仅 \(folded3.count) 字（界 4000），步数再涨也只按每步一行增长")
+        } else {
+            lines.append("✗ prompt 未有界：最紧折叠下 45 步历史仍有 \(folded3.count) 字")
+        }
+        if folded1.contains("[Step 1] click →") {
+            lines.append("✓ 旧步形态：首步已折叠为单行流水账「[Step 1] click → …」")
+        } else {
+            lines.append("✗ 旧步形态：首步未折叠为单行流水账")
+        }
+        if folded1.contains("45. click:") && folded1.contains("DOMSNIPPET-45") {
+            lines.append("✓ 最近步全量：最后一步（45）在折叠级别 1 下仍保留全量文本")
+        } else {
+            lines.append("✗ 最近步全量：最后一步未保留全量")
+        }
+        if !folded3.contains("DOMSNIPPET-1") && !folded3.contains("DOMSNIPPET-20") {
+            lines.append("✓ 原始长文本退出 prompt：最紧折叠下旧步携带的长文本片段（DOMSNIPPET-1/20）已被截断出局")
+        } else {
+            lines.append("✗ 原始长文本仍在最紧折叠的旧步里")
+        }
+        // 状态卡：关键事实钉入后，注入段原文在场；且折叠文本不携带它
+        var card = TaskStateCard(goal: "自检八合成目标")
+        card.pinFact("用户确认：只用主账号发布")
+        card.addCompleted("navigate：示例页")
+        let block = card.promptBlock()
+        if block.contains("用户确认：只用主账号发布") && block.contains("关键事实（不可丢弃）") {
+            lines.append("✓ 状态卡在场：pinnedFacts 原文在注入段里逐字在场，并带不可丢弃声明")
+        } else {
+            lines.append("✗ 状态卡注入段缺关键事实原文")
+        }
+        if !folded3.contains("只用主账号发布") {
+            lines.append("✓ pinnedFacts 不依赖历史：折叠文本里没有它，它靠状态卡独立注入——历史折叠再紧也不丢")
+        } else {
+            lines.append("✗ pinnedFacts 出现在折叠文本里（口径串位）")
+        }
+        // 快照往返：带卡快照编解码后卡片不丢（按字段比对，避开日期浮点精度）
+        let probe = SessionSnapshot(savedAt: Date(), goal: "自检八合成目标", limit: 25, stepSeq: 0, steps: [],
+                                    statusKind: "paused", statusText: "", pendingActionJSON: nil, pendingElement: nil,
+                                    pendingURL: nil, waiting: nil, answersJSON: "[]", skillNames: nil,
+                                    taskID: nil, tabURLs: nil, activeTabIndex: nil, executionTabIndex: nil,
+                                    outcomes: nil, stateCard: card, sessionID: nil)
+        if let data = try? JSONEncoder().encode(probe),
+           let decoded = try? JSONDecoder().decode(SessionSnapshot.self, from: data),
+           let restoredCard = decoded.stateCard,
+           restoredCard.goal == card.goal && restoredCard.pinnedFacts == card.pinnedFacts && restoredCard.completed == card.completed {
+            lines.append("✓ 快照往返：状态卡随快照编解码不丢（目标/关键事实/已完成逐字一致）")
+        } else {
+            lines.append("✗ 快照往返：状态卡编解码后丢失或变形")
+        }
+        return lines
     }
 }

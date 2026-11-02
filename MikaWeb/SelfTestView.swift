@@ -52,7 +52,34 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
             Text("自检七预期（ZHIHU-COLUMN-SYNC）：本页是计数器驱动的模拟框架编辑器——只有合规输入事件能让字数增长、保存落定，直接改 DOM 的文字会被重渲染冲掉、字数不动。新版 type 应能把两段文字真正写进编辑器内部状态：字数涨到与全文量级一致（约 49 字）、保存状态由『草稿保存中』落定为『草稿已保存』，点『更新』回报『更新成功』。若步流里出现先失败再换策略重试，属预期的自动升级；最终字数仍为 0 或更新失败则不通过。").font(.caption).foregroundStyle(.secondary)
+            Button("自检八：历史分库与上下文地基") {
+                runHistoryContextTest()
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检八预期（H1）：不调用模型、不动现役任务。①会话分库：临时建两个会话各写入 1500 条（超旧全局上限 1000），回读应各 1500 条、互不挤占，当前会话落盘条数不变，临时会话随后连目录删除干净；首次运行新版还应有一条旧对话迁移说明。②确定性折叠：45 步合成历史随折叠级别递减、最紧级别体量有界、首步成单行流水账、最近一步保留全量、旧步长文本被截断出局。③状态卡：pinnedFacts 原文在注入段逐字在场，且不靠历史携带（折叠文本里没有它）。④快照往返：带状态卡的快照编解码后卡片不丢。结论逐条写进对话。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检八编排（H1）：会话分库隔离（SessionStore 临时会话写入/回读/删除）
+    /// ＋引擎侧纯函数验证（折叠/状态卡/快照往返），全部结论以「自检八」
+    /// 条目写进对话（条目独立落盘，事后可查）。不调用模型、不起任务，
+    /// 因此不要求 API Key；临时会话删除后不留痕。
+    private func runHistoryContextTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检八：开始——会话级分库、确定性折叠、状态卡与快照往返（不调用模型）")
+        var lines: [String] = []
+        lines += SessionStore.shared.verifyScratchSessionsH1()
+        lines += engine.verifyHistoryContextH1()
+        let disk = conversation.onDiskEntryCount()
+        if let disk {
+            lines.append("当前会话落盘条数 \(disk)，与内存条数 \(conversation.entries.count) 对照（攒批未刷的条目会让落盘暂多于内存，属正常）")
+        } else {
+            lines.append("✗ 当前会话落盘条数读取失败（文件解码异常）")
+        }
+        for line in lines { conversation.localFeedback("自检八：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检八结论：全部通过——分库隔离、折叠有界、状态卡不丢、快照往返均成立" : "自检八结论：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检四编排（RESUME-CONTEXT-FIX）：起本地表单任务 → 等它跑出至少 2 步
