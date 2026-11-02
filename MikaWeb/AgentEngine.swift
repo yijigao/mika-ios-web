@@ -131,6 +131,10 @@ struct AgentStep: Identifiable {
     /// 本轮刚落记／更新的台账说明：由 launch 在记完本步动作后补一条 outcome
     /// 步进轨迹，保证步序是「动作 → 台账」而不是反过来。
     private var pendingOutcomeStep: String?
+    /// 本轮动作后核验的提示步（VERIFY-1）：核验在 runTargeted 内随落记
+    /// 运行，步文案经此暂存、由 flushPendingOutcomeStep 在 outcome 步
+    /// 之后补入（步序「动作 → 台账 → 核验」）；runConfirmed 路径就地消费。
+    private var pendingVerificationStep: String?
     /// 本任务最近的打字内容（提交指纹的来源）：只留内存、最近 5 条；优先取
     /// 编辑器／textarea 的输入，回退任意字段的最近输入。start() 清空——新
     /// 任务的提交若无打字记录，软门按页面＋按钮标识匹配（追问场景正是此路）。
@@ -251,7 +255,7 @@ struct AgentStep: Identifiable {
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
         // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
-        recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
+        recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = UUID()
@@ -463,7 +467,7 @@ struct AgentStep: Identifiable {
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         conversationTaskID = nil; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
-        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil
+        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         discardPendingUpload()
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
         runStartedAt = nil; activeRunContext = nil
@@ -887,8 +891,11 @@ struct AgentStep: Identifiable {
             record(saved.0)
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
             // 指示，此路不设软门；台账记下后防的是后续轮次的无意识重复）
-            if let note = noteSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2) {
-                appendStep("outcome", note)
+            if let outcome = noteSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2) {
+                appendStep("outcome", outcome.note)
+                // VERIFY-1：确认路径同样过独立核验（shadow 记录，就地补步）
+                await runPostSubmissionVerification(recordID: outcome.recordID, element: target, pageURL: saved.2, before: page, token: token)
+                if let vstep = pendingVerificationStep { appendStep("verify", vstep); pendingVerificationStep = nil }
             }
             try await Task.sleep(for: .milliseconds(500))
             return .proceed
@@ -1125,7 +1132,12 @@ struct AgentStep: Identifiable {
                 // 成功再落台账条目（说明经 pendingOutcomeStep 由调用方补步）
                 if action.action == "type" { noteTypedContent(action: action, element: target) }
                 if action.action == "click" {
-                    pendingOutcomeStep = noteSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url)
+                    if let outcome = noteSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url) {
+                        pendingOutcomeStep = outcome.note
+                        // VERIFY-1：落记后随即独立核验（shadow，verify 步经
+                        // pendingVerificationStep 在 outcome 步之后补入）
+                        await runPostSubmissionVerification(recordID: outcome.recordID, element: target, pageURL: snapshot.url, before: modelPage, token: token)
+                    }
                 }
                 return .executed
             } catch {
@@ -1350,10 +1362,11 @@ struct AgentStep: Identifiable {
     }
 
     /// 提交类点击真正执行成功后的落记（runTargeted 自主路径与 runConfirmed
-    /// 确认路径共用）：返回要补进轨迹的 outcome 步文案，非提交类返回 nil。
+    /// 确认路径共用）：返回要补进轨迹的 outcome 步文案与台账条目 id
+    /// （VERIFY-1 核验记录据此关联），非提交类返回 nil。
     /// 同一性命中已有条目时不重复建条——更新其时间与状态并注明再次提交
     /// （软门已提醒后坚持执行、或经用户确认执行的重发走的正是这条）。
-    private func noteSubmissionIfNeeded(action: AgentAction, element: PageElement, pageURL: String) -> String? {
+    private func noteSubmissionIfNeeded(action: AgentAction, element: PageElement, pageURL: String) -> (note: String, recordID: UUID)? {
         guard action.action == "click", SubmissionClassifier.isSubmissionElement(element) else { return nil }
         let (hash, prefix) = currentContentFingerprint()
         let host = URL(string: pageURL)?.host ?? ""
@@ -1363,7 +1376,7 @@ struct AgentStep: Identifiable {
             outcomeLedger[index].resubmittedAt = Date()
             outcomeLedger[index].statusNote = "再次提交（经提醒或用户确认后执行），待核查"
             saveOutcomeLedger()
-            return "成果台账更新：同一内容已再次提交（「\(label)」），条目时间与状态已更新——后续仍按已提交内容对待，不得无意识再发"
+            return ("成果台账更新：同一内容已再次提交（「\(label)」），条目时间与状态已更新——后续仍按已提交内容对待，不得无意识再发", outcomeLedger[index].id)
         }
         let record = OutcomeRecord(id: UUID(), pageURL: pageURL, host: host, elementLabel: label,
                                     contentFingerprint: hash, contentPrefix: prefix,
@@ -1371,7 +1384,69 @@ struct AgentStep: Identifiable {
         outcomeLedger.append(record)
         saveOutcomeLedger()
         let contentDesc = prefix.isEmpty ? "（正文未留指纹，按页面与按钮记账）" : "内容「\(prefix)…」"
-        return "成果台账已记录：\(Self.outcomeTime(record.recordedAt)) 在 \(host.isEmpty ? "本地页面" : host) 提交了\(contentDesc)（按钮「\(label)」），状态：已提交（待核查）"
+        return ("成果台账已记录：\(Self.outcomeTime(record.recordedAt)) 在 \(host.isEmpty ? "本地页面" : host) 提交了\(contentDesc)（按钮「\(label)」），状态：已提交（待核查）", record.id)
+    }
+
+    // MARK: - 动作后核验（VERIFY-1：shadow 记录，不阻断、不重放）
+
+    /// 台账落记后随即运行的独立核验：settle 采样取新鲜证据 →
+    /// ActionVerifier 三值判定 → 记录 append 落盘 verification-log
+    /// .jsonl（台账旁记录）→ 步流补一条 verify 提示步（经
+    /// pendingVerificationStep 在 outcome 步之后补入，runConfirmed 路径
+    /// 就地补）。shadow 口径：判定只记录与提示——不改台账状态、不拦
+    /// 动作、不自动重提/重发；unknown 只提示，contradicted 只标分歧，
+    /// 是否转正式阻断门留待 shadow 数据裁决。全程不抛错：取证异常
+    /// 本身记为 unknown，绝不让核验层把已执行的动作拖成失败。
+    private func runPostSubmissionVerification(recordID: UUID, element: PageElement, pageURL: String, before: PageState, token: UUID) async {
+        let prefix = outcomeLedger.first(where: { $0.id == recordID })?.contentPrefix ?? currentContentFingerprint().prefix
+        let label = Self.elementLabel(of: element)
+        let capture = await web.settledCapture()
+        guard token == generation else { return }
+        let result = ActionVerifier.judge(before: before, after: capture.after, samples: capture.samples,
+                                          settled: capture.settled, contentPrefix: prefix)
+        let record = ActionVerifier.makeRecord(sessionID: runSessionID.uuidString, outcomeRecordID: recordID,
+                                               actionLabel: label, pageURL: pageURL, result: result, settled: capture.settled)
+        VerificationLogStore.shared.append(record)
+        let evidenceText = result.evidence.first ?? result.weakEvidence.first ?? "无 conclusive 证据"
+        switch result.verdict {
+        case .verified:
+            pendingVerificationStep = "动作后核验（影子记录）：verified——\(evidenceText)。该结论由核验层独立回读得出，与台账「待核查」并存记录，不改变流程。"
+        case .contradicted:
+            pendingVerificationStep = "动作后核验（影子记录）：contradicted——\(evidenceText)。核验与执行器自报（已提交）分歧，已落盘记录；shadow 期只提示不阻断、不自动重发，请结合页面现状判断。"
+        case .unknown:
+            pendingVerificationStep = "动作后核验（影子记录）：unknown——\(evidenceText)。证据不足以下结论，仅提示不阻断、不自动重发；需要确认现状时按台账口径去列表/记录页核查。"
+        }
+    }
+
+    /// 自检十三 Tier A（VERIFY-1）：核验合约全链程序化核查——
+    /// WebController 在合成页 test-verify 真实驱动四场景（三值＋证据
+    /// 未稳），产出的记录在本层做落盘往返与分歧统计核对（临时日志，
+    /// 不污染正式 shadow 数据）。不调用模型；要求引擎空闲（驱动会占
+    /// 用当前标签页打开合成页）。
+    func verifyActionVerificationContract() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检十三 Tier A 未执行（先等当前任务终结或停止）"] }
+        var lines: [String] = []
+        let (webLines, records) = await web.verifyActionVerificationContract()
+        lines += webLines
+        guard records.count == 4 else {
+            lines.append("✗ 核验记录产出不全（\(records.count)/4），落盘往返未执行")
+            return lines
+        }
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("verification-log-selftest.jsonl")
+        try? FileManager.default.removeItem(at: tempURL)
+        let store = VerificationLogStore(fileURL: tempURL)
+        for record in records { store.append(record) }
+        let loaded = store.loadAll()
+        lines.append(loaded.count == records.count && zip(loaded, records).allSatisfy { $0.verdict == $1.verdict && $0.id == $1.id }
+            ? "✓ 核验记录落盘往返：4 条记录逐行写入 JSONL 后回读，条数/判定/id 逐条一致"
+            : "✗ 核验记录落盘往返异常（回读 \(loaded.count) 条）")
+        let stats = store.stats(from: loaded)
+        lines.append(stats.total == 4 && stats.verified == 1 && stats.contradicted == 1 && stats.unknown == 2 && stats.diverged == 1
+            ? "✓ 分歧统计口径：total 4＝verified 1＋contradicted 1＋unknown 2，diverged 1（与 contradicted 互为校验）"
+            : "✗ 分歧统计异常（total \(stats.total)、verified \(stats.verified)、contradicted \(stats.contradicted)、unknown \(stats.unknown)、diverged \(stats.diverged)）")
+        try? FileManager.default.removeItem(at: tempURL)
+        lines.append("· 正式核验日志（verification-log.jsonl）当前累计 \(VerificationLogStore.shared.loadAll().count) 条 shadow 记录（只由真机任务流产生，自检合成记录不入此账）")
+        return lines
     }
 
     /// 重复提交软门：本次自主点击若命中台账里同一条目、且该条目本进程内
@@ -1422,6 +1497,7 @@ struct AgentStep: Identifiable {
 
     private func flushPendingOutcomeStep() {
         if let note = pendingOutcomeStep { appendStep("outcome", note); pendingOutcomeStep = nil }
+        if let vstep = pendingVerificationStep { appendStep("verify", vstep); pendingVerificationStep = nil }
     }
 
     /// 自检六只读口径：台账条数与最近一条的人读摘要。
@@ -1936,7 +2012,7 @@ struct AgentStep: Identifiable {
         discardPendingUpload()
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
-        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; outcomeLedger = []
+        recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil; outcomeLedger = []
         // 状态卡与折叠/重试内存态同样清零：恢复出的卡片只能来自快照（H1）
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
         web.resetTabsToStartPage(sessionID: runSessionID)

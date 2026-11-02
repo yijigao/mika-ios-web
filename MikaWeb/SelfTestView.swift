@@ -8,6 +8,7 @@ struct SelfTestView: View {
     @State private var outcomeTestRunning = false
     @State private var multiSessionTestRunning = false
     @State private var coverModalTestRunning = false
+    @State private var verifyContractTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -84,7 +85,33 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!(settings.hasKey || settings.chatGPTAuth.isLoggedIn) || !engine.active)
             Text("自检十二预期（ZHUANLAN-FIX2）：本页内嵌真正的 Draft.js（0.11.7），初始正文 102 字（模拟知乎专栏待改的已发布文章），字数与保存状态全由 EditorState 驱动。type 应走粘贴事务整段替换：字数由 102 变为与目标全文一致的 54（不是 102＋54 的追加）、保存状态落定为『草稿已保存』，点『更新』回报『更新成功：正文共 54 字』。若字数仍为 102（冻结）或变成 156（只追加没替换）则不通过；步流里出现换策略重试属预期自动升级，最终以字数与更新结果为准。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十三：动作后核验合约") {
+                guard !verifyContractTestRunning else { return }
+                verifyContractTestRunning = true
+                runVerifyContractTest()
+                dismiss()
+            }.disabled(!engine.active || verifyContractTestRunning)
+            Text("自检十三预期（VERIFY-1）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-verify）：四场景真实驱动「点击→settle 采样→独立判定」——甲发布后条目进列表应凭回读证据判 verified；乙只有短暂提示（toast）应判 unknown（toast 只记弱证据）；丙被页面明确拒绝应判 contradicted 且记录与自报分歧（diverged）；丁页面持续变化、settle 有界超时应记「证据未稳」判 unknown（超时不算成功）。四条记录写临时日志做落盘往返与分歧统计核对后删净，不污染正式 shadow 账。Tier B 真机人工（步骤见案卷 VERIFY-1-IMPL 的复测清单）：知乎专栏改长文原场景与公众号存草稿场景各跑一遍，看步流出现「动作后核验（影子记录）」步、正式日志新增对应记录、判定与页面实况一致。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检十三 Tier A 编排（VERIFY-1）：核验合约全链程序化核查
+    /// （WebController 在合成页 test-verify 真实驱动四场景的三值判定，
+    /// 引擎侧再做记录落盘往返与分歧统计核对），全部结论以「自检十三」
+    /// 条目写进对话。不调用模型、不起任务；要求引擎空闲（驱动会占用
+    /// 当前标签页打开合成页）。Tier B（知乎专栏/公众号真机场景）步骤
+    /// 与预期见上方说明与案卷复测清单，不在本按钮内自动执行。
+    private func runVerifyContractTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检十三：开始——Tier A 核验合约四场景程序化核查（不调用模型）")
+        Task { @MainActor in
+            defer { verifyContractTestRunning = false }
+            let lines = await engine.verifyActionVerificationContract()
+            for line in lines { conversation.localFeedback("自检十三：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检十三结论（Tier A）：全部通过——三值判定（回读 verified／toast-only unknown／明确拒绝 contradicted）、证据未稳口径、记录落盘往返与分歧统计均成立；Tier B 真机场景按案卷清单人工复测" : "自检十三结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
+        }
     }
 
     /// 自检十一 Tier A 编排（COVER-CONSENT）：封面自产程序化核查

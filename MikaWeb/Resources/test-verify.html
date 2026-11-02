@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mika 本地核验合约页</title>
+<style>body{font:20px system-ui;margin:24px}textarea{width:95%;height:90px;font:inherit;display:block}input{width:95%;font:inherit;display:block}button{display:block;margin:12px 0;font:inherit;padding:10px 22px}li{margin:8px 0}section{border-top:2px solid #ccc;padding-top:8px;margin-top:20px}#toastB{position:fixed;top:16px;right:16px;background:#333;color:#fff;padding:10px 18px;border-radius:8px;display:none}</style>
+<h1>核验合约合成页</h1>
+<p>本页供自检十三驱动：四个场景分别对应核验三值与证据未稳。静态文案刻意不含成功/失败类字样，结果文案全部由点按后脚本写入。</p>
+
+<section>
+<h2>场景甲：发布后条目进入列表</h2>
+<textarea id="taA">自检十三稿件甲：核验合约的回读场景正文。</textarea>
+<button id="btnA" type="button">发布甲</button>
+<p id="statusA" role="status"></p>
+<p>条目数：<span id="countA">0</span></p>
+<ul id="listA"></ul>
+</section>
+
+<section>
+<h2>场景乙：只有短暂提示</h2>
+<input id="inB" value="自检十三场景乙内容">
+<button id="btnB" type="button">发送乙</button>
+<div id="toastB">已发送</div>
+</section>
+
+<section>
+<h2>场景丙：提交被明确驳回</h2>
+<textarea id="taC">自检十三场景丙正文样本。</textarea>
+<button id="btnC" type="button">提交丙</button>
+<p id="statusC" role="status"></p>
+</section>
+
+<section>
+<h2>场景丁：页面持续变化不收口</h2>
+<p id="counterD">计数：0</p>
+<button id="btnD" type="button">发布丁</button>
+</section>
+
+<script>
+var nA=0;
+document.getElementById('btnA').addEventListener('click',function(){
+  var text=document.getElementById('taA').value.trim();
+  setTimeout(function(){
+    nA+=1;
+    var li=document.createElement('li');
+    li.textContent='条目'+nA+'：'+text.slice(0,30)+'——状态：审核中';
+    document.getElementById('listA').appendChild(li);
+    document.getElementById('countA').textContent=String(nA);
+    document.getElementById('statusA').textContent='发布成功：条目'+nA+'已提交';
+  },400);
+});
+document.getElementById('btnB').addEventListener('click',function(){
+  var toast=document.getElementById('toastB');
+  toast.style.display='block';
+  setTimeout(function(){toast.style.display='none';},1100);
+});
+document.getElementById('btnC').addEventListener('click',function(){
+  document.getElementById('statusC').textContent='提交失败：内容含有敏感词，未通过审核';
+});
+var nD=0,timerD=null;
+document.getElementById('btnD').addEventListener('click',function(){
+  if(timerD)return;
+  timerD=setInterval(function(){
+    nD+=1;
+    document.getElementById('counterD').textContent='计数：'+nD+('·'.repeat(nD%40));
+  },120);
+});
+window.__verifyState=function(){
+  return JSON.stringify({listA:document.querySelectorAll('#listA li').length,
+    statusC:document.getElementById('statusC').textContent,
+    counterD:nD});
+};
+</script></html>

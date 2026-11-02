@@ -1526,6 +1526,156 @@ enum SiteMode: String {
         return lines
     }
 
+    // MARK: - VERIFY-1：动作后取证采样器（settled-capture 的 DOM 版）
+
+    /// settle 采样探针：与 PageState 同口径的可见正文（供采样帧与 toast
+    /// 捕捉），外加页面签名（就绪态/正文长度/正文哈希/节点数/文档高度）
+    /// 与网络空闲判据（performance 资源计时里最近一次响应结束时刻）。
+    private static let settleProbe = #"""
+    (()=>{const vis=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
+    let text='',n;const w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+    while((n=w.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&vis(n.parentElement))text+=n.textContent.trim()+' ';}
+    let h=0;for(let i=0;i<text.length;i++){h=((h<<5)-h+text.charCodeAt(i))|0;}
+    let lastEnd=0;try{const es=performance.getEntriesByType('resource');for(const e of es){if(e.responseEnd>lastEnd)lastEnd=e.responseEnd;}}catch(_){}
+    return JSON.stringify({url:location.href,text:text,sig:[document.readyState,text.length,h,document.querySelectorAll('*').length,document.documentElement?document.documentElement.scrollHeight:0].join('|'),lastEnd:lastEnd,now:performance.now()});})()
+    """#
+
+    private struct SettleProbeResult: Decodable {
+        let url: String
+        let text: String
+        let sig: String
+        let lastEnd: Double
+        let now: Double
+    }
+
+    /// settle 采样结果：采样帧序列＋是否在有界窗口内收口（页面签名连续
+    /// 稳定且网络空闲）＋收口后的完整快照（导航/代次变化后重新抽取，
+    /// 不用旧定位——state() 本身就是对当前执行页的重新抽取）。
+    struct SettledCapture {
+        let samples: [VerificationSample]
+        let settled: Bool
+        let after: PageState
+    }
+
+    /// 动作后取证：每 300ms 探一帧，签名连续 3 帧不变且最近网络响应
+    /// 已结束 600ms 以上判 settled；有界超时（默认 5 秒）只记证据未稳，
+    /// 不算成功、不抛错。全程尽力而为：探针失败帧直接跳过。
+    func settledCapture(timeoutMs: Int = 5000) async -> SettledCapture {
+        let tab = executionTab
+        var samples: [VerificationSample] = []
+        var lastSig: String?
+        var stableRepeats = 0
+        var settled = false
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        while Date() < deadline {
+            if agentWorkSuspended { break }
+            if let raw = (try? await evaluate(Self.settleProbe, on: tab)) as? String,
+               let probe = try? JSONDecoder().decode(SettleProbeResult.self, from: Data(raw.utf8)) {
+                samples.append(VerificationSample(url: probe.url, text: probe.text))
+                let networkQuiet = probe.lastEnd == 0 || (probe.now - probe.lastEnd) > 600
+                if probe.sig == lastSig, networkQuiet {
+                    stableRepeats += 1
+                } else {
+                    stableRepeats = 0
+                }
+                lastSig = probe.sig
+                if stableRepeats >= 2 { settled = true; break }
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        let after: PageState
+        if let fresh = try? await state() {
+            after = fresh
+        } else if let last = samples.last {
+            after = PageState(url: last.url, title: "", text: last.text, elements: [])
+        } else {
+            after = PageState(url: tab.webView.url?.absoluteString ?? "", title: "", text: "", elements: [])
+        }
+        return SettledCapture(samples: samples, settled: settled, after: after)
+    }
+
+    // MARK: - 自检十三 Tier A（VERIFY-1）：核验合约的合成页全链驱动
+    //
+    // 在本地合成页 test-verify 上真实驱动（不调用模型）：四场景逐个走
+    // 「取动作前快照→引擎 click→settle 采样→ActionVerifier 判定」，断言
+    // 三值与证据未稳口径：甲＝回读证据 verified、乙＝只有 toast 判
+    /// unknown、丙＝明确拒绝 contradicted（且与自报分歧）、丁＝页面持续
+    // 变化 settle 超时判 unknown。产出的记录回引擎做落盘往返核对（写
+    // 临时日志，不污染正式 shadow 统计）。核查在当前标签页进行，结束
+    // 时页面留在该测试页上（与自检十一同形态）。
+
+    func verifyActionVerificationContract() async -> (lines: [String], records: [VerificationRecord]) {
+        var lines: [String] = []
+        var records: [VerificationRecord] = []
+        let tab = activeTab
+        do { try tab.loadLocal("test-verify") } catch {
+            return (["✗ 合成测试页 test-verify 加载失败：\(error.localizedDescription)"], [])
+        }
+        try? await Task.sleep(for: .milliseconds(1000))
+
+        // 单场景驱动：找到按钮→记动作前快照→click→采样判定→组装记录
+        func drive(buttonText: String, content: String, timeoutMs: Int) async -> (ActionVerifier.Result, SettledCapture, PageState)? {
+            guard let before = try? await state(),
+                  let target = before.elements.first(where: { $0.text.contains(buttonText) }),
+                  let click = Self.selfTestClickAction(index: target.index) else { return nil }
+            do { try await execute(click, expected: target) } catch { return nil }
+            let capture = await settledCapture(timeoutMs: timeoutMs)
+            let prefix = SubmissionClassifier.contentFingerprint(of: content).prefix
+            let result = ActionVerifier.judge(before: before, after: capture.after, samples: capture.samples,
+                                              settled: capture.settled, contentPrefix: prefix)
+            return (result, capture, before)
+        }
+
+        // —— 场景甲：发布后条目进列表（回读证据）→ verified ——
+        if let (result, capture, before) = await drive(buttonText: "发布甲", content: "自检十三稿件甲：核验合约的回读场景正文。", timeoutMs: 5000) {
+            let record = ActionVerifier.makeRecord(sessionID: tab.sessionID.uuidString, outcomeRecordID: nil,
+                                                   actionLabel: "发布甲", pageURL: before.url, result: result, settled: capture.settled)
+            records.append(record)
+            lines.append(result.verdict == .verified && result.evidence.contains(where: { $0.contains("回读证据") })
+                ? "✓ 场景甲：发布后条目进入列表——回读证据成立，判定 verified（证据：\(result.evidence.first ?? "")）"
+                : "✗ 场景甲判定异常：\(result.verdict.rawValue)（证据 \(result.evidence)）")
+        } else {
+            lines.append("✗ 场景甲驱动失败（按钮定位或点击异常）")
+        }
+
+        // —— 场景乙：只有 toast → 弱证据，unknown ——
+        if let (result, capture, before) = await drive(buttonText: "发送乙", content: "自检十三场景乙内容", timeoutMs: 5000) {
+            let record = ActionVerifier.makeRecord(sessionID: tab.sessionID.uuidString, outcomeRecordID: nil,
+                                                   actionLabel: "发送乙", pageURL: before.url, result: result, settled: capture.settled)
+            records.append(record)
+            lines.append(result.verdict == .unknown
+                ? "✓ 场景乙：只有短暂提示、无回读证据——判定 unknown（toast 只记弱证据，不单独构成 verified）"
+                : "✗ 场景乙判定异常：\(result.verdict.rawValue)（toast 被误判为 conclusive 证据）")
+        } else {
+            lines.append("✗ 场景乙驱动失败（按钮定位或点击异常）")
+        }
+
+        // —— 场景丙：明确拒绝 → contradicted 且与自报分歧 ——
+        if let (result, capture, before) = await drive(buttonText: "提交丙", content: "自检十三场景丙正文样本。", timeoutMs: 5000) {
+            let record = ActionVerifier.makeRecord(sessionID: tab.sessionID.uuidString, outcomeRecordID: nil,
+                                                   actionLabel: "提交丙", pageURL: before.url, result: result, settled: capture.settled)
+            records.append(record)
+            lines.append(result.verdict == .contradicted && record.diverged
+                ? "✓ 场景丙：页面明确拒绝——判定 contradicted，记录 diverged=true（与执行器自报分歧成立）"
+                : "✗ 场景丙判定异常：\(result.verdict.rawValue)（diverged=\(record.diverged)）")
+        } else {
+            lines.append("✗ 场景丙驱动失败（按钮定位或点击异常）")
+        }
+
+        // —— 场景丁：页面持续变化 → settle 超时，证据未稳，unknown ——
+        if let (result, capture, before) = await drive(buttonText: "发布丁", content: "", timeoutMs: 2600) {
+            let record = ActionVerifier.makeRecord(sessionID: tab.sessionID.uuidString, outcomeRecordID: nil,
+                                                   actionLabel: "发布丁", pageURL: before.url, result: result, settled: capture.settled)
+            records.append(record)
+            lines.append(!capture.settled && result.verdict == .unknown && result.evidence.contains(where: { $0.contains("证据未稳") })
+                ? "✓ 场景丁：页面持续变化、settle 有界超时——记录「证据未稳」，判定 unknown（超时不算成功）"
+                : "✗ 场景丁判定异常：settled=\(capture.settled)、verdict=\(result.verdict.rawValue)")
+        } else {
+            lines.append("✗ 场景丁驱动失败（按钮定位或点击异常）")
+        }
+        return (lines, records)
+    }
+
     // MARK: - 失败留证（写入既有 DiagnosticStore 通道：同目录、同信封格式，诊断页可见）
 
     /// agent 操作失败时存一份快照：页面截图（JPEG base64）＋精简 DOM 摘要（候选按钮与禁用状态）。
