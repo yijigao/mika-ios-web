@@ -44,6 +44,18 @@ enum ModelProvider: String, CaseIterable, Identifiable {
         }
     }
 }
+/// 模型来源：API Key（既有通道）或 ChatGPT 订阅（OAuth 登录，Joey 2026-11-02 新增）。
+/// 两条通道并存，用户在设置页切换当前生效来源；互不影响对方的凭据与配置。
+enum ModelSource: String, CaseIterable, Identifiable {
+    case apiKey, chatGPT
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .apiKey: return "API Key"
+        case .chatGPT: return "ChatGPT 订阅"
+        }
+    }
+}
 struct ModelNameValidationIssue {
     enum Kind { case empty, providerTitle }
     let kind: Kind
@@ -64,6 +76,17 @@ struct ModelNameValidationIssue {
     }
     @Published private(set) var provider: ModelProvider
     @Published private(set) var hasKey = !Keychain.read().isEmpty
+    // MARK: ChatGPT 订阅通道（与 API Key 通道并存）
+    /// 订阅 OAuth 管理器：由本 Store 持有（AppObjectGraph 内部），不进 App struct。
+    let chatGPTAuth = ChatGPTAuth()
+    @Published var modelSource: ModelSource { didSet { UserDefaults.standard.set(modelSource.rawValue, forKey: "modelSource") } }
+    /// 订阅通道的模型名：可编辑；登录后以账号实际目录（discoverModels）为准。
+    @Published var chatGPTModel = UserDefaults.standard.string(forKey: "chatGPTModel") ?? "gpt-5.2-codex" { didSet { UserDefaults.standard.set(chatGPTModel, forKey: "chatGPTModel") } }
+    /// 上次成功拉取的账号模型目录缓存（登录后刷新；拉不到时用 fallbackModels 提示）。
+    @Published var chatGPTModels: [String] = UserDefaults.standard.stringArray(forKey: "chatGPTModels") ?? [] { didSet { UserDefaults.standard.set(chatGPTModels, forKey: "chatGPTModels") } }
+    /// 未拉到账号目录时的内置候选。来源：OpenMinis 内置 Codex 模型表与其记录的
+    /// Codex 后端目录（2026-11-02 研究时点）；仅作快捷填写，是否可用以账号实测为准。
+    static let chatGPTFallbackModels = ["gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5-codex", "gpt-5-codex-mini"]
     static func validateModelName(_ rawValue: String, provider: ModelProvider) -> ModelNameValidationIssue? {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let extra = provider == .custom ? " 请以你的网关支持的模型名为准。" : ""
@@ -78,6 +101,7 @@ struct ModelNameValidationIssue {
         let normalizedSteps = min(50, max(5, savedSteps))
         maxSteps = normalizedSteps
         if savedSteps != normalizedSteps { UserDefaults.standard.set(normalizedSteps, forKey: "maxSteps") }
+        modelSource = ModelSource(rawValue: UserDefaults.standard.string(forKey: "modelSource") ?? "") ?? .apiKey
         if let raw = UserDefaults.standard.string(forKey: "provider"), let saved = ModelProvider(rawValue: raw) {
             provider = saved
         } else {
@@ -110,17 +134,43 @@ struct SettingsView: View {
     @State private var testing = false
     @State private var testSuccess = ""
     @State private var testFailure = ""
+    @State private var subBusy = false
+    @State private var subSuccess = ""
+    @State private var subFailure = ""
     var body: some View {
         Form {
             Section("当前配置") {
-                LabeledContent("服务商", value: settings.provider.title)
-                LabeledContent("模型", value: settings.model.isEmpty ? "未填写" : settings.model)
-                LabeledContent("API Key") {
-                    Text(settings.hasKey ? "已配置" : "未配置")
-                        .foregroundStyle(settings.hasKey ? .green : .orange)
-                        .fontWeight(.medium)
+                LabeledContent("模型来源", value: settings.modelSource.title)
+                if settings.modelSource == .chatGPT {
+                    LabeledContent("模型", value: settings.chatGPTModel.isEmpty ? "未填写" : settings.chatGPTModel)
+                    LabeledContent("ChatGPT 登录") {
+                        Text(settings.chatGPTAuth.isLoggedIn ? "已登录" : "未登录")
+                            .foregroundStyle(settings.chatGPTAuth.isLoggedIn ? .green : .orange)
+                            .fontWeight(.medium)
+                    }
+                } else {
+                    LabeledContent("服务商", value: settings.provider.title)
+                    LabeledContent("模型", value: settings.model.isEmpty ? "未填写" : settings.model)
+                    LabeledContent("API Key") {
+                        Text(settings.hasKey ? "已配置" : "未配置")
+                            .foregroundStyle(settings.hasKey ? .green : .orange)
+                            .fontWeight(.medium)
+                    }
                 }
             }
+            Section {
+                Picker("模型来源", selection: $settings.modelSource) {
+                    ForEach(ModelSource.allCases) { source in
+                        Text(source.title).tag(source)
+                    }
+                }.pickerStyle(.inline).labelsHidden()
+                Text("两种来源并存、互不影响：API Key 用你在服务商申请的 Key 按量计费；ChatGPT 订阅用你已付费的 ChatGPT 订阅账号登录后直接使用订阅额度。切换来源不会删除另一条通道的配置。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("第零步 · 选择模型来源") }
+            if settings.modelSource == .chatGPT {
+                chatGPTSection
+            }
+            if settings.modelSource == .apiKey {
             Section {
                 Picker("服务商", selection: Binding(get: { settings.provider }, set: { settings.applyProvider($0); testSuccess = ""; testFailure = "" })) {
                     ForEach(ModelProvider.allCases) { item in
@@ -175,6 +225,7 @@ struct SettingsView: View {
                     }
                 }
             } header: { Text("第二步 · 填 Key 并测试") }
+            }
             Section {
                 HStack { Text("最大步数"); Spacer(); Text("\(settings.maxSteps)").monospacedDigit().fontWeight(.semibold); Stepper("最大步数", value: $settings.maxSteps, in: 5...50).labelsHidden() }
                 Text("达到上限后暂停，可继续任务。").font(.caption).foregroundStyle(.secondary)
@@ -202,6 +253,108 @@ struct SettingsView: View {
             } header: { Text("Playbook（经验手册）") }
             if let diagnostics { Section { NavigationLink("崩溃报告") { CrashReportsView(store: diagnostics) } } }
         }.navigationTitle("设置")
+    }
+    /// ChatGPT 订阅来源的设置区：登录状态、登录/退出、订阅模型选择与连接测试。
+    private var chatGPTSection: some View {
+        Section {
+            if settings.chatGPTAuth.isLoggedIn {
+                if let email = settings.chatGPTAuth.accountEmail, !email.isEmpty {
+                    LabeledContent("账号", value: email)
+                } else {
+                    LabeledContent("账号", value: "已登录")
+                }
+                if let plan = settings.chatGPTAuth.planType, !plan.isEmpty {
+                    LabeledContent("订阅套餐", value: plan)
+                }
+                Button("退出登录", role: .destructive) {
+                    settings.chatGPTAuth.logout()
+                    subSuccess = ""; subFailure = "已退出 ChatGPT 登录"
+                }
+            } else {
+                Text("点下方按钮会打开 OpenAI 官方授权页，用你的 ChatGPT 账号登录并授权。授权全程在 OpenAI 页面完成，Mika Web 不接触你的账号密码；登录凭据只保存在这台手机的钥匙串里。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button {
+                    Task { await runSubscriptionLogin() }
+                } label: {
+                    HStack {
+                        if settings.chatGPTAuth.isAuthenticating { ProgressView() }
+                        Text(settings.chatGPTAuth.isAuthenticating ? "等待你在授权页完成登录…" : "用 ChatGPT 登录")
+                    }
+                }.disabled(settings.chatGPTAuth.isAuthenticating)
+            }
+            TextField("模型名", text: $settings.chatGPTModel).textInputAutocapitalization(.never).autocorrectionDisabled()
+            let candidates = settings.chatGPTModels.isEmpty ? SettingsStore.chatGPTFallbackModels : settings.chatGPTModels
+            ScrollView(.horizontal) { HStack { ForEach(candidates, id: \.self) { name in Button(name) { settings.chatGPTModel = name } .buttonStyle(.bordered) } } }
+            Text(settings.chatGPTModels.isEmpty
+                 ? "模型候选为内置清单（来源：Codex 客户端公开的模型表）；登录后点「刷新模型列表」会换成你账号实际可用的目录。是否可用以账号实测为准。"
+                 : "模型候选来自你账号的实际目录。")
+                .font(.caption).foregroundStyle(.secondary)
+            if settings.chatGPTAuth.isLoggedIn {
+                Button {
+                    Task { await refreshSubscriptionModels() }
+                } label: {
+                    HStack {
+                        if subBusy { ProgressView() }
+                        Text(subBusy ? "正在刷新…" : "刷新模型列表")
+                    }
+                }.disabled(subBusy)
+                Button {
+                    Task { await testSubscription() }
+                } label: {
+                    HStack {
+                        if subBusy { ProgressView() }
+                        Text(subBusy ? "正在测试…" : "测试订阅连接")
+                    }
+                }.disabled(subBusy)
+            }
+            if !subSuccess.isEmpty {
+                Label(subSuccess, systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.callout)
+            }
+            if !subFailure.isEmpty {
+                Label(subFailure, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.callout).textSelection(.enabled)
+            }
+        } header: { Text("ChatGPT 订阅") }
+    }
+    private func runSubscriptionLogin() async {
+        subSuccess = ""; subFailure = ""
+        do {
+            try await settings.chatGPTAuth.login()
+            subSuccess = "登录成功：\(settings.chatGPTAuth.accountEmail ?? "ChatGPT 账号")"
+            await refreshSubscriptionModels()
+        } catch {
+            subFailure = error.localizedDescription
+        }
+    }
+    private func refreshSubscriptionModels() async {
+        subBusy = true
+        do {
+            let models = try await settings.chatGPTAuth.discoverModels()
+            settings.chatGPTModels = models
+            if !models.contains(settings.chatGPTModel), let first = models.first {
+                settings.chatGPTModel = first
+            }
+            subBusy = false
+            subSuccess = "已刷新模型列表：共 \(models.count) 个可用模型"
+        } catch {
+            subBusy = false
+            subFailure = error.localizedDescription
+        }
+    }
+    private func testSubscription() async {
+        subSuccess = ""; subFailure = ""
+        guard !settings.chatGPTModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            subFailure = "请先填写模型名。"
+            return
+        }
+        subBusy = true
+        do {
+            let reply = try await ModelClient().testChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel)
+            subBusy = false
+            subSuccess = "订阅连接成功：\(settings.chatGPTModel)" + (reply.isEmpty ? "" : "（模型回复：\(reply)）")
+        } catch {
+            subBusy = false
+            subFailure = error.localizedDescription
+        }
     }
     private func saveAndTest() async {
         testSuccess = ""; testFailure = ""

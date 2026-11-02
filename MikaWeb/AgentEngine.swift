@@ -97,8 +97,13 @@ struct AgentStep: Identifiable {
     func start(local: String? = nil, task: String? = nil) {
         stop()
         guard active else { status = .paused("任务只能在前台执行"); return }
-        guard settings.hasKey else { status = .failed("未配置 API Key：点控制台下方的橙色提示进入设置页，选服务商、粘贴 Key、测试连接后再开始"); return }
-        if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { status = .failed(issue.message); return }
+        if settings.modelSource == .chatGPT {
+            guard settings.chatGPTAuth.isLoggedIn else { status = .failed("尚未登录 ChatGPT 订阅：进入设置页，在「模型来源」选「ChatGPT 订阅」，点「用 ChatGPT 登录」后再开始"); return }
+            guard !settings.chatGPTModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("订阅模型名不能为空：请在设置页填写模型名"); return }
+        } else {
+            guard settings.hasKey else { status = .failed("未配置 API Key：点控制台下方的橙色提示进入设置页，选服务商、粘贴 Key、测试连接后再开始"); return }
+            if let issue = SettingsStore.validateModelName(settings.model, provider: settings.provider) { status = .failed(issue.message); return }
+        }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
@@ -199,7 +204,12 @@ struct AgentStep: Identifiable {
                         if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
                         if let hint = pendingLoopHint { prompt += "\n\(hint)"; pendingLoopHint = nil }
                         prompt += "\n当前页面 JSON：\(json)"
-                        let action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
+                        let action: AgentAction
+                        if settings.modelSource == .chatGPT {
+                            action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
+                        } else {
+                            action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
+                        }
                         try await checkpoint(token)
                         if action.action == "done" {
                             record(action); status = .done(action.summary)

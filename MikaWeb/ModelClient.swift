@@ -119,3 +119,123 @@ struct ModelClient {
         throw MikaError("模型响应缺少完整 JSON 对象（支持代码围栏）")
     }
 }
+
+// MARK: - ChatGPT 订阅通道（Responses 形态）
+//
+// 与 chat/completions 的差异（端点、请求体、SSE 响应）全部收口在本扩展内：
+// 引擎仍只拿到 AgentAction，AgentEngine 不感知当前走哪条通道。
+extension ModelClient {
+    /// 订阅通道的一次动作决策：系统提示走 instructions，用户内容走 input。
+    func nextViaChatGPT(auth: ChatGPTAuth, model: String, prompt: String, skillCatalog: String = "") async throws -> AgentAction {
+        let systemContent = skillCatalog.isEmpty ? Self.system : Self.system + "\n" + skillCatalog
+        let content = try await chatGPTRespond(auth: auth, model: model, instructions: systemContent, inputText: prompt)
+        let json = try Self.firstObject(content)
+        guard let action = try? JSONDecoder().decode(AgentAction.self, from: Data(json.utf8)), ["click", "type", "scroll", "navigate", "open_new_tab", "wait", "use_skill", "done", "ask_user"].contains(action.action) else { throw MikaError("模型返回的动作无法识别，请点继续重试") }
+        return action
+    }
+    /// 设置页「测试订阅连接」用：最小请求，成功返回回复片段。
+    func testChatGPT(auth: ChatGPTAuth, model: String) async throws -> String {
+        let content = try await chatGPTRespond(auth: auth, model: model, instructions: nil, inputText: "请只回复 ok")
+        return String(content.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+    }
+    /// 向 ChatGPT 的 Codex 后端发一次 Responses 请求（流式），拼回完整文本。
+    /// 网络失败沿用「无法连接模型服务」前缀，与引擎瞬时错误分类口径一致。
+    private func chatGPTRespond(auth: ChatGPTAuth, model: String, instructions: String?, inputText: String) async throws -> String {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { throw MikaError("订阅模型名不能为空，请在设置页填写模型名") }
+        let (token, accountId) = try await auth.validAccessToken()
+        guard let url = URL(string: ChatGPTAuth.backendResponsesURL) else { throw MikaError("订阅服务地址无效") }
+        var payload: [String: Any] = [
+            "model": trimmedModel,
+            "stream": true,
+            "store": false,
+            "input": [["role": "user", "content": [["type": "input_text", "text": inputText]]]],
+            "reasoning": ["effort": "low"],
+            "include": ["reasoning.encrypted_content"],
+        ]
+        if let instructions, !instructions.isEmpty { payload["instructions"] = instructions }
+        let body: Data
+        do { body = try JSONSerialization.data(withJSONObject: payload) } catch { throw MikaError("请求构造失败，请检查模型设置") }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"; request.timeoutInterval = 120
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("responses=experimental", forHTTPHeaderField: "Openai-Beta")
+        request.setValue("codex_cli_rs", forHTTPHeaderField: "Originator")
+        request.setValue(ChatGPTAuth.clientVersion, forHTTPHeaderField: "Version")
+        request.setValue("codex_cli_rs/\(ChatGPTAuth.clientVersion) (iOS; arm64)", forHTTPHeaderField: "User-Agent")
+        if let accountId { request.setValue(accountId, forHTTPHeaderField: "Chatgpt-Account-Id") }
+        request.httpBody = body
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await URLSession.shared.data(for: request) }
+        catch let error as URLError { throw MikaError("无法连接模型服务：\(Self.describe(error))") }
+        catch { throw MikaError("无法连接模型服务：\(error.localizedDescription)") }
+        guard let http = response as? HTTPURLResponse else { throw MikaError("模型接口未返回 HTTP 响应") }
+        guard (200...299).contains(http.statusCode) else { throw MikaError(Self.explainChatGPTHttp(status: http.statusCode, data: data)) }
+        return try Self.parseResponsesSSE(data)
+    }
+    private static func explainChatGPTHttp(status: Int, data: Data) -> String {
+        var detail = ""
+        if let text = String(data: data, encoding: .utf8), !text.isEmpty {
+            detail = " 服务说明：\(String(text.prefix(120)))"
+        }
+        switch status {
+        case 400: return "订阅接口拒绝请求（HTTP 400），多半是模型名不对或当前套餐不可用。\(detail)"
+        case 401: return "ChatGPT 登录已失效（HTTP 401），请在设置页重新登录。\(detail)"
+        case 403: return "订阅账号无权使用该模型或接口（HTTP 403），请换一个模型或检查订阅状态。\(detail)"
+        case 404: return "订阅接口不存在该模型（HTTP 404），请在设置页刷新模型列表后重选。\(detail)"
+        case 429: return "订阅额度暂时受限（HTTP 429），请稍后再试。\(detail)"
+        case 500...599: return "订阅服务暂时异常（HTTP \(status)），请稍后重试。\(detail)"
+        default: return "订阅接口返回 HTTP \(status)。\(detail)"
+        }
+    }
+    /// 解析 Responses 的 SSE 事件流：优先累积 output_text delta；没有 delta 时
+    /// 从 response.completed 的 output 里取文本；failed/error 事件抛人话错误。
+    static func parseResponsesSSE(_ data: Data) throws -> String {
+        guard let text = String(data: data, encoding: .utf8) else { throw MikaError("模型响应无法解码") }
+        var deltas = ""
+        var completedText = ""
+        var failureMessage: String?
+        for rawLine in text.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("data:") else { continue }
+            let jsonText = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if jsonText.isEmpty || jsonText == "[DONE]" { continue }
+            guard let eventData = jsonText.data(using: .utf8),
+                  let event = try? JSONSerialization.jsonObject(with: eventData) as? [String: Any],
+                  let type = event["type"] as? String else { continue }
+            switch type {
+            case "response.output_text.delta":
+                if let delta = event["delta"] as? String { deltas += delta }
+            case "response.completed":
+                if let response = event["response"] as? [String: Any] {
+                    completedText = extractOutputText(response)
+                }
+            case "response.failed":
+                let error = (event["response"] as? [String: Any])?["error"] as? [String: Any]
+                failureMessage = (error?["message"] as? String) ?? "模型生成失败"
+            case "error":
+                failureMessage = (event["message"] as? String) ?? failureMessage
+            default:
+                break
+            }
+        }
+        if let failureMessage, deltas.isEmpty { throw MikaError("模型生成失败：\(String(failureMessage.prefix(160)))") }
+        let content = deltas.isEmpty ? completedText : deltas
+        guard !content.isEmpty else { throw MikaError("模型响应为空，请点继续重试") }
+        return content
+    }
+    private static func extractOutputText(_ response: [String: Any]) -> String {
+        guard let output = response["output"] as? [[String: Any]] else { return "" }
+        var text = ""
+        for item in output where (item["type"] as? String) == "message" {
+            guard let contents = item["content"] as? [[String: Any]] else { continue }
+            for part in contents where (part["type"] as? String) == "output_text" {
+                if let value = part["text"] as? String { text += value }
+            }
+        }
+        return text
+    }
+}
