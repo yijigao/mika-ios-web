@@ -173,6 +173,6 @@ struct PersistedChatEntry: Codable {
     private func persistNow() {
         let logical = (entries + batchedEntries).suffix(1000)
         guard let data = try? JSONEncoder().encode(logical.map { PersistedChatEntry($0) }) else { return }
-        try? data.write(to: Self.persistenceFileURL, options: [.atomic, .completeUntilFirstUserAuthentication])
+        try? data.write(to: Self.persistenceFileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 }
