@@ -74,4 +74,18 @@
 
 ## 4. 构建与 ASC 回读证据
 
-（构建完成后回填：每阶提交号、CI/Release Run、构建号、build id、processingState、Internal 组回读。）
+分支 `crash-ladder-2`（自 crash-ladder 尖端 2e9a33d 建，已 push origin）。validate_project.py 全 PASS（18 源文件）。
+
+### H3 — 构建 202611020205
+
+- 提交 `5e81bf1`（App 入口按 1652 形态装配对象图＋Harness 扩 H3/H4 视图＋step=3；含本案卷）。
+- CI Run **41375765685** success（macOS 真编译通过）；Release Run **41375769004** success。
+- build id `9eb91a34-8b43-47c4-97d5-cacdcf2a28e1`；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 并回读确认；Internal 组（6a722377-d7f3-4c76-876f-4c35e193e0e4）挂载 POST 204，组内回读居首：[202611020205, 202611020054, 202611020045, 202611020036, 202611020016, 202611012002]。
+
+### H4 — 构建 202611020210
+
+- 提交 `b46647e`（与 H3 的源码 diff 经 `git diff --stat` 核验恰为 `Harness.step` 3→4 一行）。
+- CI Run **41376265046** success；Release Run **41376269351** success。
+- build id `177fb3f5-a8b9-422c-a878-57be49cccfc9`；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false 并回读确认；Internal 组挂载 POST 204，组内回读居首：[202611020210, 202611020205, 202611020054, 202611020045, 202611020036, 202611020016]。
+
+两阶均未改 main、未动起始页与 WebSurface/WebController/BrowserView 本体。待主聊转交 Joey 按 §3 规程逐阶真机测（H3 先、首崩即停）。

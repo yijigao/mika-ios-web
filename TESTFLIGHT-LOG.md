@@ -76,3 +76,11 @@
 
 - 构建 **202611020016**（0.1.0），build id `f9ab837d-fdd8-483f-aba6-ee731d91d192`：源码＝提交 `3165943` 逐字（分支 `baseline-1652-confirm` 直接指向该提交，diff 为空、tree hash 一致，零夹带）；CI Run 41366049681 success、Release Run 41366185979 success；ASC 回读 processingState=**VALID**、expired=false、usesNonExemptEncryption 已 PATCH=false、已挂 Internal 组（组内回读 [202611020016, 202611012002, 202611011920, 202611011811, 202611011747, 202611011652, 202611011544]）。构建号由 fastlane 现场生成、不落仓；版本串保持基线 0.1.0（改版本串会破坏零 diff，取舍理由见 BASELINE-CONFIRM-2026-11-02.md）。
 - 背景：v0.2.3 结构修复版 202611012002 真机复测仍闪退（Joey 2026-11-02 08:12），UI 结构组整体回退不足以止崩。本版按 CRASH-HUNT-2 预写退路验证「1652 基线在当前设备仍不崩」这一前提：Joey 装 202611020016 后点网页 5 次＋滚动、口头报崩/不崩即可（此版无崩溃报告导出）。基线不崩→逐个回加 1652 后增量（DiagnosticStore＋MetricKit、conversation store＋binds、AgentEngine 增量、App 装配）；基线也崩→增量整体脱罪、转查设备/iOS/页面环境。两种结论均非根因确认。
+
+## 增补（2026-11-02）：最小化阶梯第二轮 H3/H4（自 H2 向上加回生产装配），两构建已上
+
+- 背景：第一轮阶梯 H0（202611020036）与 H2（202611020054）Joey 真机实测点网页均不崩——地基本体脱罪，病因锁定在 H2 之上的生产 App 装配层。案卷 CRASH-LADDER-2-2026-11-02.md（含「1652 生产装配有、H2 没有」完整差异清单 D1–D9 与生产追加装配 E1–E4）。
+- 代码：分支 `crash-ladder-2`（自主线/生产分支零改动）；H3/H4 视图代码同批入 H3 提交，两阶源码 diff 恰为 Harness.step 3→4 一行；起始页、WebController 配置、诊断导出包装两阶恒定；validate_project.py 全 PASS。
+- **H3＝202611020205**（提交 5e81bf1；CI 41375765685、Release 41375769004 均 success）：App 入口按 1652 形态持有 WebController/SettingsStore/AgentEngine/DiagnosticStore 对象图，根视图按 1652 ContentView 布局（BrowserView＋Divider＋控制台静态形态：本地 @State 输入框、不绑 engine），根视图不观察 settings/engine，engine 只创建不执行。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- **H4＝202611020210**（提交 b46647e；CI 41376265046、Release 41376269351 均 success）：H3＋1652 动态接线——根视图逐字复刻 3165943 ContentView（@ObservedObject 扇出＋PendingTaskStore 观察/consumePending＋toolbar 自检/设置真实导航项）＋真实 AgentConsoleView 子树（$engine.taskText 双向绑定等）＋scenePhase→engine.setForeground 接线（挂载点在根包装、step≥4 生效）。ASC 回读 VALID、expired=false、合规已 PATCH=false、已挂 Internal 组居首。
+- Joey 规程：按 H3→H4 装，起始页点网页 5 次＋滚动，首崩即停并从右下角圆钮导出崩溃报告。判读只定位到层（H3 崩→装配骨架层；H4 崩→动态接线层；全稳→生产追加装配 E 组），不写根因确认。
