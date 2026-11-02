@@ -254,6 +254,12 @@ extension Notification.Name {
 @MainActor final class WebController: NSObject, ObservableObject, WKUIDelegate {
     @Published private(set) var tabs: [BrowserTab]
     @Published private(set) var activeTabID: UUID
+    /// 浏览器坞的几何／形态状态（CRASH-1031 追加项）：坞的 mode／小窗位置／
+    /// 布局缩放／布局所有权放在本对象（App 级、随 WebController 同寿命）持有，
+    /// 不放 BrowserDockView 的 @State——设置页等导航往返会重建视图层级、
+    /// @State 随之清零，onAppear 的冷启动恢复路径再按默认值重导布局，真机
+    /// 实证为从设置返回后坞被还原成贴右侧的大面板。定义见 BrowserDockView.swift。
+    let dockState = DockStateStore()
     /// 任务绑定的标签页；nil＝没有任务绑定（state／execute 回落到当前页）
     @Published private(set) var executionTabID: UUID?
     /// agent 工作驻停标记（BACKGROUND-RESILIENCE，由 AgentEngine 在切后台时置位）：

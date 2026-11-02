@@ -39,7 +39,7 @@ struct ContentView: View {
                               inputFocus: $chatInputFocused, followLatest: $followLatest,
                               bottomInset: inputBarHeight)
                 BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused,
-                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest)
+                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState)
                 if showsInterventionPrompt {
                     InterventionPrompt(engine: engine, web: web,
                                        onOpenBrowser: { dockExpandRequest += 1 })

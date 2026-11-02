@@ -154,6 +154,23 @@ struct MiniShieldView: View {
     }
 }
 
+/// 浏览器坞的几何／形态状态存储（CRASH-1031 追加项）：由 WebController 持有
+/// （App 级寿命），BrowserDockView 只是它的呈现层。mode／miniCenter／
+/// layoutScale／layoutMode 放这里而不是 View 的 @State，是因为设置页这类
+/// 导航 push／pop（及 sheet 呈现）会让 SwiftUI 拆建根视图层级、@State 随之
+/// 清零，视图 onAppear 再按冷启动路径「恢复」出错误布局（Joey 2026-11-02
+/// 18:59 真机：从设置返回后坞被还原成贴右侧的大面板、盖住对话区）。状态在
+/// 本存储里跨视图重建原样保留；onAppear 只在 didInitializeLayout 为假的
+/// 真冷启动时跑一次初始布局落定，往返重现只做位置钳制、不重导布局。
+@MainActor final class DockStateStore: ObservableObject {
+    @Published var mode: DockMode = .mini
+    @Published var miniCenter: CGPoint?
+    @Published var layoutScale: CGFloat = 1
+    @Published var layoutMode: DockLayoutMode = .dockSize
+    /// 冷启动初始布局是否已落定（见类注释）：非 @Published，仅作 onAppear 门。
+    var didInitializeLayout = false
+}
+
 /// 浏览器坞：承载现有 BrowserView，在对话层之上呈 expanded／mini 双态。
 /// 介入呈现（2026-11-02 16:01 Joey 定版）：坞**不再**因 engine 信号自动展开，
 /// 也不再在坞底呈现介入 UI——确认（.waitingConfirm）与手输（.waitingManual＋.manual）
@@ -182,19 +199,35 @@ struct BrowserDockView: View {
     /// 与护盾点按同级（见文件头「坞形态触发口径」）。只增不减，坞只认变化本身。
     var expandRequest: Int
 
-    @State private var mode: DockMode = .mini
-    @State private var miniCenter: CGPoint?
-    @State private var dragDelta: CGSize = .zero
-    @State private var dragStartCenter: CGPoint?
-    @State private var area: CGSize = .zero
+    /// 坞几何状态存储（WebController 持有，App 级寿命，见 DockStateStore）：
+    /// 视图只是呈现层，导航／sheet 往返重建视图时状态不丢。下四名为转发
+    /// 计算属性，本文件其余代码读写习惯不变。
+    @ObservedObject var dock: DockStateStore
+    private var mode: DockMode {
+        get { dock.mode }
+        nonmutating set { dock.mode = newValue }
+    }
+    private var miniCenter: CGPoint? {
+        get { dock.miniCenter }
+        nonmutating set { dock.miniCenter = newValue }
+    }
     /// 已落定的布局缩放比：BrowserView 按 area×layoutScale 布局；动画期间的视觉缩放比
     /// （由 mode 决定）与它之商走 scaleEffect 过渡，落定后 layoutScale 追平目标缩放比、
     /// 渲染缩放归 1，页面按真实尺寸重排（FIX2 缺陷 1）。目标缩放比由 layoutMode 决定，
     /// 不是直接由 mode 决定（任务期布局锁定，见 settleTargetScale）。
-    @State private var layoutScale: CGFloat = 1
+    private var layoutScale: CGFloat {
+        get { dock.layoutScale }
+        nonmutating set { dock.layoutScale = newValue }
+    }
     /// 布局尺寸所有权：任务会话活跃＝.workingSize（布局锁定工作尺寸），否则 .dockSize。
     /// 只在 onChange(engine.sessionActive) 两个迁移点写入，坞自身的收放不改它。
-    @State private var layoutMode: DockLayoutMode = .dockSize
+    private var layoutMode: DockLayoutMode {
+        get { dock.layoutMode }
+        nonmutating set { dock.layoutMode = newValue }
+    }
+    @State private var dragDelta: CGSize = .zero
+    @State private var dragStartCenter: CGPoint?
+    @State private var area: CGSize = .zero
     @State private var settleTask: Task<Void, Never>?
     @AppStorage("dock.miniCenterXFrac") private var storedXFrac: Double = -1
     @AppStorage("dock.miniCenterYFrac") private var storedYFrac: Double = -1
@@ -231,10 +264,21 @@ struct BrowserDockView: View {
             .frame(width: size.width, height: size.height)
             .onAppear {
                 area = size
-                restoreCenter(area: size)
-                // 冷启动无过渡动画：布局尺寸直接落到初始态（mini），起始页一次排好
-                if mode == .mini {
-                    layoutScale = DockGeometry.miniScale(area: size)
+                if !dock.didInitializeLayout {
+                    // 真冷启动（进程内首次出现）：恢复记忆位置，布局尺寸直接
+                    // 落到初始态（mini）无过渡动画，起始页一次排好。
+                    dock.didInitializeLayout = true
+                    restoreCenter(area: size)
+                    if mode == .mini {
+                        layoutScale = DockGeometry.miniScale(area: size)
+                    }
+                } else if let current = miniCenter {
+                    // 导航 push／pop、sheet 呈现等往返后的重现：mode／位置／
+                    // 布局缩放都在 DockStateStore 里原样保留，这里只把小窗
+                    // 位置钳制进当前容器合法区间——绝不重跑冷启动恢复、
+                    // 不动 mode／layoutScale／layoutMode（CRASH-1031 追加项：
+                    // 从设置返回后坞被「还原」成大面板的成因路径）。
+                    miniCenter = DockGeometry.clampedCenter(current, area: size, scale: DockGeometry.miniScale(area: size), bottomReserve: bottomReserve)
                 }
             }
             .onChange(of: size) { _, newSize in
