@@ -861,12 +861,14 @@ enum SiteMode: String {
           const selectAll=()=>{const r=document.createRange();r.selectNodeContents(e);sel.removeAllRanges();sel.addRange(r);};
           selectAll();
           if('\(path)'==='paste'){
-            // 粘贴事务路径（ZHUANLAN-FIX2）：Draft 类编辑器的内部选区只认
-            // editOnSelect 的同步——DOM 选区必须锚在 block 的文本节点内（锚在
-            // 容器元素上映射必败，第一轮全灭的根因之一），且要在派发前用
-            // selectionchange＋mouseup 促一次同步；粘贴本身走框架的
-            // replaceWithFragment 整段替换内部选区，不经增量字符/段落操作
-            // （段落断开不是 beforeinput 事务，混入原生 insertParagraph 必坏账）。
+            // 粘贴事务路径（ZHUANLAN-FIX2）：Draft 类编辑器的一切文本事务
+            // 只认内部 SelectionState，而第一轮派发前内部选区从未完成同步
+            // （selectionchange 派得太晚）、合成 beforeinput 又不被 React 的
+            // 事件插件消费、段落断开更不是 beforeinput 事务——增量路径全灭
+            // 的根因在案卷。这里先把 DOM 选区锚进首/末 block 的文本节点，
+            // 派 selectionchange＋mouseup 促 editOnSelect 把内部选区同步为
+            // 全选；粘贴本身走框架的 replaceWithFragment 整段替换内部选区，
+            // 不经任何增量字符/段落操作。
             const host=(e.isContentEditable?e:(e.querySelector('[contenteditable="true"]')||e));
             host.focus();
             const blocks=[...host.querySelectorAll('[data-offset-key]')];
