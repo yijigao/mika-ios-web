@@ -15,8 +15,15 @@ import SwiftUI
 //   agent 的工作视口就是这个尺寸，坞收起只把全尺寸布局缩放渲染（回到 0540 的 scale 路径），
 //   绝不因收起而 resize；会话终结后若坞仍是小窗态再补落定 resize。任务开始**不改变坞
 //   形态**：原「任务开始自动展开」经 Joey 问题 2（2026-11-02）摘除，用户停在哪态就
-//   保持哪态；只有介入场景（确认／手输）的自动展开保留（needsIntervention 信号）。
+//   保持哪态。
 // - 无任务时（DockLayoutMode.dockSize）：布局跟随坞态，即 FIX2 的落定真 resize 行为。
+//
+// 坞形态触发口径（2026-11-02 16:01 Joey 定版，案卷 INTERVENTION-PROMPT-IMPL-2026-11-02.md）：
+// **任何自动展开都不要了**——任务开始（问题 2 已摘）与介入场景（确认／手输，本轮摘净）
+// 都不再程序触发 expand()；坞形态变化只来自用户动作：点按／拖动护盾、点右下收起按钮、
+// 点对话区介入卡上的「打开浏览器查看／打开浏览器」（经 ContentView 的 expandRequest
+// 令牌下传，仍是用户点击）。介入呈现改走对话区置顶卡片（InterventionPrompt），
+// 小窗坞只加橙点＋「等你处理」状态提示（纯视觉、不触发任何动作）。
 // 视觉呈现（DisplayMode）由 mode（坞形态）×layoutMode（布局所有权）导出：
 // 布局缩放比 layoutScale 与视觉缩放比之商走 scaleEffect，组合真值表见案卷。
 // 位置几何走「中心点＋缩放比」模型：动画由 mode 驱动（弹簧、可被新手势打断重定向），
@@ -135,11 +142,13 @@ struct MiniShieldView: View {
 }
 
 /// 浏览器坞：承载现有 BrowserView，在对话层之上呈 expanded／mini 双态。
-/// 自动展开接 AgentEngine 既有信号（不新造确认逻辑、不改安全边界）：
-/// ① status 进入 .waitingConfirm（执行前确认卡片）→ 展开，且确认卡片随坞底呈现；
-/// ② status 进入 .waitingManual 且 waitingInput 为 .manual（密码／验证码框等用户手输）→ 展开，
-///    并在坞底给出与聊天区同口径的「已处理，继续」入口（engine.resume() 同一路径）。
-/// ask_user 提问（waitingInput 为 .question）在对话层作答，不触发展开。
+/// 介入呈现（2026-11-02 16:01 Joey 定版）：坞**不再**因 engine 信号自动展开，
+/// 也不再在坞底呈现介入 UI——确认（.waitingConfirm）与手输（.waitingManual＋.manual）
+/// 一律走对话区置顶卡片（ContentView 的 InterventionPrompt 层，同一 engine.confirm／
+/// engine.resume 路径与防重复守卫）；小窗态坞上只加橙点＋「等你处理」状态提示
+/// （纯视觉、allowsHitTesting(false)，点按仍由护盾接管＝用户手势展开）。
+/// expand() 的调用点只剩用户动作：护盾点按、介入卡「打开浏览器」类按钮（经
+/// expandRequest 令牌下传）。ask_user 提问在对话层作答，本就不涉及坞。
 struct BrowserDockView: View {
     @ObservedObject var web: WebController
     @ObservedObject var engine: AgentEngine
@@ -152,9 +161,13 @@ struct BrowserDockView: View {
     /// 普通 Binding<Bool> 与之不互通（首版 Release 编译实证，见案卷）。
     var chatInputFocus: FocusState<Bool>.Binding
     /// 底部保留高度（本坞全出血坐标）：ContentView 按输入栏实测高度推导后下传
-    /// （问题 3）——小窗钳制下界、展开态收起按钮与介入 UI 的底部避让都用它，
+    /// （问题 3）——小窗钳制下界与展开态收起按钮的底部避让都用它，
     /// 输入栏永远在坞之上、压不住。草稿变高（输入栏变高）时经 onChange 重钳小窗。
     var bottomReserve: CGFloat
+    /// 用户主动展开请求令牌（ContentView 持有）：对话区介入卡上的「打开浏览器查看／
+    /// 打开浏览器」被点击时 +1，坞据此展开。这是用户点击、不是程序自动展开——
+    /// 与护盾点按同级（见文件头「坞形态触发口径」）。只增不减，坞只认变化本身。
+    var expandRequest: Int
 
     @State private var mode: DockMode = .mini
     @State private var miniCenter: CGPoint?
@@ -177,6 +190,8 @@ struct BrowserDockView: View {
     /// 点按／拖动分界：总位移小于此值（pt）视为点按展开
     private let tapThreshold: CGFloat = 8
 
+    /// 是否正等待用户介入（确认／手输）：现在只驱动小窗上的状态提示（橙点＋
+    /// 「等你处理」），**不再**触发任何形态变化（自动展开已按 Joey 定版摘净）。
     private var needsIntervention: Bool {
         if case .waitingConfirm = engine.status { return true }
         if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput { return true }
@@ -228,12 +243,15 @@ struct BrowserDockView: View {
         .ignoresSafeArea(.keyboard)
         .onChange(of: mode) { _, newMode in
             // 展开＝对话层被全屏盖住：顺手收起对话键盘（触发来源不限：护盾点按、
-            // 任务自动展开、介入自动展开皆走此一条）。expanded 期间用户与网页的
-            // 交互走 WKWebView 自己的焦点，不受影响。
+            // 介入卡「打开浏览器」按钮皆走此一条——均为用户动作）。expanded 期间
+            // 用户与网页的交互走 WKWebView 自己的焦点，不受影响。
             if newMode == .expanded { chatInputFocus.wrappedValue = false }
         }
-        .onChange(of: needsIntervention) { _, needed in
-            if needed, mode != .expanded { expand() }
+        .onChange(of: expandRequest) { _, _ in
+            // 用户在对话区介入卡上主动点「打开浏览器查看／打开浏览器」→ 展开。
+            // 这是 expand() 仅剩的两个调用点之一（另一个是护盾点按），都是用户动作；
+            // engine 的任何状态信号都不再触发形态变化（Joey 2026-11-02 16:01 定版）。
+            if mode != .expanded { expand() }
         }
         .onChange(of: engine.sessionActive) { _, active in
             // 视口所有权迁移点（任务会话开始／终结）：
@@ -243,8 +261,8 @@ struct BrowserDockView: View {
                 // 任务开始自动展开已被 Joey 否掉（问题 2，2026-11-02：「消息发出后
                 // 自动放大到全屏，没有必要，很突兀」）：用户停在小窗就保持小窗（工作
                 // 尺寸布局＋缩放渲染，页面实时可见），停在展开态就保持展开。
-                // 介入场景（waitingConfirm／waitingManual）的自动展开是另一条信号
-                // （上方 needsIntervention 的 onChange），不在此处、本轮保留不动。
+                // 介入场景（waitingConfirm／waitingManual）同样不自动展开（Joey
+                // 2026-11-02 16:01 定版）：只在对话里出卡提示，用户自己决定开不开。
                 layoutMode = .workingSize
                 scheduleSettle()
             } else {
@@ -309,36 +327,24 @@ struct BrowserDockView: View {
                     .accessibilityLabel("缩小浏览器为悬浮小窗")
                 }
             }
-            .overlay(alignment: .bottom) {
-                if mode == .expanded {
-                    // 介入 UI（确认卡片／手输提示）同样抬到输入栏之上呈现，不与输入口重叠
-                    interventionOverlay
-                        .padding(.bottom, bottomReserve)
+            .overlay(alignment: .top) {
+                // 小窗状态提示（纯视觉，INTERVENTION-PROMPT 定版）：等待用户介入时
+                // 在小窗顶部给橙点＋「等你处理」——只提示、不展开、不可点出动作
+                // （allowsHitTesting(false)，点按仍落在护盾上＝用户点按展开，是允许的
+                // 用户路径）。介入卡本体在对话区（ContentView 的 InterventionPrompt 层）。
+                if mode == .mini, needsIntervention {
+                    HStack(spacing: 4) {
+                        Circle().fill(.orange).frame(width: 7, height: 7)
+                        Text("等你处理").font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.top, 6)
+                    .allowsHitTesting(false)
                 }
             }
             .animation(spring, value: mode)
-    }
-
-    /// 展开态下随坞呈现的用户介入 UI（与聊天区同源同口径，不另造逻辑）：
-    /// 确认等待时复用 AgentChatView 的 ConfirmCard（同一 engine.confirm 路径与内部防重复守卫）；
-    /// 手动输入等待时给出同口径提示＋「已处理，继续」（engine.resume() 同一路径）。
-    @ViewBuilder
-    private var interventionOverlay: some View {
-        if case .waitingConfirm(let action) = engine.status {
-            ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID)
-                .padding(10)
-        } else if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("请在网页完成处理，然后点击「已处理，继续」。")
-                Button("已处理，继续") { engine.resume() }
-                    .buttonStyle(.borderedProminent)
-            }
-            .font(.callout)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-            .padding(10)
-        }
     }
 
     // MARK: - 状态切换
