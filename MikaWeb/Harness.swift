@@ -1,15 +1,16 @@
 import SwiftUI
 import WebKit
 
-// 触摸网页闪退最小化阶梯（CRASH-LADDER-2026-11-02）。本文件只存在于 crash-ladder 分支，主线无此文件。
-// 阶梯定义：H0 裸 WKWebView → H1 加 1652 形态浏览器 chrome → H2 换现行 BrowserView/WebSurface/WebController 地基。
-// 三个构建之间唯一的源码差异是 Harness.step 的取值（0/1/2），其余代码逐字相同。
+// 触摸网页闪退最小化阶梯（CRASH-LADDER-2026-11-02；第二轮 CRASH-LADDER-2-2026-11-02）。本文件只存在于阶梯分支，主线无此文件。
+// 第一轮阶梯定义：H0 裸 WKWebView → H1 加 1652 形态浏览器 chrome → H2 换现行 BrowserView/WebSurface/WebController 地基。
+// 第二轮阶梯定义（crash-ladder-2，step=3/4）：H3 = App 级装配骨架（1652 形态对象图＋流内静态控制台）→ H4 = 加 1652 动态接线（观察扇出/真控制台/pending/toolbar 目的地/scenePhase）。
+// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同。
 // 三阶共同点：
 // 1. 起始页与生产 App 完全一致——startPageHTML 是 WebController.init 里 loadHTMLString 的原文，
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 2
+    static let step = 3
     static var stepName: String { "H\(step)" }
     static let startPageHTML = "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>"
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
@@ -43,7 +44,12 @@ struct HarnessBareSurface: UIViewRepresentable {
 }
 
 struct HarnessRootView: View {
+    // 第二轮（step>=3）由 App 入口传入 1652 形态对象图；第一轮各阶（step 0/1/2）不使用这些引用（其 WebController 由各阶视图自持）。
+    let web: WebController
+    let settings: SettingsStore
+    let engine: AgentEngine
     @ObservedObject var diagnostics: DiagnosticStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showReports = false
     var body: some View {
         Group {
@@ -51,9 +57,17 @@ struct HarnessRootView: View {
                 HarnessH0View()
             } else if Harness.step == 1 {
                 HarnessH1View()
+            } else if Harness.step == 3 {
+                HarnessH3View(web: web, settings: settings, engine: engine)
+            } else if Harness.step >= 4 {
+                HarnessH4View(web: web, settings: settings, engine: engine)
             } else {
                 HarnessH2View()
             }
+        }
+        // 1652 的 scenePhase 接线（App body 的 onChange → engine.setForeground）：本阶梯挂在根包装、仅 step>=4 生效（案卷 CRASH-LADDER-2 §2 登记的挂载点差异）。
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if Harness.step >= 4 { engine.setForeground(phase == .active) }
         }
         .overlay(alignment: .bottomTrailing) {
             VStack(spacing: 2) {
@@ -133,5 +147,78 @@ struct HarnessH2View: View {
                 }
             }
         }
+    }
+}
+
+// H3：H2 ＋ 生产 App 级装配骨架（案卷 CRASH-LADDER-2 §2）。
+// 对象图由 App 入口按 1652 形态持有并向下传递（web/settings/engine 均为普通引用 let——根视图不对 settings/engine 声明观察，观察扇出归 H4）；
+// 根视图布局按 1652 ContentView 结构：NavigationStack { VStack(spacing: 0) { BrowserView + Divider + 控制台区 } }；
+// 控制台区为静态形态（HarnessStaticConsole）；toolbar 仍为阶梯标记（真实导航项归 H4）；AgentEngine 只创建不执行。
+struct HarnessH3View: View {
+    let web: WebController
+    let settings: SettingsStore
+    let engine: AgentEngine
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                BrowserView(controller: web).frame(maxHeight: .infinity)
+                Divider()
+                HarnessStaticConsole()
+            }
+            .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Text(Harness.stepName).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+// 控制台静态形态：与 AgentConsoleView 同版式（纵向 TextField＋按钮行＋状态文案），但输入只绑本地 @State、
+// 不绑定 engine、无 .focused、不读任何 store 发布、不挂 ScrollView。按钮为禁用态（engine 不执行）。
+struct HarnessStaticConsole: View {
+    @State private var draft = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("输入网页任务", text: $draft, axis: .vertical).lineLimit(1...3).textFieldStyle(.roundedBorder)
+            HStack(spacing: 12) {
+                Button("开始") {}.disabled(true)
+                Button("停止") {}.disabled(true)
+                Spacer()
+                Text("步骤 0").font(.caption).foregroundStyle(.secondary)
+            }
+            Text("待命").font(.callout).foregroundStyle(.secondary)
+        }.padding()
+    }
+}
+
+// H4：H3 ＋ 1652 剩余动态接线（案卷 CRASH-LADDER-2 §2 逐项清单）。
+// 本视图逐字复刻 3165943 的 ContentView：@ObservedObject 观察扇出（web/settings/engine）＋ PendingTaskStore 观察与 consumePending、
+// toolbar 真实导航项（自检/设置）、真实 AgentConsoleView 子树（$engine.taskText 双向绑定等随原文生效）。
+// 与 3165943 的已知差别：scenePhase 接线挂在 HarnessRootView 包装（step>=4 生效）；AgentConsoleView/SettingsView 为仓库现行文件（差异登记见案卷 §1.3）。
+struct HarnessH4View: View {
+    @ObservedObject var web: WebController
+    @ObservedObject var settings: SettingsStore
+    @ObservedObject var engine: AgentEngine
+    @ObservedObject private var pending = PendingTaskStore.shared
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                BrowserView(controller: web).frame(maxHeight: .infinity)
+                Divider()
+                AgentConsoleView(engine: engine, settings: settings)
+            }
+            .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                NavigationLink { SelfTestView(engine: engine, settings: settings) } label: { Text("自检") }
+                NavigationLink { SettingsView(settings: settings) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
+            }
+        }
+        .onAppear { consumePending() }
+        .onChange(of: pending.task) { _, _ in consumePending() }
+    }
+    private func consumePending() {
+        if let task = pending.task { engine.stop(); engine.taskText = task; pending.task = nil }
     }
 }
