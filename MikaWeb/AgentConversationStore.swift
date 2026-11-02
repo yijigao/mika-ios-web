@@ -2,8 +2,8 @@ import SwiftUI
 import Combine
 import UIKit
 
-enum ChatEntryKind: Equatable { case userTask, userAnswer, process, result, error, pause, question, manual, local }
-enum ChatEntrySource { case userTask, userAnswer, engineStep, engineStatus, localValidation }
+enum ChatEntryKind: String, Equatable, Codable { case userTask, userAnswer, process, result, error, pause, question, manual, local }
+enum ChatEntrySource: String, Codable { case userTask, userAnswer, engineStep, engineStatus, localValidation }
 struct ChatEntry: Identifiable {
     let id: UUID
     let taskID: UUID?
@@ -18,11 +18,37 @@ struct ChatEntry: Identifiable {
         id = UUID(); self.taskID = taskID; createdAt = Date(); self.kind = kind; self.text = text
         self.stepID = stepID; self.action = action; self.reason = reason; self.source = source
     }
+    /// 从持久化记录还原（保留原 id 与时间戳，见 AgentConversationStore 的条目持久化）。
+    init(restoring p: PersistedChatEntry) {
+        id = p.id; self.taskID = p.taskID; createdAt = p.createdAt; self.kind = p.kind; self.text = p.text
+        self.stepID = p.stepID; self.action = p.action; self.reason = p.reason; self.source = p.source
+    }
+}
+
+/// 对话条目的持久化形态（Codable 镜像）：与 ChatEntry 分开，避免给 UI 模型
+/// 本身加编解码负担；字段一一对应、还原时不改 id／时间戳。
+struct PersistedChatEntry: Codable {
+    let id: UUID
+    let taskID: UUID?
+    let createdAt: Date
+    let kind: ChatEntryKind
+    let text: String
+    let stepID: Int?
+    let action: String?
+    let reason: String?
+    let source: ChatEntrySource
+    init(_ e: ChatEntry) {
+        id = e.id; taskID = e.taskID; createdAt = e.createdAt; kind = e.kind; text = e.text
+        stepID = e.stepID; action = e.action; reason = e.reason; source = e.source
+    }
 }
 
 @MainActor final class AgentConversationStore: ObservableObject {
     @Published private(set) var entries: [ChatEntry] = []
     @Published var draft = ""
+    /// 条目独立持久化（见文件末 MARK）：启动先把上次落盘的对话读回，
+    /// 进程被杀重开后对话仍在位（此前 entries 纯内存、进程一死全丢）。
+    init() { loadPersisted() }
     private var cancellables: Set<AnyCancellable> = []
     private var bound = false
     private var taskID: UUID?
@@ -55,7 +81,16 @@ struct ChatEntry: Identifiable {
         }
         engine.$conversationTaskID.sink { [weak self, weak engine] id in
             guard let self, let engine, let id, id != self.taskID else { return }
-            self.taskID = id; self.seenSteps = []; self.seenWaits = []
+            self.taskID = id
+            // 该任务的条目已持久化在位（进程被杀重开、引擎按快照恢复会话时
+            // 会重发同一 taskID）：不重复追加任务条目，并把已存条目的
+            // stepID 预置进 seenSteps，避免恢复时步流被整段重推一遍。
+            if self.entries.contains(where: { $0.taskID == id }) {
+                self.seenSteps = Set(self.entries.filter { $0.taskID == id }.compactMap { $0.stepID })
+                self.seenWaits = []
+                return
+            }
+            self.seenSteps = []; self.seenWaits = []
             self.append(ChatEntry(taskID: id, kind: .userTask, text: engine.taskText, source: .userTask))
             self.trimHistory()
         }.store(in: &cancellables)
@@ -100,15 +135,44 @@ struct ChatEntry: Identifiable {
     func acceptedAnswer(_ text: String) { append(ChatEntry(taskID: taskID, kind: .userAnswer, text: text, source: .userAnswer)) }
     private func append(_ entry: ChatEntry) {
         if batching { batchedEntries.append(entry) } else { entries.append(entry) }
+        persistNow()
     }
     private func flushBatch() {
         batching = false
         guard !batchedEntries.isEmpty else { return }
         entries.append(contentsOf: batchedEntries)
         batchedEntries = []
+        persistNow()
     }
     private func trimHistory() {
         let older = entries.filter { $0.taskID != taskID }
-        if older.count > 500 { entries.removeFirst(older.count - 500) }
+        if older.count > 500 { entries.removeFirst(older.count - 500); persistNow() }
+    }
+
+    // MARK: - 条目持久化（CRASH-1031 追加项：任务完成后切后台再回来对话被清空）
+
+    // 对话记录是用户的事后凭证（发了什么任务、agent 做了什么、结果如何都在
+    // 里面），与引擎的会话执行快照（终结／停止即清除）解耦、独立落盘：
+    // 切后台、回前台、进程被系统杀掉后重开都不丢。落盘口径：每次条目变化
+    // 写全量逻辑列表（entries＋攒批中的 batchedEntries，杀进程发生在攒批期
+    // 也不丢），上限最近 1000 条；当前产品没有任何「清空对话」的用户动作，
+    // 条目只随 trimHistory 的上限滚动——将来若加显式清空，须同步删本文件。
+    private static var persistenceFileURL: URL {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/Conversation", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("entries.json")
+    }
+
+    private func loadPersisted() {
+        guard let data = try? Data(contentsOf: Self.persistenceFileURL),
+              let decoded = try? JSONDecoder().decode([PersistedChatEntry].self, from: data) else { return }
+        entries = decoded.suffix(1000).map { ChatEntry(restoring: $0) }
+    }
+
+    private func persistNow() {
+        let logical = (entries + batchedEntries).suffix(1000)
+        guard let data = try? JSONEncoder().encode(logical.map { PersistedChatEntry($0) }) else { return }
+        try? data.write(to: Self.persistenceFileURL, options: [.atomic, .completeUntilFirstUserAuthentication])
     }
 }
