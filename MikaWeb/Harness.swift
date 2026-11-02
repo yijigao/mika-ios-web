@@ -9,7 +9,7 @@ import WebKit
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 1
+    static let step = 2
     static var stepName: String { "H\(step)" }
     static let startPageHTML = "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Mika Web</title><body><h1>Mika Web</h1><p>在地址栏打开网页，或输入包含网址的任务。</p></body></html>"
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
