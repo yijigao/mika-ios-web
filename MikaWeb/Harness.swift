@@ -7,13 +7,21 @@ import WebKit
 // 第三轮阶梯定义（CRASH-LADDER-3-2026-11-02，step=7/8/9）：H3a/H3b 真机均崩、A 组单独可触发后，自 H2 基线（step=2 源码状态）把 A 组拆单件——
 //   step=7「A-1」只加 A1（App 级持有 WebController＋下传消费）；step=8「A-2」只加 A2（App 级创建 SettingsStore）；
 //   step=9「A-2+3」为 A3 的最小耦合阶（AgentEngine init 签名强制 web+settings 两实例，A3 不能独立，详见案卷 CRASH-LADDER-3 §1）。
-// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同（各阶 App 装配差异由 HarnessObjectGraph 的分阶构造表承载，对象在 App init 内构造）。
+// 第四轮阶梯定义（CRASH-LADDER-4-2026-11-02，step=10/11）：第三轮单件阶 A-1/A-2/A-3 经 Joey 2026-11-02 12:28 真机实测全稳，
+// 单件全脱罪、疑为件间交互。本轮验证两个交互候选：
+//   step=10「X-1」真实生产对象图复刻（去 B 组布局）：持有者形态（HarnessObjectGraph）建 web＋settings＋engine，
+//   且 AgentEngine 用视图正在消费的**同一个** WebController 实例构造（与 A-3 阶 engine 持独立替身实例的关键差别），
+//   engine 只建不执行；根视图保持 H2 形态（HarnessH3aView：BrowserView 消费下传 web＋120pt 占位）。
+//   step=11「X-2」与 X-1 内容相同，唯一差异是持有形态：改为第二轮 H3a 的原样——MikaWebApp 直接以三个
+//   @StateObject 分别持有 web/settings/engine（不用 HarnessObjectGraph 间接层），该阶的持有形态差异由
+//   MikaWebApp.swift 承载（该文件在 step=11 的提交内替换为直接持有版），本文件内两阶差异仍仅 step 取值。
+// 同一轮内构建之间唯一的源码差异是 Harness.step 的取值，其余代码逐字相同（各阶 App 装配差异由 HarnessObjectGraph 的分阶构造表承载，对象在 App init 内构造；第四轮 X-2 的持有形态差异例外，见上）。
 // 三阶共同点：
 // 1. 起始页与生产 App 完全一致——startPageHTML 是 WebController.init 里 loadHTMLString 的原文，
 //    WKWebView 配置（WKWebViewConfiguration + websiteDataStore=.default()）与 customUserAgent 亦与 WebController 原文一致。
 // 2. 均带 DiagnosticStore + MetricKit 崩溃报告导出（右下角按钮打开 CrashReportsView），该包装三阶恒定。
 enum Harness {
-    static let step = 9
+    static let step = 10
     static var stepName: String {
         switch step {
         case 5: return "H3a"
@@ -21,6 +29,8 @@ enum Harness {
         case 7: return "A-1"
         case 8: return "A-2"
         case 9: return "A-2+3"
+        case 10: return "X-1"
+        case 11: return "X-2"
         default: return "H\(step)"
         }
     }
@@ -42,13 +52,17 @@ enum Harness {
 // - step 9（A-3 耦合阶 A2+A3）：建 settings＋engine；engine 的 web 参数仅为满足 AgentEngine.init(web:settings:)
 //   签名的依赖实例——不入本持有者的 web 槽（保持 nil）、不下传视图、仅由 engine 的 strong let 引用保活；
 //   BrowserView 实际消费的 controller 仍由根视图自持（A1/A4 缺席）。耦合关系详记案卷 CRASH-LADDER-3 §1。
+// - step 10（X-1）：与 step 3–6 同形态的全对象图——web＋settings＋engine 全建，且 engine 用**同一个**
+//   w 实例构造（生产/H3a 形态；与 step 9 的替身实例相对）。根视图只消费 web（H2 形态），settings/engine 不被观察。
+// - step 11（X-2）：本持有者不参与——该阶由 MikaWebApp 直接 @StateObject 持有三件（见 MikaWebApp.swift），
+//   本 switch 不会被以 11 调用；若被调用落入 default（全 nil）。
 @MainActor final class HarnessObjectGraph: ObservableObject {
     let web: WebController?
     let settings: SettingsStore?
     let engine: AgentEngine?
     init(step: Int) {
         switch step {
-        case 3, 4, 5, 6:
+        case 3, 4, 5, 6, 10:
             let w = WebController()
             let s = SettingsStore()
             web = w
@@ -105,7 +119,8 @@ struct HarnessBareSurface: UIViewRepresentable {
 struct HarnessRootView: View {
     // 对象图引用由 App 入口按 step 分阶传入，未建的对象为 nil（各阶实际建了哪些对象见 HarnessObjectGraph 的分阶构造表）：
     // step 0/1/2 三者皆 nil；step 3/4/5/6 三者皆非 nil；step 7 仅 web；step 8 仅 settings；step 9 为 settings＋engine
-    //（其 engine 的 web 依赖实例不经此下传）。需要全对象图的视图分支均以 if let 解包，解包失败不挂载（按 init 分阶构造不会发生）。
+    //（其 engine 的 web 依赖实例不经此下传）；step 10 三者皆非 nil（来源为持有者）；step 11 三者皆非 nil
+    //（来源为 App 直接 @StateObject 持有，语义与 step 10 相同、仅持有形态不同）。需要全对象图的视图分支均以 if let 解包，解包失败不挂载（按 init 分阶构造不会发生）。
     let web: WebController?
     let settings: SettingsStore?
     let engine: AgentEngine?
@@ -122,9 +137,11 @@ struct HarnessRootView: View {
                 if let web, let settings, let engine {
                     HarnessH3View(web: web, settings: settings, engine: engine)
                 }
-            } else if Harness.step == 5 || Harness.step == 7 {
+            } else if Harness.step == 5 || Harness.step == 7 || Harness.step == 10 || Harness.step == 11 {
                 // step 5＝H3a（全对象图在场、根视图只消费 web）；step 7＝A-1（对象图只有 web，根视图形态与 H3a 逐字相同，
                 // 差异只在 settings/engine 不存在）——两阶共用同一视图，变量纯度由 App 装配承载。
+                // step 10＝X-1 / step 11＝X-2（第四轮）：全对象图在场且 engine 共享同一 web 实例，根视图同为 H2 形态
+                //（只消费 web）；两阶的唯一差异是对象图的持有形态（持有者 vs App 直接 @StateObject），由 App 入口承载。
                 if let web {
                     HarnessH3aView(web: web)
                 }
