@@ -2157,6 +2157,11 @@ enum SiteMode: String {
         lines.append("\(fmt(altIcon != nil)) alt 图标补盲：只有 alt 的图标图以 alt 为名进快照（名源=alt）=\(altIcon != nil)")
         let bgEntry = page.elements.first(where: { $0.nameSource == "bg" && $0.text == "cover entry" })
         lines.append("\(fmt(bgEntry != nil)) 背景图入口补盲：无文本封面区入口以背景图文件名为名进快照（名源=bg、名=cover entry）=\(bgEntry != nil)")
+        // 事件属性入口（browser-use 回退分支的适配样本）：无 pointer 光标、
+        // 无文本无背景图，只有内联 onclick——本页唯一的「无名」条目
+        let evtMatches = page.elements.filter { $0.nameSource == "none" && $0.text.isEmpty && $0.tag == "div" }
+        let evtEntry = evtMatches.count == 1 ? evtMatches.first : nil
+        lines.append("\(fmt(evtEntry != nil)) 事件属性入口补盲：只有内联事件属性的无名入口凭事件证据进快照（名源=none，本页同型条目数=\(evtMatches.count)，应为 1）=\(evtEntry != nil)")
         // —— 内层滚动容器下方的编辑入口：抽取在位、初始不在视口 ——
         guard let editEntry = page.elements.first(where: { $0.text == "编辑草稿" }) else {
             lines.append("✗ 内层滚动容器下方的「编辑草稿」入口未进快照")
@@ -2183,6 +2188,14 @@ enum SiteMode: String {
                 lines.append("\(fmt(r.contains("封面入口已打开"))) 背景图封面入口点击：引擎 click 点中、页面结果标记在场=\(r.contains("封面入口已打开"))")
             } catch { lines.append("✗ 背景图封面入口点击抛错：\(error.localizedDescription)") }
         } else { lines.append("✗ 背景图封面入口点击跳过（元素或动作构造失败）") }
+        if let evtEntry, let act = Self.selfTestClickAction(index: evtEntry.index) {
+            do {
+                try await execute(act, expected: evtEntry)
+                try? await Task.sleep(for: .milliseconds(300))
+                let r = await resultText()
+                lines.append("\(fmt(r.contains("事件入口已打开"))) 事件属性入口点击：引擎 click 点中、页面结果标记在场=\(r.contains("事件入口已打开"))")
+            } catch { lines.append("✗ 事件属性入口点击抛错：\(error.localizedDescription)") }
+        } else { lines.append("✗ 事件属性入口点击跳过（元素或动作构造失败）") }
         // —— 揭示后编辑入口可点 ——
         guard let page2 = try? await state(), let editFresh = page2.elements.first(where: { $0.text == "编辑草稿" }) else {
             lines.append("✗ 揭示后状态重取失败")

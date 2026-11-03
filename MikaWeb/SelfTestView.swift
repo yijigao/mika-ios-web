@@ -115,7 +115,7 @@ struct SelfTestView: View {
                 runEditorNavTest()
                 dismiss()
             }.disabled(!engine.active || editorNavTestRunning)
-            Text("自检十六预期（WECHAT-EDITOR-NAV）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-nav）：合成页复刻三类盲区——只有 aria-label 的 icon 按钮、只有 alt 的图标图、只有背景图的无文本封面入口（旧抽取整类滤掉），以及藏在内层滚动容器下方＋整页折下的编辑入口。预期：三类无文本入口都进元素清单且名源标注正确（aria-label／alt／bg）；编辑入口初始 inView=false、经揭示复判（逐个滚动内层容器＋窗口跟随）后在视口且中心可命中；补盲入口与编辑入口经引擎 click 都真点得动；序号标记失效后重扫能经文本锚点回退点中整卡。Tier B 真机人工（步骤见案卷 WECHAT-EDITOR-NAV-IMPL 的复测清单）：公众号编辑器原场景复测——草稿编辑入口与封面设置入口按 playbook 写死顺序找，未保存前不重载。").font(.caption).foregroundStyle(.secondary)
+            Text("自检十六预期（WECHAT-EDITOR-NAV）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-nav）：合成页复刻三类盲区——只有 aria-label 的 icon 按钮、只有 alt 的图标图、只有背景图的无文本封面入口、只有内联事件属性的无名入口（旧抽取整类滤掉），以及藏在内层滚动容器下方＋整页折下的编辑入口。预期：四类无文本入口都进元素清单且名源标注正确（aria-label／alt／bg／none）；编辑入口初始 inView=false、经揭示复判（逐个滚动内层容器＋窗口跟随）后在视口且中心可命中；补盲入口与编辑入口经引擎 click 都真点得动；序号标记失效后重扫能经文本锚点回退点中整卡。Tier B 真机人工（步骤见案卷 WECHAT-EDITOR-NAV-IMPL 的复测清单）：公众号编辑器原场景复测——草稿编辑入口与封面设置入口按 playbook 写死顺序找，未保存前不重载。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 

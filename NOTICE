@@ -8,3 +8,10 @@ https://github.com/wangzan101/Mika
 本项目未获上游背书，不是 Mika 官方发布；未复制上游安卓端代码，
 iOS 端的网页 Agent 子集为独立实现。Mika 名称仅用于说明来源与概念参考。
 本项目按 Apache License, Version 2.0 许可，全文见 LICENSE。
+
+第三方改编说明（WECHAT-EDITOR-NAV，2026-11-03）：页面元素抽取中的两处
+判定手法改编自 browser-use 项目的 browser_use/dom/buildDomTree.js
+（tag 0.2.7）：①交互元素的内联事件属性回退判定；②以 getClientRects
+任一矩形判视口相交。改编处在源码注释中逐处标注。该项目采用 MIT License，
+Copyright (c) 2024 Gregor Zunic；本项目未复制其脚本本体（快照契约与
+WKWebView 环境不兼容，盘点结论见 WECHAT-EDITOR-NAV-IMPL-2026-11-03.md）。

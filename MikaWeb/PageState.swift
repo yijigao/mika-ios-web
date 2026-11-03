@@ -53,8 +53,12 @@ enum PageScript {
         return{name:'',source:'none'};
       };
       // 与视口相交与否（A2）：只问窗口视口——内层滚动容器裁剪不在此判，
-      // 可达性复判走引擎的揭示流程（滚动容器逐个滚动后再判）。
-      const inViewOf=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;};
+      // 可达性复判走引擎的揭示流程（滚动容器逐个滚动后再判）。判定用
+      // getClientRects 任一矩形相交（内联元素多行矩形只取包围盒会误判），
+      // 无矩形时回落包围盒——此法改编自 browser-use 的
+      // isInExpandedViewport（buildDomTree.js，MIT License，
+      // Copyright (c) 2024 Gregor Zunic；轮子盘点见本单案卷）。
+      const inViewOf=e=>{const hit=r=>r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;const rs=e.getClientRects();for(const r of rs){if(hit(r))return true;}return rs.length?false:hit(e.getBoundingClientRect());};
       const semSel='a,button,input,textarea,select,[role="button"],[contenteditable="true"]';
       const roleSel='[role="tab"],[role="link"],[role="menuitem"],[role="option"],[role="switch"],[role="checkbox"],[role="treeitem"],[onclick]';
       const baseSet=new Set(document.querySelectorAll(semSel+','+roleSel));
@@ -62,11 +66,13 @@ enum PageScript {
       // 入口常是 div/span＋JS 绑定的非语义元素，不在语义选择器内——模型看不见、
       // 只能请用户手动点。补入判据（须同时满足，防噪声）：不在语义元素内部、
       // 也不包裹语义元素（真目标在内层时父级不重复列）；纯文本粗筛 ≤120 字；
-      // 可见且尺寸 ≥12×12；计算样式 cursor:pointer；且有可达名称（名源见
-      // nameOf：文本／aria-label／title／alt／背景图任一）或至少带背景图
-      // （图标形态，名可为空）——A1 修订：旧判据只认文本与 aria／title，
+      // 可见且尺寸 ≥12×12；交互证据＝cursor:pointer 或内联事件属性（见
+      // 循环内注释）；且有可达名称（名源见 nameOf：文本／aria-label／
+      // title／alt／背景图任一）或至少带背景图（图标形态，名可为空）或
+      // 带内联事件属性——A1 修订：旧判据只认文本与 aria／title，
       // 纯图标入口（alt 图、背景图按钮）整类被滤掉，是编辑器入口盲区
-      // 的主因；全无名源又无背景图的透明热区无从指认，仍不入（防噪声）。
+      // 的主因；全无名源又无背景图无事件属性的透明热区无从指认，仍不入
+      // （防噪声）。
       // 同类嵌套只留最内层（点击事件冒泡到父级处理器，点内层等效）。
       // 补入上限 200 条（去重前），语义元素不受任何新门槛影响。
       const scanSel='div,span,li,td,th,p,i,em,b,strong,img,section,article,nav,header,footer,figure,figcaption,dd,dt';
@@ -80,9 +86,17 @@ enum PageScript {
         if(!visible(e))continue;
         const r=e.getBoundingClientRect();
         if(r.width<12||r.height<12)continue;
-        if(getComputedStyle(e).cursor!=='pointer')continue;
+        // 交互证据（改编自 browser-use isInteractiveElement 的事件属性
+        // 回退分支，buildDomTree.js，MIT License，Copyright (c) 2024
+        // Gregor Zunic）：cursor:pointer 或带内联事件属性（onclick／
+        // onmousedown／onmouseup，属性或 property 任一）任一成立即算
+        // 可点——旧式后台页常给图标区只挂 onclick 不设 pointer 光标，
+        // 只认光标会整类漏掉。它们的 getEventListeners 检测在
+        // WKWebView 页面世界不可用（其源码注释亦承认），不移植。
+        const hasEvt=e.hasAttribute('onclick')||typeof e.onclick==='function'||e.hasAttribute('onmousedown')||typeof e.onmousedown==='function'||e.hasAttribute('onmouseup')||typeof e.onmouseup==='function';
+        if(getComputedStyle(e).cursor!=='pointer'&&!hasEvt)continue;
         const nm=nameOf(e);
-        if(!nm.name&&nm.source!=='bg')continue;
+        if(!nm.name&&nm.source!=='bg'&&!hasEvt)continue;
         if(nm.name.length>120)continue;
         rawExtras.push(e);
       }

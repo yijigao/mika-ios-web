@@ -34,6 +34,10 @@
 <!-- 盲区二：无文本封面区入口（背景图名源） -->
 <div id="coverEntry" onclick="mark('封面入口已打开')"></div>
 
+<!-- 盲区二乙：只有内联事件属性、无 pointer 光标、无文本无背景图的入口
+     （browser-use 事件属性回退的适配样本；靠 name 属性在快照里定位） -->
+<div id="evtEntry" name="evtEntry" style="width:44px;height:44px;cursor:default" onclick="mark('事件入口已打开')"></div>
+
 <!-- 盲区三锚点样本：目标词只是文本节点，可点的是整卡祖先 -->
 <div id="anchorCard" onclick="mark('锚点卡片已打开')">
   <div>整卡标题文字</div>
