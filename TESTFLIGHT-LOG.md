@@ -216,3 +216,12 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线实查均 0 行）；无新第三方依赖；未合 main；文案无「并行执行」；核验记录只存证据引用，不存正文全文与凭据。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷第 8 节复测（第一条＝自检十三 Tier A；Tier B 与知乎专栏改长文、公众号发表两场景同程，看步流核验步与正式日志记录同页面实况对照）；验收通过前不合 main。
 - 附记：上一构建 1908 条目末尾的阿仁 ASC 亲验行此前未提交，随本次日志提交一并入库（非本单代记）。
+- ASC 亲验（阿仁，2026-11-03 03:43 CST）：构建 202611021932 processingState=VALID（build id 31a7f974-2612-46fb-9b8c-309df5a2781d），已 POST 挂 Internal 组并回读确认居首——**正式取代 1908 成为唯一复测目标**（含 VERIFY-1 shadow 核验合约，判定只记录不阻断）。
+
+## 增补（2026-11-03）：WECHAT-COVER-FIX（公众号封面链：frame 探针＋框内关闭／playbook 本地上传专节＋双回读／步数预算与检查点分段），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030042**（0.1.0）：分支 `feat/wechat-cover-fix`（基线＝feat/verify-1 tip 264c1d8，含构建 1932，未合 main），功能提交 `be14cce`；CI Run 41554331643 success（日志原文双核对：70 条 SwiftCompile、WebController/AgentEngine/SkillStore/SelfTestView 均在编译列、test-frames 资源打包在位、BUILD SUCCEEDED ×1、FAILED ×0；唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41554635915 success（agvtool 置号 202611030042、Successfully uploaded package、dSYM artifact dsym-41554635915 4,685,536 字节实存未过期）；validate_project.py 全 PASS（31 源、11 项资源集含 test-frames.html）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 WECHAT-COVER-FIX-IMPL-2026-11-03.md）：Part A 弹窗 frame 探针——探针脚本经既有 WebAuthn 多路复用通道一次性装配注入每个 frame（含跨源），postMessage 洪泛普查枚举全 frame 的弹窗与按钮特征（诊断信封留档）；关闭在弹窗所在 frame 内分阶段尝试（完整 pointer 序列→触摸序列→Escape→关闭叉号→遮罩点击），关闭判定只认复查普查中该弹窗消失的回读证据；探针无获时回落 1830 主 frame 路径；两轮不关抛「弹窗点按无响应」附探针实测摘要转人工。Part B playbook 修订（哈希迁移）——封面只走本地上传入口、绝不点 AI 配图任何入口、条款弹窗在场先点「取消」关闭再继续；上传收口双回读（文件控件持有＋页面新增图像），双过才写里程碑、单过按 unknown 如实记步。Part C 步数预算——只计模型决策步（计数点唯一在主循环动作取得处），引擎注记/采样/回读/分块不计数；段限（每段＝设置上限）到落检查点暂停、点「继续」开新段续跑同一任务（状态全量已落盘），全任务硬顶＝4 段×每段（limit=42 时 168 决策）防失控；快照新增预算四字段、旧快照走迁移口径。自检十四（test-frames 合成页：同源/沙箱跨源 frame 各一弹窗，枚举定位＋框内 pointer/Escape 关闭＋消失双证）与自检十五（步数账程序化模拟：只计决策、子步不计数、开新段不清零、硬顶封顶、熔断 3/5/7、快照往返与旧格式迁移）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 264c1d8 实查均 0 行）；无新第三方依赖；未合 main；新增文案无「并行执行」；探针只做证据与受控点按，click 指令在出手 frame 内重跑安全词复查。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷复测清单复测（第一条＝自检十四 Tier A，须特别留意沙箱 frame 乙的探针回報是否如期到达——该前提未经真机证实，如实记录不放水）；验收通过前不合 main。
+- 附记：上一构建 1932 条目末尾的阿仁 ASC 亲验行（03:43）此前未提交，随本次日志提交一并入库（系阿仁所记，非本单代记）。
