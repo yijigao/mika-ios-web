@@ -416,6 +416,33 @@ enum SiteMode: String {
         };
         run(0);
       };
+      var collectHarvest = function(){
+        var hrefs = [], dataAttrs = [], onclicks = [], embedded = [];
+        var links = document.querySelectorAll('a[href]');
+        for (var i=0;i<links.length && hrefs.length<400;i++){ var h = links[i].getAttribute('href'); if (h) hrefs.push(h); }
+        var all = document.querySelectorAll('*');
+        for (var j=0;j<all.length && j<6000;j++){
+          var e = all[j];
+          if (e.attributes){
+            for (var k=0;k<e.attributes.length;k++){
+              var at = e.attributes[k], v = at.value || '';
+              if (at.name.indexOf('data-')===0 && (v.indexOf('appmsg')>=0 || v.indexOf('://')>=0 || at.name.indexOf('appmsgid')>=0 || /^\d{5,}$/.test(v))){
+                if (dataAttrs.length<120) dataAttrs.push({ name:at.name, value:v.slice(0,600) });
+              }
+            }
+          }
+          var oc = e.getAttribute ? e.getAttribute('onclick') : null;
+          if (oc && (oc.indexOf('appmsg')>=0 || oc.indexOf('http')>=0) && onclicks.length<120) onclicks.push(oc.slice(0,600));
+        }
+        var scripts = document.querySelectorAll('script:not([src])');
+        for (var s=0;s<scripts.length && embedded.length<60;s++){
+          var t = scripts[s].textContent || '';
+          if (t.indexOf('appmsg')<0) continue;
+          var m = t.match(/[^\s"'<>]*appmsg[^\s"'<>]*/g) || [];
+          for (var q=0;q<m.length && embedded.length<60;q++) embedded.push(m[q].slice(0,600));
+        }
+        return { hrefs:hrefs, dataAttrs:dataAttrs, onclicks:onclicks, embedded:embedded };
+      };
       window.addEventListener('message', function(ev){
         var d = ev.data;
         if (!d || d.__mikaFrame !== 1) return;
@@ -425,6 +452,9 @@ enum SiteMode: String {
           post({ kind:'probe-report', token:d.token, path:framePath(), href:hrefSafe(), isTop: window===window.top, children: window.frames.length, dialogs:dialogs });
         } else if (d.kind === 'click'){
           handleClick(d);
+        } else if (d.kind === 'harvest'){
+          var hv = collectHarvest();
+          post({ kind:'harvest-report', token:d.token, path:framePath(), href:hrefSafe(), hrefs:hv.hrefs, dataAttrs:hv.dataAttrs, onclicks:hv.onclicks, embedded:hv.embedded });
         }
       });
     })();
@@ -1083,18 +1113,115 @@ enum TCProbeLogStore {
     /// probeFrames 的执行页包装，签名/摘要口径与 frame 探针一致。
     func dialogCensus() async -> FrameCensus { await probeFrames(on: executionTab) }
 
-    /// 直达目标 harvest（AUTONOMY-FIX 梯级②）：收集执行页主 frame 内
-    /// 全部 a[href] 原始属性值，交 DirectTargetHarvest.build 做纯函数
-    /// 提取——模板与目标 ID 只从页面已有链接实证，不凭记忆编造。
-    /// 页面读取失败或无候选返回 nil。
-    func harvestDirectTargets() async -> DirectTargetHarvest.Result? {
+    /// harvest 采集结果（LADDER-FIX F3）：采用候选（可空）＋实况
+    /// （候选总数/来源分布/采用或落空原因，进梯账与梯尽结案文案）。
+    struct HarvestOutcome {
+        let result: DirectTargetHarvest.Result?
+        let facts: DirectTargetHarvest.Facts
+    }
+
+    /// 直达目标 harvest（AUTONOMY-FIX 梯级②、LADDER-FIX F3 扩展）：
+    /// 经 frame 探针向整棵 frame 树采集候选——链接 href、data-* 属
+    /// 性、onclick 属性、页面内嵌列表数据（内联脚本文本中含 appmsg
+    /// 的片段），交 DirectTargetHarvest.build 做纯函数提取：模板与
+    /// 目标 ID 只从实证候选出，禁止任何未实证的标识映射假定（如
+    /// mid＝appmsgid）。探针未覆盖（零 frame 回報）时回落主 frame
+    /// 链接采集（旧口径下限），回落事实记入实况不隐瞒。
+    func harvestDirectTargets(memoryTemplate: String?) async -> HarvestOutcome {
         let tab = executionTab
-        let result = try? await evaluate("""
-        (()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const h=a.getAttribute('href');if(h)out.push(h);if(out.length>=400)break;}return JSON.stringify(out);})()
-        """, on: tab)
-        guard let raw = result as? String, let data = raw.data(using: .utf8),
-              let hrefs = try? JSONDecoder().decode([String].self, from: data) else { return nil }
-        return DirectTargetHarvest.build(hrefs: hrefs)
+        let token = UUID().uuidString
+        let box = FrameMessageBox()
+        FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
+            if (body["kind"] as? String) == "harvest-report" { box.messages.append(body) }
+        }
+        defer { FrameProbeHub.shared.unregister(token: token) }
+        let flood = "(()=>{const d={__mikaFrame:1,kind:'harvest',token:'\(token)'};window.postMessage(d,'*');return 'flooded';})()"
+        _ = try? await evaluate(flood, on: tab)
+        try? await Task.sleep(for: .milliseconds(900))
+        var candidates: [DirectTargetHarvest.Candidate] = []
+        for message in box.messages {
+            let base = (message["href"] as? String) ?? ""
+            for href in (message["hrefs"] as? [String]) ?? [] {
+                candidates.append(.init(source: .href, value: href, baseURL: base))
+            }
+            for attr in (message["dataAttrs"] as? [[String: Any]]) ?? [] {
+                candidates.append(.init(source: .dataAttr, value: (attr["value"] as? String) ?? "", attrName: (attr["name"] as? String) ?? "", baseURL: base))
+            }
+            for oc in (message["onclicks"] as? [String]) ?? [] {
+                candidates.append(.init(source: .onclick, value: oc, baseURL: base))
+            }
+            for em in (message["embedded"] as? [String]) ?? [] {
+                candidates.append(.init(source: .embedded, value: em, baseURL: base))
+            }
+        }
+        if box.messages.isEmpty {
+            let result = try? await evaluate("""
+            (()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const h=a.getAttribute('href');if(h)out.push(h);if(out.length>=400)break;}return JSON.stringify(out);})()
+            """, on: tab)
+            if let raw = result as? String, let data = raw.data(using: .utf8),
+               let hrefs = try? JSONDecoder().decode([String].self, from: data) {
+                candidates = hrefs.map { .init(source: .href, value: $0) }
+            }
+            var built = DirectTargetHarvest.build(candidates: candidates, memoryTemplate: memoryTemplate)
+            built.facts.note += (built.facts.note.isEmpty ? "" : "；") + "frame 探针未覆盖，已回落主 frame 链接采集"
+            return HarvestOutcome(result: built.result, facts: built.facts)
+        }
+        let built = DirectTargetHarvest.build(candidates: candidates, memoryTemplate: memoryTemplate)
+        return HarvestOutcome(result: built.result, facts: built.facts)
+    }
+
+    /// hover 显形探测的回報（LADDER-FIX F5）。
+    struct HoverProbeReport {
+        let containersTried: Int
+        let revealed: [String]
+        var summary: String {
+            if revealed.isEmpty { return "hover 显形探测已试 \(containersTried) 个卡片容器，未探到新显形的可操作元素" }
+            return "hover 显形探测在 \(containersTried) 个卡片容器上探到 \(revealed.count) 个新显形元素：\(revealed.joined(separator: "；"))"
+        }
+    }
+
+    /// hover 显形探测（LADDER-FIX F5）：编辑入口可能藏在 hover 才显
+    /// 形的控件里、感知层快照中不可见。本探测在执行页主 frame 先记
+    /// 「当前可见可操作元素签名集」，对卡片状容器（至多 8 个）逐个
+    /// 派发 mouseover/mouseenter/mousemove，Swift 侧等约 450ms 后复
+    /// 采签名集——新出现的签名即 hover 显形元素。只探测与留痕，绝
+    /// 不点击；子 frame 内的 hover 显形不在本探测面（案卷未证项）。
+    func hoverRevealProbe() async -> HoverProbeReport {
+        let tab = executionTab
+        let begin = """
+        (()=>{const vis=x=>{if(!x||!x.getBoundingClientRect)return false;const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        const lab=x=>((x.innerText||x.value||x.getAttribute('aria-label')||'')+'').replace(/\\s+/g,' ').trim().slice(0,24);
+        const sig=x=>x.tagName.toLowerCase()+'|'+lab(x);
+        const sel='a,button,[role="button"],input,select,textarea,[onclick],[contenteditable="true"]';
+        const before=new Set();document.querySelectorAll(sel).forEach(e=>{if(vis(e))before.add(sig(e));});
+        window.__mikaHoverBefore=Array.from(before);
+        const containers=[];document.querySelectorAll('div,li,section,article,tr').forEach(c=>{if(containers.length>=8||!vis(c))return;const r=c.getBoundingClientRect();if(r.width<60||r.height<24)return;if(!c.querySelector('a,button,[onclick]')&&getComputedStyle(c).cursor!=='pointer')return;containers.push(c);});
+        containers.forEach(c=>{const r=c.getBoundingClientRect();const x=Math.round(r.left+r.width/2),y=Math.round(r.top+r.height/2);let t=c;try{t=document.elementFromPoint(x,y)||c;}catch(e){}['mouseover','mouseenter','mousemove'].forEach(type=>{try{t.dispatchEvent(new MouseEvent(type,{bubbles:true,composed:true,cancelable:true,clientX:x,clientY:y,view:window}));}catch(e){}});});
+        return JSON.stringify({tried:containers.length});})()
+        """
+        guard let rawBegin = try? await evaluate(begin, on: tab) as? String,
+              let beginData = rawBegin.data(using: .utf8),
+              let beginObj = try? JSONSerialization.jsonObject(with: beginData) as? [String: Any] else {
+            return HoverProbeReport(containersTried: 0, revealed: [])
+        }
+        try? await Task.sleep(for: .milliseconds(450))
+        let after = """
+        (()=>{const vis=x=>{if(!x||!x.getBoundingClientRect)return false;const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        const lab=x=>((x.innerText||x.value||x.getAttribute('aria-label')||'')+'').replace(/\\s+/g,' ').trim().slice(0,24);
+        const sig=x=>x.tagName.toLowerCase()+'|'+lab(x);
+        const sel='a,button,[role="button"],input,select,textarea,[onclick],[contenteditable="true"]';
+        const before=new Set(window.__mikaHoverBefore||[]);const revealed=[];
+        document.querySelectorAll(sel).forEach(e=>{if(!vis(e))return;const s=sig(e);if(!before.has(s)&&revealed.indexOf(s)<0)revealed.push(s);});
+        window.__mikaHoverBefore=null;
+        return JSON.stringify({revealed:revealed.slice(0,10)});})()
+        """
+        var revealed: [String] = []
+        if let rawAfter = try? await evaluate(after, on: tab) as? String,
+           let afterData = rawAfter.data(using: .utf8),
+           let afterObj = try? JSONSerialization.jsonObject(with: afterData) as? [String: Any] {
+            revealed = (afterObj["revealed"] as? [String]) ?? []
+        }
+        return HoverProbeReport(containersTried: (beginObj["tried"] as? Int) ?? 0, revealed: revealed)
     }
 
     /// agent 的 open_new_tab 动作：在执行会话里新开标签并把执行绑定移过去，

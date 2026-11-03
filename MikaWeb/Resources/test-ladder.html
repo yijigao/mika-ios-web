@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检二十一合成页：绕行梯回路</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  .card { border: 1px solid #999; padding: 12px; margin-bottom: 16px; }
+  .card a { display: block; margin: 6px 0; }
+  /* 编辑按钮 hover 才显形（JS 监听 mouseover 切 class，不靠 CSS
+     :hover——合成事件能触发 JS 监听、触发不了引擎的悬停状态）：
+     验证 F5 的 hover 显形探测能探到感知层快照里不可见的入口 */
+  .editBtn { display: none; }
+  .card.hovering .editBtn { display: inline-block; }
+</style>
+</head>
+<body>
+<h3>草稿箱（合成）</h3>
+
+<!-- 草稿卡：标题是带 tempkey 的临时预览链接（点开是预览页、不是
+     编辑器，F5 须区分）；编辑 ID 只出现在 data-appmsgid 属性里
+     （裸 ID）；编辑链接模板只出现在编辑按钮的 onclick 里——主
+     frame 没有任何明文编辑 href，F3 的扩展来源缺一不可 -->
+<div class="card" id="draftCard">
+  <a id="previewLink" href="https://example.com/s?__biz=MzY5Nzg5&amp;mid=2247484001&amp;idx=1&amp;sn=abcdef&amp;tempkey=MTg3X3Rva2Vu">《合成草稿·梯》</a>
+  <span class="meta" data-appmsgid="100000777">草稿元信息（ID 在 data 属性）</span>
+  <button type="button" class="editBtn" id="editBtn"
+          onclick="location.href='https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&amp;action=edit'">编辑草稿</button>
+</div>
+<script>
+  document.getElementById('draftCard').addEventListener('mouseover', function () {
+    document.getElementById('draftCard').classList.add('hovering');
+  });
+</script>
+
+<!-- 子 frame 里的带 ID 编辑链接：验证 F3 的全 frame 采集（探针到
+     不到此 frame 时，主 frame 的 data＋onclick 拼装路径同样成立，
+     自检断言对两条成功路径都成立） -->
+<iframe title="子 frame 草稿" srcdoc="&lt;a href=&quot;https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&amp;action=edit&amp;appmsgid=100000555&quot;&gt;子 frame 编辑入口&lt;/a&gt;"></iframe>
+</body>
+</html>

@@ -19,6 +19,20 @@ struct PageElement: Codable, Equatable {
     // 引擎按稳定描述重找时靠它圈定候选池（AGENT-VIEWPORT-FIX 案卷）
     let editable: Bool
 }
+
+extension PageElement {
+    /// 链接类别（LADDER-FIX F5，计算属性、不落盘不进快照编码）：
+    /// "edit"＝编辑入口链接（href 含 appmsg_edit）；"preview"＝带
+    /// tempkey 的临时预览链接（点开是预览页、不是编辑器——草稿卡标
+    /// 题多属此类，感知层不得把它当编辑入口候选交付，引擎点中时步
+    /// 流另行标注）；其余 ""。判据只认 href 字面，与 harvest 侧的
+    /// 预览排除（DirectTargetHarvest.isPreviewLink）同口径。
+    var linkKind: String {
+        if href.contains("appmsg_edit") { return "edit" }
+        if DirectTargetHarvest.isPreviewLink(href) { return "preview" }
+        return ""
+    }
+}
 struct PageState: Codable {
     let url, title, text: String
     let elements: [PageElement]

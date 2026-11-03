@@ -16,6 +16,7 @@ struct SelfTestView: View {
     @State private var autonomyTestRunning = false
     @State private var zOrderTestRunning = false
     @State private var trustedClickTestRunning = false
+    @State private var ladderFixTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -148,6 +149,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || trustedClickTestRunning)
             Text("自检二十预期（TRUSTED-CLICK-EXP）：不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-trusted）。E1——武装只读插桩后：普通按钮经引擎 click 计数应为 1（阴性对照）；触摸状态机复刻弹窗在现行 pointer 序列＋合成 TouchEvent 序列后应仍打开（现象复现），页面账与插桩账双证 touchend 的 changedTouches 恒为 0、全部事件 isTrusted=false，两账逐类型计数应一致（插桩工作正常）。E2——宿主枚举本页无障碍树、按 aria-label 命中探针按钮并调 accessibilityActivate()，页面收到 click 且 isTrusted=true、或控件动作确实生效（计数增长）记「通」并留字段证据；够不到元素或激活无事件记「不通」并写明卡点层。实验合成一份结构化 JSON 落盘，本页下方可导出最近一份。E1 的真机金标准（真实条款弹窗上真人点一次再重放 diff）不在本按钮内，步骤见案卷 TRUSTED-CLICK-EXP-IMPL。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十一：绕行梯引擎驱动回路（LADDER-FIX）") {
+                guard !ladderFixTestRunning else { return }
+                ladderFixTestRunning = true
+                runLadderFixTest()
+                dismiss()
+            }.disabled(!engine.active || ladderFixTestRunning)
+            Text("自检二十一预期（LADDER-FIX）：不调用模型（本按钮，要求引擎空闲，会占用执行页打开本地合成页 test-ladder 与 test-ladder-zero）。纯逻辑——第 1 级逐项验收状态机（下达不记已试、真实 click 的多项实证口径、frameClose 判不适用后才完成）；harvest 扩展来源（data 属性裸 ID＋onclick 模板拼装、内嵌数据直用、跨页模板记忆、预览链接排除计数、零候选实况行）；梯尽结案文案强制含 harvest 实况节；词表外动作判定；预览/编辑链接的感知区分。回路（真实调用主循环同款生产函数在合成页上驱动）——场景A：单次能力类信号只下达第 1 级（不记 attempted），生产记账喂齐手段后，动作后推进钩子不等第二次信号即结级并驱动直达 URL 一级（test-ladder 的编辑 ID 只在 data 属性、模板只在 onclick 里）成功关卡点；场景B：卡点在开且梯未尽时 done 被梯门拦下、引擎驱动成功后才放行；场景C：零候选页推进第 2 级落空、第 3 级重载后弹窗仍在→梯尽抛失败结案且文案含 harvest 实况（含预览排除数）；场景D：澄清问题不吞卡点（步流明示保持在开）、词表外动作「teleport」经生产处理后记账留痕并计入卡点证据、引擎不置失败不清进度。测试前后引擎现场完整恢复。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -169,6 +177,24 @@ struct SelfTestView: View {
             for line in lines { conversation.localFeedback("自检二十：\(line)") }
             let failed = lines.filter { $0.hasPrefix("✗") }.count
             conversation.localFeedback(failed == 0 ? "自检二十结论：全部通过——插桩自证与 touches 恒空复现成立、E2 探针判定见上（通／不通均以字段证据为准）；E1 真机金标准按案卷步骤另行采集" : "自检二十结论：\(failed) 项未通过，见上方逐条记录（E2 判「不通」属实验结论、同样计未通过以便醒目）")
+        }
+    }
+
+    /// 自检二十一编排（LADDER-FIX）：绕行梯引擎驱动的回路级核查，
+    /// 委托引擎侧 verifyLadderFix（纯逻辑断言＋在合成页 test-ladder／
+    /// test-ladder-zero 上真实调用主循环同款生产函数驱动完整回路），
+    /// 结论以「自检二十一」条目写进对话。不调用模型、不起任务；要求
+    /// 引擎空闲（会占用执行页打开合成页，结束恢复引擎现场）。
+    private func runLadderFixTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十一：开始——绕行梯引擎驱动回路核查（不调用模型）")
+        Task { @MainActor in
+            defer { ladderFixTestRunning = false }
+            let lines = await engine.verifyLadderFix()
+            for line in lines { conversation.localFeedback("自检二十一：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检二十一结论：全部通过——第 1 级逐项验收、引擎自动推进、done 梯门、harvest 扩展来源与梯尽实况、词表外动作去终结化、澄清不吞卡点均有回路级实证" : "自检二十一结论：\(failed) 项未通过，见上方逐条记录")
         }
     }
 

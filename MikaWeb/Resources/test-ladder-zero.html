@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检二十一合成页：零候选与梯尽结案</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  a { display: block; margin: 8px 0; }
+  /* 常驻弹窗（合成）：重载不消失、无关闭行为——验证第 3 级重载绕行
+     失败后梯尽结案，且结案文案含 harvest 实况节 */
+  #stuckDlg { position: fixed; left: 40px; right: 40px; top: 160px; background: #fff;
+              border: 2px solid #c00; padding: 16px; z-index: 99; }
+</style>
+</head>
+<body>
+<h3>草稿箱（合成·零候选）</h3>
+
+<!-- 全页唯一的链接是临时预览链接：harvest 候选只有它一条，且按
+     F5 必须被排除（其 mid 不冒充编辑 ID） -->
+<a id="onlyPreview" href="https://example.com/s?__biz=MzY5Nzg5&amp;mid=2247484002&amp;idx=1&amp;sn=abcdef&amp;tempkey=MTg3X3Rva2Vu">《合成草稿·零》</a>
+
+<div id="stuckDlg" role="dialog" aria-modal="true">
+  <p>合成常驻弹窗：按钮没有任何行为，重载后仍在。</p>
+  <button type="button" id="stuckCancel">取消</button>
+  <button type="button" id="stuckAgree">同意</button>
+</div>
+</body>
+</html>

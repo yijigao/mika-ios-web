@@ -113,11 +113,15 @@ enum InterventionGate {
         return markers.contains { text.contains($0) }
     }
 
-    /// 失败结案文案（梯尽出口）：卡点＋已试路径＋页面证据。自检十八
-    /// 对措辞做负断言——不得出现请用户代劳的话（亲手／手动／请用户）。
-    static func failureSummary(stuck: String, ladder: BypassLadder, evidence: String) -> String {
+    /// 失败结案文案（梯尽出口）：卡点＋已试路径＋harvest 实况节＋页面
+    /// 证据。自检十八对措辞做负断言——不得出现请用户代劳的话（亲手／
+    /// 手动／请用户）。harvest 实况节为 LADDER-FIX F6 强制节（候选
+    /// 总数、来源分布、采用／落空原因；未运行过 harvest 时写明未运行
+    /// 的原因，不得缺席）。
+    static func failureSummary(stuck: String, ladder: BypassLadder, evidence: String, harvestFact: String? = nil) -> String {
         let tried = ladder.summary.isEmpty ? "（无可用绕行梯级）" : ladder.summary
-        return "任务未能自主完成：\(stuck)。已试路径：\(tried)。页面证据：\(evidence)。本任务按失败结案处理，未完成的步骤与原因已如实记录如上。"
+        let harvest = harvestFact ?? "未运行 harvest（直达 URL 一级未到达或采集结果未回写梯账）"
+        return "任务未能自主完成：\(stuck)。已试路径：\(tried)。harvest 实况：\(harvest)。页面证据：\(evidence)。本任务按失败结案处理，未完成的步骤与原因已如实记录如上。"
     }
 }
 
@@ -141,6 +145,13 @@ struct BypassLadder: Equatable {
     }
     private(set) var attempted: [Rung] = []
     private(set) var notes: [String] = []
+    /// 直达 URL 跨页模板记忆（LADDER-FIX F3）：本任务内从页面实证采
+    /// 集到、当前页没有的编辑链接模板与其出处页——只许页面实证来源，
+    /// 严禁凭记忆或按标识映射假定（mid≠appmsgid 一类映射一律不做）。
+    private(set) var harvestTemplate: String?
+    private(set) var harvestTemplateFrom: String?
+    /// 最近一次 harvest 的实况行（F6）：梯尽结案文案强制引用。
+    private(set) var harvestFact: String?
 
     /// 下一级未试梯级（按声明顺序）；nil＝梯尽。
     var nextRung: Rung? { Rung.allCases.first { !attempted.contains($0) } }
@@ -151,42 +162,186 @@ struct BypassLadder: Equatable {
         notes.append("\(rung.label)：\(note)")
     }
 
+    /// 记录一次 harvest 的实况与跨页模板记忆（模板仅在同源实证见到
+    /// 时更新，fact 每次覆盖为最新实况）。
+    mutating func noteHarvest(template: String?, templateFrom: String?, fact: String) {
+        if let template, harvestTemplate == nil {
+            harvestTemplate = template
+            harvestTemplateFrom = templateFrom
+        }
+        harvestFact = fact
+    }
+
     /// 已试路径的人读汇总（进失败结案文案与步流）。
     var summary: String { notes.joined(separator: "；") }
 
     init() {}
     /// 快照往返构造：梯级以 rawValue 数组落盘（旧快照无此二键时梯账为空）。
-    init(attemptedRaw: [String], notes: [String]) {
+    init(attemptedRaw: [String], notes: [String], harvestTemplate: String? = nil, harvestTemplateFrom: String? = nil, harvestFact: String? = nil) {
         attempted = attemptedRaw.compactMap { Rung(rawValue: $0) }
         self.notes = notes
+        self.harvestTemplate = harvestTemplate
+        self.harvestTemplateFrom = harvestTemplateFrom
+        self.harvestFact = harvestFact
     }
     var attemptedRaw: [String] { attempted.map { $0.rawValue } }
 }
 
-/// 直达 URL 的实证提取（AUTONOMY-FIX 梯级②，纯函数）：模板只从页面
-/// 已有链接提取，绝不凭记忆编造——收集到的 href 里：
-/// ①已有带 appmsgid 的编辑链接（appmsg_edit）→ 直接用它（模板与 ID
-/// 同源实证）；②只有不带 ID 的编辑链接模板、且别处链接带 appmsgid
-/// → 以实证 ID 拼到模板上；③无 ID 或无模板 → nil（此级失败）。
+/// 直达 URL 的实证提取（AUTONOMY-FIX 梯级②＋LADDER-FIX F3 扩展，
+/// 纯函数）：模板与 ID 只从页面实证采集提取，绝不凭记忆编造，更禁
+/// 止任何未实证的标识映射（例如假定 mid＝appmsgid）——采集到的
+/// 候选里：①已有带 appmsgid 的编辑链接（appmsg_edit）→ 直接用它
+/// （模板与 ID 同源实证）；②只有不带 ID 的编辑链接模板、且别处候选
+/// 带 appmsgid → 以实证 ID 拼到模板上；③模板只在本任务先前页面实
+/// 证见过（跨页记忆）→ 以实证 ID 拼装并注明跨页；④无 ID 或无模板
+/// → nil（此级失败）。候选来源（F3）：链接 href、data-* 属性、
+/// onclick 属性、页面内嵌列表数据（内联脚本文本）——预览链接
+/// （/s? 类带 tempkey）按 F5 明确排除出编辑入口候选并计数留痕。
 enum DirectTargetHarvest {
-    struct Result: Equatable { let url: String; let appmsgid: String; let viaTemplate: Bool }
+    struct Result: Equatable {
+        let url: String
+        let appmsgid: String
+        let viaTemplate: Bool
+        /// 采用候选的来源类别（步流与结案留痕用）。
+        var source: String = ""
+        /// 模板来自本任务先前页面的跨页记忆时为 true。
+        var crossPage: Bool = false
+    }
 
-    static func build(hrefs: [String]) -> Result? {
-        var knownIDs: [String] = []
-        var directEdit: (url: String, id: String)?
-        var editTemplate: String?
-        for href in hrefs {
-            let id = firstMatch(href, pattern: "appmsgid=(\\d+)")
-            if let id, !knownIDs.contains(id) { knownIDs.append(id) }
-            if href.contains("appmsg_edit"), href.contains("://") {
-                if let id { if directEdit == nil { directEdit = (href, id) } }
-                else if editTemplate == nil { editTemplate = href }
+    enum Source: String, CaseIterable {
+        case href, dataAttr, onclick, embedded
+        var label: String {
+            switch self {
+            case .href: return "链接 href"
+            case .dataAttr: return "data 属性"
+            case .onclick: return "onclick 属性"
+            case .embedded: return "内嵌数据"
             }
         }
-        if let directEdit { return Result(url: directEdit.url, appmsgid: directEdit.id, viaTemplate: false) }
-        guard let template = editTemplate, let id = knownIDs.first else { return nil }
-        let separator = template.contains("?") ? "&" : "?"
-        return Result(url: template + separator + "appmsgid=" + id, appmsgid: id, viaTemplate: true)
+    }
+
+    /// 一条实证候选：原始值、来源、属性名（data-* 专用，如
+    /// data-appmsgid 的裸 ID）、所在 frame 的页面地址（相对地址解析基）。
+    struct Candidate {
+        let source: Source
+        let value: String
+        var attrName: String = ""
+        var baseURL: String = ""
+    }
+
+    /// harvest 实况（F6）：候选总数、来源分布、预览排除数、实证 ID
+    /// 数、采用路线或落空原因——梯尽结案强制引用 `line`。
+    struct Facts {
+        var total: Int = 0
+        var perSource: [Source: Int] = [:]
+        var previewExcluded: Int = 0
+        var knownIDs: [String] = []
+        var note: String = ""
+        /// 本页实证见到的编辑链接模板（已解析的绝对地址；供引擎回写
+        /// 梯账作跨页模板记忆，不进 line 文案）。
+        var editTemplate: String? = nil
+        var line: String {
+            let dist = Source.allCases.compactMap { s -> String? in
+                guard let n = perSource[s], n > 0 else { return nil }
+                return "\(s.label) \(n)"
+            }.joined(separator: "、")
+            var text = "候选共 \(total) 条"
+            if !dist.isEmpty { text += "（来源：\(dist)）" }
+            if previewExcluded > 0 { text += "；预览链接排除 \(previewExcluded) 条" }
+            text += "；实证 appmsgid \(knownIDs.count) 个"
+            if !note.isEmpty { text += "；\(note)" }
+            return text
+        }
+    }
+
+    /// 旧入口（仅 href 候选）：自检十八既有断言走此包装，语义不变。
+    static func build(hrefs: [String]) -> Result? {
+        build(candidates: hrefs.map { Candidate(source: .href, value: $0) }, memoryTemplate: nil).result
+    }
+
+    static func build(candidates: [Candidate], memoryTemplate: String?) -> (result: Result?, facts: Facts) {
+        var facts = Facts()
+        facts.total = candidates.count
+        for c in candidates { facts.perSource[c.source, default: 0] += 1 }
+        var directEdit: (url: String, id: String, source: Source)?
+        var editTemplate: (url: String, source: Source)?
+        for c in candidates {
+            // 裸 ID 属性（data-appmsgid="12345" 一类）：属性名本身即
+            // 实证语义，值是纯数字才收——这是页面明示的标识，不是映射假定。
+            if c.source == .dataAttr, c.attrName.lowercased().contains("appmsgid"),
+               !c.value.isEmpty, c.value.allSatisfy({ $0.isNumber }), !facts.knownIDs.contains(c.value) {
+                facts.knownIDs.append(c.value)
+            }
+            for raw in extractURLs(from: c) {
+                if let id = firstMatch(raw, pattern: "appmsgid=(\\d+)"), !facts.knownIDs.contains(id) {
+                    facts.knownIDs.append(id)
+                }
+                if isPreviewLink(raw) { facts.previewExcluded += 1; continue }
+                guard raw.contains("appmsg_edit"),
+                      let resolved = resolve(raw, base: c.baseURL) else { continue }
+                if let id = firstMatch(resolved, pattern: "appmsgid=(\\d+)") {
+                    if directEdit == nil { directEdit = (resolved, id, c.source) }
+                } else if editTemplate == nil {
+                    editTemplate = (resolved, c.source)
+                }
+            }
+        }
+        facts.editTemplate = editTemplate?.url
+        if let d = directEdit {
+            facts.note = "采用带 ID 编辑链接直用（来源：\(d.source.label)）"
+            return (Result(url: d.url, appmsgid: d.id, viaTemplate: false, source: d.source.label), facts)
+        }
+        if let t = editTemplate, let id = facts.knownIDs.first {
+            facts.note = "采用编辑链接模板拼装实证 ID（模板来源：\(t.source.label)）"
+            let separator = t.url.contains("?") ? "&" : "?"
+            return (Result(url: t.url + separator + "appmsgid=" + id, appmsgid: id, viaTemplate: true, source: t.source.label), facts)
+        }
+        if let memory = memoryTemplate, let id = facts.knownIDs.first {
+            facts.note = "采用跨页模板记忆拼装实证 ID（模板为本任务先前页面实证）"
+            let separator = memory.contains("?") ? "&" : "?"
+            return (Result(url: memory + separator + "appmsgid=" + id, appmsgid: id, viaTemplate: true, source: "跨页模板记忆", crossPage: true), facts)
+        }
+        if facts.total == 0 { facts.note = "落空：各 frame 未采集到任何候选" }
+        else if facts.knownIDs.isEmpty { facts.note = "落空：\(facts.total) 条候选中未见 appmsgid 实证（不假定任何标识映射）" }
+        else { facts.note = "落空：有实证 ID 但无编辑链接模板（本页与跨页记忆均无）" }
+        return (nil, facts)
+    }
+
+    /// 预览链接判定（F5）：带 tempkey 的 /s? 短链是临时预览、非编辑
+    /// 入口——harvest 一律排除，感知层点击时另行标注。
+    static func isPreviewLink(_ value: String) -> Bool {
+        value.contains("tempkey") && (value.contains("/s?") || value.contains("/s/"))
+    }
+
+    /// 从一条候选值里抽出 URL 形子串：href 直接用原值；data-*／
+    /// onclick／内嵌数据从原文里截取含 appmsg 的片段与完整 http(s)
+    /// 地址（JSON 转义的 \/ 先还原）。
+    private static func extractURLs(from c: Candidate) -> [String] {
+        if c.source == .href { return c.value.isEmpty ? [] : [c.value] }
+        let text = c.value.replacingOccurrences(of: "\\/", with: "/")
+        var found: [String] = []
+        for pattern in ["https?://[^\\s\"'<>\\\\)]+", "[^\\s\"'<>]+appmsg[^\\s\"'<>]*"] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for m in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                if let r = Range(m.range, in: text) {
+                    let s = String(text[r])
+                    if !found.contains(s) { found.append(s) }
+                }
+            }
+        }
+        return found
+    }
+
+    /// 相对地址以所在 frame 的页面地址为基解析；只收 http(s)。
+    private static func resolve(_ raw: String, base: String) -> String? {
+        if raw.contains("://") {
+            guard let u = URL(string: raw), let scheme = u.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { return nil }
+            return raw
+        }
+        guard let baseURL = URL(string: base), let resolved = URL(string: raw, relativeTo: baseURL)?.absoluteURL,
+              let scheme = resolved.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        return resolved.absoluteString
     }
 
     private static func firstMatch(_ text: String, pattern: String) -> String? {
@@ -194,6 +349,97 @@ enum DirectTargetHarvest {
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
               let range = Range(match.range(at: 1), in: text) else { return nil }
         return String(text[range])
+    }
+}
+
+/// 绕行梯第 1 级「既有手段」的逐项验收项（LADDER-FIX F2）：第 1 级
+/// 不再「下达即记 attempted」——每项手段须有引擎可核的真实执行证据
+/// 才记 verified；判定不适用的记 NA 并注明依据；两类都不齐时第 1
+/// 级保持未完成，由预算强制结级兜底（见 AgentEngine 的推进口径）。
+enum StallMeans: String, CaseIterable {
+    case revealClick, siteMode, altEntry, coordClick, frameClose
+    var label: String {
+        switch self {
+        case .revealClick: return "揭示复判再点"
+        case .siteMode: return "站点模式切换"
+        case .altEntry: return "替代入口"
+        case .coordClick: return "坐标点击"
+        case .frameClose: return "frame 感知关闭"
+        }
+    }
+}
+
+/// 在开的能力卡点（LADDER-FIX F2）：一次卡点从打开到关闭（绕过、
+/// 页面离开或梯尽结案）的全程账本——推进权在引擎，不在模型：模型
+/// 的 done 须过梯门、后续 ask_user 与动作后钩子都由引擎据此推进梯
+/// 级；澄清类 ask_user 停车不关它（随快照跨停车存续，答复后继续）。
+struct OpenStall {
+    var stuck: String
+    /// 卡点所在页（打开时的 URL）；页面离开该地址视为卡点已绕过。
+    var openURL: String
+    /// 打开时已消费的模型决策数（第 1 级预算强制结级的基准）。
+    var openedAtDecision: Int
+    /// 打开时页面有弹窗在场（frameClose 的 NA 判定依据之一）。
+    var dialogAtOpen: Bool
+    private(set) var verified: Set<StallMeans> = []
+    private(set) var notApplicable: [StallMeans: String] = [:]
+    /// 已执行的 click 目标键集合（替代入口＝出现第二个不同目标键）。
+    private(set) var clickedTargets: Set<String> = []
+    /// 第 1 级期间真实执行过 click（揭示复判与坐标落点同为引擎
+    /// click 实现面：点前揭示复判＋按元素中心真实坐标派发序列）。
+    private(set) var clickExecuted = false
+    /// 第 1 级期间有弹窗点按无响应信号或导航绕行真实出手。
+    private(set) var frameCloseTried = false
+    /// 词表外动作留痕（F4：计入卡点证据，不终结任务）。
+    private(set) var invalidActions: [String] = []
+    /// 感知盲区留痕（F5：hover 显形探测探不到时如实记账）。
+    var perceptionBlindNote: String?
+
+    mutating func verify(_ means: StallMeans) { verified.insert(means) }
+    mutating func markNA(_ means: StallMeans, reason: String) {
+        if !verified.contains(means), notApplicable[means] == nil { notApplicable[means] = reason }
+    }
+    mutating func noteClickTarget(_ key: String) {
+        clickExecuted = true
+        clickedTargets.insert(key)
+        verify(.revealClick)
+        verify(.coordClick)
+        if clickedTargets.count >= 2 { verify(.altEntry) }
+    }
+    mutating func noteInvalidAction(_ name: String) { invalidActions.append(name) }
+
+    init(stuck: String, openURL: String, openedAtDecision: Int, dialogAtOpen: Bool) {
+        self.stuck = stuck
+        self.openURL = openURL
+        self.openedAtDecision = openedAtDecision
+        self.dialogAtOpen = dialogAtOpen
+    }
+    /// 快照往返构造（字段全部可选落盘，旧快照无此组键时卡点为空）。
+    init(stuck: String, openURL: String, openedAtDecision: Int, dialogAtOpen: Bool,
+         verifiedRaw: [String], na: [String: String], clicked: [String], clickExecuted: Bool,
+         frameCloseTried: Bool, invalid: [String], blind: String?) {
+        self.init(stuck: stuck, openURL: openURL, openedAtDecision: openedAtDecision, dialogAtOpen: dialogAtOpen)
+        verified = Set(verifiedRaw.compactMap { StallMeans(rawValue: $0) })
+        for (key, value) in na { if let m = StallMeans(rawValue: key) { notApplicable[m] = value } }
+        clickedTargets = Set(clicked)
+        self.clickExecuted = clickExecuted
+        self.frameCloseTried = frameCloseTried
+        invalidActions = invalid
+        perceptionBlindNote = blind
+    }
+    var verifiedRaw: [String] { verified.map { $0.rawValue } }
+    var naRaw: [String: String] { Dictionary(uniqueKeysWithValues: notApplicable.map { ($0.key.rawValue, $0.value) }) }
+    var clickedRaw: [String] { Array(clickedTargets) }
+
+    /// 第 1 级完成判据：每项手段或已验收、或已判定不适用。
+    var rung1Complete: Bool { StallMeans.allCases.allSatisfy { verified.contains($0) || notApplicable[$0] != nil } }
+    /// 逐项验收的人读汇总（进梯账与结案文案，F1 可见性）。
+    var meansSummary: String {
+        StallMeans.allCases.map { m in
+            if verified.contains(m) { return "\(m.label)✓" }
+            if let why = notApplicable[m] { return "\(m.label)不适用（\(why)）" }
+            return "\(m.label)未试"
+        }.joined(separator: "、")
     }
 }
 
@@ -282,6 +528,10 @@ enum DirectTargetHarvest {
     /// 绕行梯现场（AUTONOMY-FIX）：能力类卡点的已试梯级与逐级留痕，
     /// 随任务存活、随快照落盘（恢复后已试梯级不重走）。
     private var bypassLadder = BypassLadder()
+    /// 在开的能力卡点（LADDER-FIX F2）：非 nil＝有卡点尚未解除——
+    /// 梯级推进权在引擎（done 梯门＋每轮动作后推进钩子），不再等
+    /// 模型第二次 ask_user；随快照落盘，跨澄清类停车与进程恢复存续。
+    private var openStall: OpenStall?
     /// 本任务已加载的 playbook（ADOPTION-TOP3 第 3 条）：名称防重复加载，正文
     /// 随每次模型调用注入任务上下文；playbook 只是提示层，安全判定不读它。
     private var loadedSkillNames: [String] = []
@@ -440,6 +690,8 @@ enum DirectTargetHarvest {
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
         // 绕行梯随新任务重置（AUTONOMY-FIX）：每个任务从梯级①重新开始
         bypassLadder = BypassLadder()
+        // 在开卡点随新任务重置（LADDER-FIX）：卡点是单任务现场
+        openStall = nil
         // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
@@ -877,6 +1129,14 @@ enum DirectTargetHarvest {
                         stepBudget.consumeDecision()
                         try await checkpoint(token)
                         if action.action == "done" {
+                            // done 梯门（LADDER-FIX F2）：有在开卡点且绕行
+                            // 梯未尽时 done 不得直接结案——引擎先推进梯
+                            // 级：驱动成功则本轮不接受 done、带着新页面
+                            // 继续；卡点已绕过或梯已尽才放行；梯尽抛失败
+                            // 结案错误走外层收口。
+                            if let gate = try await evaluateDoneGate(token: token), gate == .driven {
+                                continue
+                            }
                             // 完成总结是模型回读页面后写下的核实结论：钉进台账
                             // 里仍待核查的条目，后续追问轮次据此守定力口径
                             markOutcomesVerified(summary: action.summary)
@@ -889,6 +1149,13 @@ enum DirectTargetHarvest {
                             advanceQueue()
                             return
                         }
+                        // 本轮的循环检测指纹（动作＋目标＋结果），分支内赋值、分支后统一裁决。
+                        // 声明在 ask_user 分支之前，且执行链与 ask_user 构成互斥的
+                        // else-if 链（LADDER-FIX 回路级修复）：能力类 ask_user 由绕行
+                        // 梯在本分支内接管后，本轮不得再落入链尾 else——历史上它落进
+                        // else 被 execute 以「不可执行动作」硬终结，且旧 else 先执行后
+                        // 记账、该动作无留痕（诊断 D2「触发字符串查不到」的成因）。
+                        var loopFingerprint: String?
                         if action.action == "ask_user" {
                             record(action)
                             // 介入分类门（AUTONOMY-FIX）：ask_user 先分类——
@@ -899,15 +1166,16 @@ enum DirectTargetHarvest {
                             switch InterventionGate.classifyAskUser(declared: action.askKind, question: action.question) {
                             case .capability:
                                 try await handleCapabilityStall(stuck: "模型请求用户亲手操作网页：\(action.question)", token: token)
+                                loopFingerprint = LoopDetector.fingerprint(action: "ask_user", target: "", outcome: "capability-stall")
                             case .safety, .clarify:
+                                // 澄清类停车不吞卡点（LADDER-FIX F2）：卡点
+                                // 在开时步流明示其保持在开，答复续跑后继续推进
+                                noteClarifyDuringStall(question: action.question)
                                 waitingInput = .question(id: UUID(), text: action.question)
                                 status = .waitingManual(action.question); persistSnapshot()
                                 return
                             }
-                        }
-                        // 本轮的循环检测指纹（动作＋目标＋结果），分支内赋值、分支后统一裁决
-                        var loopFingerprint: String?
-                        if action.action == "use_skill" {
+                        } else if action.action == "use_skill" {
                             // playbook 加载（ADOPTION-TOP3 第 3 条）：正文只在命中时注入
                             // 本任务上下文，加载结果记入步流（用户可见）；加载不改变任何
                             // 安全判定——确认／手输流程照旧走 runTargeted 的安全检查。
@@ -943,11 +1211,24 @@ enum DirectTargetHarvest {
                                 targetKey = ElementDescriptor(page.elements[action.index]).key
                                 if action.action == "type" { targetKey += "|\(LoopDetector.textFingerprint(action.text))" }
                             }
+                            // 感知标注（LADDER-FIX F5）：预览链接与编辑控件
+                            // 在感知层明确区分——目标是带 tempkey 的临时预
+                            // 览链接时先行标注：它打开的是预览页、不是编辑
+                            // 器，不得据此认定可编辑或已发表；编辑入口另找。
+                            if action.action == "click", action.index >= 0, action.index < page.elements.count {
+                                let targetElement = page.elements[action.index]
+                                if targetElement.linkKind == "preview" {
+                                    appendStep("perception", "感知标注：目标「\(targetElement.text.isEmpty ? targetElement.ariaLabel : targetElement.text)」的链接是带 tempkey 的临时预览链接——点开是预览页、不是编辑器，不得据此认定已进入编辑或已发表；编辑入口须另找（绕行梯直达 URL 一级只从页面实证采集编辑入口，预览链接不作候选）")
+                                }
+                            }
                             // 目标获取走失效恢复（runTargeted）：页面在模型思考／执行期间重排时
                             // 按稳定描述重找重绑，不再把「目标已失效／已变化」直接判为任务失败。
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
                                 record(action)
+                                // 卡点逐项验收记账（LADDER-FIX F2）：真实
+                                // 执行成功的 click 计入在开卡点的手段证据
+                                noteExecutedActionForStall(actionName: action.action, targetKey: targetKey)
                                 flushPendingOutcomeStep()
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: targetKey, outcome: "executed")
                                 try await Task.sleep(for: .milliseconds(500))
@@ -996,14 +1277,33 @@ enum DirectTargetHarvest {
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: "index:\(action.index)", outcome: "strategy-switch")
                             }
                         } else {
-                            try await checkpoint(token)
-                            executionSerial += 1
-                            try await web.execute(action, expected: nil)
-                            try await checkpoint(token)
+                            // 先记账后分发（LADDER-FIX F1）：含词表外动作
+                            // 在内，每个动作先在步流留下动作字符串再执行，
+                            // 被拒动作不再无留痕。词表外动作去终结化
+                            // （F4）：执行层抛「不可执行动作」时记账＋回注
+                            // 纠正＋计入在开卡点的证据，不置 .failed、不清
+                            // 快照，任务继续；其余错误照旧上抛。
                             record(action)
-                            let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : (action.action == "set_site_mode" ? action.mode : "\(Int(action.seconds))"))
-                            loopFingerprint = LoopDetector.fingerprint(action: action.action, target: target, outcome: "ok")
-                            try await Task.sleep(for: .milliseconds(500))
+                            var executedOK = true
+                            do {
+                                try await checkpoint(token)
+                                executionSerial += 1
+                                try await web.execute(action, expected: nil)
+                                try await checkpoint(token)
+                            } catch {
+                                guard Self.isUnexecutableActionError(error) else { throw error }
+                                executedOK = false
+                                handleInvalidAction(action)
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.action, outcome: "invalid-action")
+                            }
+                            if executedOK {
+                                let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : (action.action == "set_site_mode" ? action.mode : "\(Int(action.seconds))"))
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: target, outcome: "ok")
+                                // 卡点逐项验收记账（F2）：站点模式切换真实
+                                // 执行成功计入在开卡点的手段证据
+                                noteExecutedActionForStall(actionName: action.action, targetKey: target)
+                                try await Task.sleep(for: .milliseconds(500))
+                            }
                         }
                         // 循环裁决（ADOPTION-TOP3 第 2 条）：警告只置位提醒、随下一次
                         // 调用注入；熔断＝真正停驻（已暂停、可继续），与步数上限的
@@ -1029,6 +1329,12 @@ enum DirectTargetHarvest {
                         }
                         // 一整轮迭代走通：瞬时连败清零
                         transientStreak = 0
+                        // 绕行梯引擎推进（LADDER-FIX F2）：卡点在开时，
+                        // 每轮末尾由引擎核对推进——页面离开卡点页则关
+                        // 卡点；第 1 级验收齐或预算到期则结级并同步驱
+                        // 动后续梯级。梯尽抛失败结案错误，经外层 catch
+                        // 收口（瞬时错误分类不吞它：文案前缀不在其列）。
+                        try await advanceLadderIfNeeded(token: token)
                     } catch {
                         guard token == generation else { return }
                         if error is CancellationError { throw error }
@@ -1388,11 +1694,22 @@ enum DirectTargetHarvest {
                 }
                 return .executed
             } catch {
-                // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改）：
-                // 能力类卡点，不是失效类错误，重找重试只会再连败——不
-                // 停车等用户代劳，改走绕行梯：弹窗导航绕行成功 → 按
-                // 策略切换交模型按新快照重新判断；绕行失败 → 失败结案。
+                // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改、
+                // LADDER-FIX 补卡点联动）：能力类卡点，不是失效类错误，
+                // 重找重试只会再连败——不停车等用户代劳。卡点已在开时：
+                // frame 感知关闭连败计入卡点证据（第 1 级 frameClose
+                // 项），按策略切换交模型续跑，梯级推进由引擎钩子驱动
+                // （不再从这里跳过第 2 级直达第 3 级）；无在开卡点时沿
+                // 用既有直达弹窗导航绕行口径，绕行失败 → 失败结案。
                 if Self.modalInterventionText(for: error) != nil {
+                    if var stall = openStall {
+                        stall.frameCloseTried = true
+                        stall.verify(.frameClose)
+                        openStall = stall
+                        appendStep("click", "弹窗点按无响应（能力卡点）：frame 感知关闭连败已计入在开卡点的证据（第 1 级 frame 感知关闭项验收），引擎将按绕行梯继续推进（直达 URL／弹窗导航绕行），不停车等用户代劳")
+                        persistSnapshot()
+                        return .strategySwitch
+                    }
                     appendStep("click", "弹窗点按无响应（能力卡点）：不停车等用户代劳，改走绕行梯（弹窗导航绕行）")
                     if await driveDialogBypass(token: token) {
                         appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，请按最新页面重新判断")
@@ -1498,59 +1815,241 @@ enum DirectTargetHarvest {
         return "当前页状态读取失败"
     }
 
-    /// 梯尽失败结案错误：文案由分类门组装（卡点＋已试路径＋页面证据，
-    /// 不出现请用户代劳的措辞），由 launch 外层 catch 置 .failed 收口。
+    /// 梯尽失败结案错误：文案由分类门组装（卡点＋已试路径＋harvest
+    /// 实况节＋页面证据，不出现请用户代劳的措辞），由 launch 外层
+    /// catch 置 .failed 收口。harvest 实况取梯账里最近一次采集的
+    /// 回写（F6）；从未运行过 harvest 时文案明示未运行原因。
     private func capabilityFailureError(stuck: String) async -> MikaError {
-        MikaError(InterventionGate.failureSummary(stuck: stuck, ladder: bypassLadder, evidence: await currentPageEvidence()))
+        MikaError(InterventionGate.failureSummary(stuck: stuck, ladder: bypassLadder, evidence: await currentPageEvidence(), harvestFact: bypassLadder.harvestFact))
     }
 
-    /// 能力类卡点处理（AUTONOMY-FIX）：分类门拒绝停车后调用——按绕行
-    /// 梯逐级尝试（每级只试一轮、逐级留痕进梯账与步流），任一级驱动
-    /// 成功即返回（主循环在本轮继续）；梯尽抛失败结案错误。
+    /// 能力类卡点处理（AUTONOMY-FIX 立、LADDER-FIX F2 改引擎驱动）：
+    /// 分类门拒绝停车后调用。首次信号＝打开卡点并下达第 1 级——本级
+    /// 只下达、不记 attempted，逐项验收由引擎在后续每轮动作后核对
+    /// （见 advanceLadderIfNeeded）；卡点已在开时再收到能力类信号＝
+    /// 强制结第 1 级并由引擎同步驱动后续梯级。不再把梯级推进权留给
+    /// 模型（旧口径等第二次 ask_user 才推进，现场实证梯子永停第 1 级）。
     private func handleCapabilityStall(stuck: String, token: UUID) async throws {
+        if openStall == nil {
+            let census = await web.dialogCensus()
+            let openURL = (try? await web.state())?.url ?? ""
+            openStall = OpenStall(stuck: stuck, openURL: openURL, openedAtDecision: stepBudget.totalUsed, dialogAtOpen: !census.hits.isEmpty)
+            appendStep("bypass", "能力卡点不停车（自主完成口径）：\(stuck)。绕行梯第 1 级「既有手段轮试」已下达——推进权在引擎：本级逐项验收（揭示复判再点／站点模式／替代入口／坐标点击／frame 感知关闭），下达不等于已试；验收齐或预算到期后引擎自动推进到直达 URL 一级，无需第二次信号")
+            pendingLoopHint = "【能力卡点·绕行梯进行中】刚才的卡点属于能力类，按自主完成口径不许停下等用户亲手操作。现在逐项试既有手段（每项一轮，引擎逐项验收）：①入口先 scroll 揭示再点（引擎点前会自动揭示复判）；②set_site_mode 换站点模式；③站内同功能替代入口；④坐标点击；⑤弹窗照常 click（引擎有 frame 感知关闭）。引擎会在验收齐或预算到期后自动推进绕行梯下一级；确实无路时用 ask_user 只说明卡点与已试路径（不要请用户代劳）。"
+            await runHoverProbeIfEntryStall(token: token)
+            persistSnapshot()
+            return
+        }
+        appendStep("bypass", "能力卡点再次上报（卡点保持在开）：\(stuck)。引擎据此强制结第 1 级并推进后续梯级")
+        try await completeRung1AndProgress(token: token, forcedBy: "第二次能力类信号")
+    }
+
+    /// 关闭在开卡点（绕过成功／页面已离开卡点页）：步流留痕后清空，
+    /// 梯账保留原样（未走完的梯级不补记、不假装已试）。
+    private func closeStall(note: String) {
+        guard let stall = openStall else { return }
+        appendStep("bypass", "卡点关闭：\(note)（卡点：\(stall.stuck)；第 1 级验收进度：\(stall.meansSummary)）")
+        openStall = nil
+    }
+
+    /// 结第 1 级并驱动后续梯级（F2 的同步推进点）：frameClose 在结级
+    /// 时收口——期间有弹窗信号记验收；打开与结级普查均无弹窗则记
+    /// 不适用（依据留痕）；其余未试项按强制结级如实写入梯账。
+    private func completeRung1AndProgress(token: UUID, forcedBy: String) async throws {
+        guard var stall = openStall else { return }
+        if !stall.verified.contains(.frameClose), stall.notApplicable[.frameClose] == nil {
+            if stall.frameCloseTried {
+                stall.verify(.frameClose)
+            } else if !stall.dialogAtOpen {
+                let census = await web.dialogCensus()
+                if census.hits.isEmpty {
+                    stall.markNA(.frameClose, reason: "卡点打开与结级两次普查均无弹窗在场")
+                } else {
+                    stall.dialogAtOpen = true
+                }
+            }
+            openStall = stall
+        }
+        if !bypassLadder.attempted.contains(.existingMeans) {
+            let forced = !stall.rung1Complete
+            bypassLadder.markAttempted(.existingMeans, note: "逐项验收：\(stall.meansSummary)\(forced ? "（\(forcedBy)强制结级，未试项如上如实记录）" : "（全部验收齐或判定不适用）")")
+        }
+        appendStep("bypass", "绕行梯第 1 级结级（\(forcedBy)）：\(stall.meansSummary)，引擎推进下一级")
+        persistSnapshot()
+        try await progressRungsBeyondFirst(token: token)
+    }
+
+    /// 驱动第 2、3 级（引擎同步执行，不等模型）：任一级成功即关卡点
+    /// 返回；全部失败＝梯尽，关卡点并抛失败结案错误（结案文案含
+    /// F6 harvest 实况节）。第 2 级 harvest 的实况与跨页模板记忆在
+    /// 每次采集后回写梯账，结案与步流都读得到。
+    private func progressRungsBeyondFirst(token: UUID) async throws {
         while let rung = bypassLadder.nextRung {
             try await checkpoint(token)
             switch rung {
             case .existingMeans:
-                // 梯级①：既有手段由模型在后续轮次逐项轮试（引擎的揭示
-                // 复判/frame 感知关闭在点击路径内自动在场），本级以指令
-                // 注入＋留痕完成，模型试完仍卡住会再发 ask_user 推进梯级
-                bypassLadder.markAttempted(.existingMeans, note: "已下达既有手段轮试指令（揭示复判／站点模式／替代入口／坐标点击／frame 感知关闭各一轮）")
-                appendStep("bypass", "能力卡点不停车（自主完成口径）：\(stuck)。绕行梯第 1 级「既有手段轮试」——模型接下来逐项试：入口先揭示复判再点、换站点模式、找同功能替代入口、坐标点击、弹窗走 frame 感知关闭；每项只试一轮，仍卡住再发 ask_user 只说明卡点，引擎将推进到直达 URL 一级")
-                pendingLoopHint = "【能力卡点·绕行梯进行中】刚才的卡点属于能力类，按自主完成口径不许停下等用户亲手操作。现在逐项试既有手段（每项一轮）：①入口先 scroll 揭示再点（引擎点前会自动揭示复判）；②set_site_mode 换站点模式；③站内同功能替代入口；④坐标点击；⑤弹窗照常 click（引擎有 frame 感知关闭）。都试过仍卡住时，再用 ask_user 只说明卡点与已试路径（不要请用户代劳），引擎会推进绕行梯下一级。"
-                persistSnapshot()
-                return
+                // 第 1 级由 completeRung1AndProgress 结级后才进本函数；
+                // 快照恢复等边角下若它仍是下一级，按已下达口径补记并继续
+                bypassLadder.markAttempted(.existingMeans, note: "第 1 级已下达（恢复现场补记，逐项验收以在开卡点账为准）")
             case .directURL:
-                if let harvest = await web.harvestDirectTargets() {
+                let outcome = await web.harvestDirectTargets(memoryTemplate: bypassLadder.harvestTemplate)
+                let pageURL = (try? await web.state())?.url ?? ""
+                bypassLadder.noteHarvest(template: outcome.facts.editTemplate, templateFrom: outcome.facts.editTemplate == nil ? nil : pageURL, fact: outcome.facts.line)
+                if let harvest = outcome.result {
                     do {
                         executionSerial += 1
                         try await web.loadOnExecutionTab(harvest.url)
                     } catch {
                         // 候选地址导航失败：记为此级失败、推进下一级，
                         // 不让一个坏候选杀掉整个任务
-                        bypassLadder.markAttempted(.directURL, note: "实证提取到 appmsgid=\(harvest.appmsgid) 的候选，但导航失败：\(error.localizedDescription)")
-                        appendStep("bypass", "绕行梯第 2 级「直达 URL」导航失败（appmsgid=\(harvest.appmsgid)）：\(error.localizedDescription)，推进下一级")
+                        bypassLadder.markAttempted(.directURL, note: "候选导航失败：\(error.localizedDescription)；\(outcome.facts.line)")
+                        appendStep("bypass", "绕行梯第 2 级「直达 URL」导航失败：\(error.localizedDescription)（\(outcome.facts.line)），推进下一级")
                         continue
                     }
-                    bypassLadder.markAttempted(.directURL, note: "从页面已有链接实证提取 appmsgid=\(harvest.appmsgid)（\(harvest.viaTemplate ? "以页面内编辑链接模板拼出" : "页面内已有带 ID 的编辑链接")），已导航直达")
-                    appendStep("bypass", "绕行梯第 2 级「直达 URL」：已从当前页链接实证提取目标（appmsgid=\(harvest.appmsgid)），直接导航到编辑页：\(harvest.url)")
-                    try await checkpoint(token)
+                    bypassLadder.markAttempted(.directURL, note: "采用候选 appmsgid=\(harvest.appmsgid)（来源：\(harvest.source)\(harvest.viaTemplate ? "、模板拼装" : "、带 ID 直用")\(harvest.crossPage ? "、跨页模板记忆" : "")），已导航直达；\(outcome.facts.line)")
+                    appendStep("bypass", "绕行梯第 2 级「直达 URL」成功：\(outcome.facts.line)；已导航直达：\(harvest.url)")
                     _ = await web.settledCapture()
-                    pendingLoopHint = "【能力卡点·绕行梯进行中】引擎已用直达 URL 打开目标页（模板与 ID 均取自页面已有链接实证）。请按最新页面快照继续完成任务；若仍被弹窗等卡住，再用 ask_user 只说明卡点，引擎将推进到弹窗导航绕行一级。"
+                    closeStall(note: "直达 URL 已打开目标页")
+                    pendingLoopHint = "【能力卡点·绕行梯】引擎已用直达 URL 打开目标页（模板与 ID 均取自页面实证采集，含 data 属性／onclick／内嵌数据等来源）。请按最新页面快照继续完成任务。"
                     persistSnapshot()
                     return
                 }
-                bypassLadder.markAttempted(.directURL, note: "当前页链接中提取不到目标 ID 或编辑链接模板，此级无候选（不凭记忆编造 URL）")
-                appendStep("bypass", "绕行梯第 2 级「直达 URL」无候选：当前页链接里提取不到目标 ID 与编辑链接模板（不凭记忆编造 URL），推进下一级")
+                bypassLadder.markAttempted(.directURL, note: outcome.facts.line)
+                appendStep("bypass", "绕行梯第 2 级「直达 URL」落空：\(outcome.facts.line)，推进下一级")
             case .dialogNavBypass:
                 let outcome = await attemptDialogNavBypass(token: token)
                 bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
                 appendStep("bypass", "绕行梯第 3 级「弹窗导航绕行」：\(outcome.note)")
-                persistSnapshot()
-                if outcome.success { return }
+                if outcome.success {
+                    closeStall(note: "弹窗导航绕行成功，弹窗已消失")
+                    persistSnapshot()
+                    return
+                }
             }
         }
+        let stuck = openStall?.stuck ?? "能力类卡点"
+        openStall = nil
         throw await capabilityFailureError(stuck: stuck)
+    }
+
+    /// 每轮动作后的引擎推进钩子（F2，主循环迭代末尾调用）：卡点在开
+    /// 时由引擎核对——页面已离开卡点页＝卡点绕过、关卡点；第 1 级
+    /// 验收齐＝立即结级推进；打开后模型决策达 10 次仍未齐＝预算强制
+    /// 结级（防梯子无限悬置）。推进中某级成功则关卡点续跑，梯尽抛
+    /// 失败结案错误由主循环外层收口。
+    private func advanceLadderIfNeeded(token: UUID) async throws {
+        guard let stall = openStall else { return }
+        if !stall.openURL.isEmpty, let now = try? await web.state(), now.url != stall.openURL {
+            closeStall(note: "页面已离开卡点页（\(stall.openURL) → \(now.url)），卡点视为已绕过，绕行梯停止推进")
+            persistSnapshot()
+            return
+        }
+        // frameClose 收口：只差此一项且打开时无弹窗时，做一次普查判
+        // 定不适用——避免第 1 级因「没弹窗可关」永远悬置；普查只在
+        // 其余手段已齐时做，不给每轮迭代加固定开销
+        if !stall.verified.contains(.frameClose), stall.notApplicable[.frameClose] == nil,
+           !stall.frameCloseTried, !stall.dialogAtOpen,
+           StallMeans.allCases.filter({ $0 != .frameClose }).allSatisfy({ stall.verified.contains($0) || stall.notApplicable[$0] != nil }) {
+            let census = await web.dialogCensus()
+            if census.hits.isEmpty, var current = openStall {
+                current.markNA(.frameClose, reason: "卡点期间无弹窗信号、推进钩子普查亦无弹窗在场")
+                openStall = current
+            }
+        }
+        guard let current = openStall else { return }
+        if current.rung1Complete {
+            try await completeRung1AndProgress(token: token, forcedBy: "第 1 级逐项验收齐")
+        } else if stepBudget.totalUsed - current.openedAtDecision >= 10 {
+            try await completeRung1AndProgress(token: token, forcedBy: "第 1 级预算到期（卡点打开后已过 10 次模型决策）")
+        }
+    }
+
+    /// done 梯门（F2）：主循环接受模型 done 前调用——无在开卡点返回
+    /// nil（照常结案）；页面已离开卡点页或梯已尽返回 .bypassed（关
+    /// 卡点、放行 done）；其余情形强制结第 1 级并驱动后续梯级，驱动
+    /// 成功返回 .driven（本轮不接受 done、继续循环），梯尽抛失败
+    /// 结案错误。杜绝「梯未尽而 done 被无条件接受、结案不读梯账」。
+    private enum DoneGateOutcome { case bypassed, driven }
+    private func evaluateDoneGate(token: UUID) async throws -> DoneGateOutcome? {
+        guard let stall = openStall else { return nil }
+        if bypassLadder.exhausted {
+            appendStep("bypass", "done 梯门：卡点在开但绕行梯已尽（梯账见步流），放行 done 结案")
+            openStall = nil
+            return .bypassed
+        }
+        if !stall.openURL.isEmpty, let now = try? await web.state(), now.url != stall.openURL {
+            closeStall(note: "done 梯门放行：页面已离开卡点页，卡点视为已绕过")
+            persistSnapshot()
+            return .bypassed
+        }
+        appendStep("bypass", "done 梯门：有在开卡点且绕行梯未尽（第 1 级验收进度：\(stall.meansSummary)），本次 done 不直接结案，引擎先推进绕行梯")
+        try await completeRung1AndProgress(token: token, forcedBy: "done 梯门触发")
+        return .driven
+    }
+
+    /// 已执行动作的卡点记账（F2 逐项验收的证据入口）：只记真实执行
+    /// 成功的动作——click 记目标键（揭示复判与坐标落点同为引擎 click
+    /// 的实现面：点前自动揭示复判＋按元素中心真实坐标派发点按序列，
+    /// 一次真实执行同时构成两项实证，口径在此明示不拆假账）；第二
+    /// 个不同目标键的 click 记替代入口；set_site_mode 记站点模式。
+    private func noteExecutedActionForStall(actionName: String, targetKey: String) {
+        guard var stall = openStall else { return }
+        switch actionName {
+        case "click": stall.noteClickTarget(targetKey)
+        case "set_site_mode": stall.verify(.siteMode)
+        default: return
+        }
+        openStall = stall
+        persistSnapshot()
+    }
+
+    /// 澄清类 ask_user 不吞卡点（F2）：卡点在开时澄清停车照旧，但步
+    /// 流明示卡点保持在开——答复续跑后绕行梯从原进度继续推进。
+    private func noteClarifyDuringStall(question: String) {
+        guard let stall = openStall else { return }
+        appendStep("bypass", "澄清问题停车等待（问题：\(question)）：在开卡点不因此关闭——卡点「\(stall.stuck)」保持在开（第 1 级验收进度：\(stall.meansSummary)），答复续跑后引擎继续推进绕行梯")
+    }
+
+    /// 词表外动作的去终结化处理（F4）：主循环 else 分支捕获执行层
+    /// 「不可执行动作」后调用——动作字符串已由调用方先行记账，此处
+    /// 补可见说明、回注纠正提示、计入在开卡点的证据；不置 .failed、
+    /// 不清快照，任务继续。
+    private func handleInvalidAction(_ action: AgentAction) {
+        if var stall = openStall {
+            stall.noteInvalidAction(action.action)
+            openStall = stall
+        }
+        appendStep("invalid", "词表外动作「\(action.action)」不可执行：已记账留痕（理由：\(action.reason)），任务不因此终结、进度不清零\(openStall != nil ? "，并已计入在开卡点的证据" : "")；已回注模型改用可执行动作词表")
+        pendingLoopHint = "【动作词表纠正】你上一步用的动作名「\(action.action)」不在可执行词表内，未被执行（任务未因此失败、进度未清零）。可执行动作只有：navigate、click、type、scroll、wait、set_site_mode、open_new_tab、generate_cover、upload_file、use_skill、ask_user、done。请改用词表内动作继续完成任务。"
+    }
+
+    /// 执行层词表外动作的错误判定（F4）：WebController.execute 的
+    /// default 分支抛 MikaError("不可执行动作")，仅此一义。
+    private static func isUnexecutableActionError(_ error: Error) -> Bool {
+        (error as? MikaError)?.message == "不可执行动作"
+    }
+
+    /// 入口型卡点的 hover 显形探测（F5）：卡点打开时若当前页既无编
+    /// 辑链接元素、也无可编辑元素（编辑入口不在感知层视野内），引擎
+    /// 在主 frame 对卡片状容器派发 hover 并对比显形——探到的新入口
+    /// 写进去向提示供模型下一轮使用；探不到如实记入卡点盲区账，
+    /// 不假装已排除 hover 显形这一可能。
+    private func runHoverProbeIfEntryStall(token: UUID) async {
+        guard openStall != nil, let page = try? await web.state() else { return }
+        let hasEditLink = page.elements.contains { $0.linkKind == "edit" }
+        let hasEditable = page.elements.contains { $0.editable }
+        guard !hasEditLink, !hasEditable else { return }
+        let report = await web.hoverRevealProbe()
+        if report.revealed.isEmpty {
+            if var stall = openStall {
+                stall.perceptionBlindNote = report.summary
+                openStall = stall
+            }
+            appendStep("perception", "感知盲区记账：\(report.summary)——编辑入口可能为 hover 显形或无文本图标，当前感知层未 surface，梯账如实记录此盲区")
+        } else {
+            appendStep("perception", "hover 显形探测：\(report.summary)，请按最新页面快照点新显形的入口")
+            pendingLoopHint = (pendingLoopHint ?? "") + "\n【感知补充】引擎已对当前页卡片容器做过一轮 hover 显形探测：\(report.summary)。请按最新页面快照尝试这些新显形的入口。"
+        }
     }
 
     /// 弹窗能力卡点的绕行驱动（AUTONOMY-FIX，runTargeted／runConfirmed
@@ -1559,6 +2058,13 @@ enum DirectTargetHarvest {
     /// 已消失、页面可继续；false＝可用梯级已尽（梯账已记全，调用方
     /// 走失败结案）。
     private func driveDialogBypass(token: UUID) async -> Bool {
+        // 卡点在开时（LADDER-FIX）：frame 感知关闭连败先记入卡点账
+        // （第 1 级 frameClose 项的实证），绕行成功即关卡点
+        if var stall = openStall {
+            stall.frameCloseTried = true
+            stall.verify(.frameClose)
+            openStall = stall
+        }
         if !bypassLadder.attempted.contains(.existingMeans) {
             bypassLadder.markAttempted(.existingMeans, note: "执行层 frame 感知关闭（框内五阶段）已在抛错前试过并连败")
         }
@@ -1566,6 +2072,9 @@ enum DirectTargetHarvest {
         let outcome = await attemptDialogNavBypass(token: token)
         bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
         appendStep("bypass", "弹窗导航绕行：\(outcome.note)")
+        if outcome.success, openStall != nil {
+            closeStall(note: "弹窗导航绕行成功，弹窗已消失")
+        }
         persistSnapshot()
         return outcome.success
     }
@@ -1688,10 +2197,11 @@ enum DirectTargetHarvest {
             return lines
         }
         try? await Task.sleep(for: .milliseconds(1000))
-        if let harvest = await web.harvestDirectTargets() {
-            lines.append("\(fmt(harvest.appmsgid == "100000001" && harvest.url.contains("appmsg_edit"))) 直达提取实测：合成页链接农场提取到 appmsgid=\(harvest.appmsgid)、URL 含 appmsg_edit=\(harvest.url.contains("appmsg_edit"))（期望 100000001/true，模板与 ID 均来自页面真实链接）")
+        let harvestOutcome = await web.harvestDirectTargets(memoryTemplate: nil)
+        if let harvest = harvestOutcome.result {
+            lines.append("\(fmt(harvest.appmsgid == "100000001" && harvest.url.contains("appmsg_edit"))) 直达提取实测：合成页链接农场提取到 appmsgid=\(harvest.appmsgid)、URL 含 appmsg_edit=\(harvest.url.contains("appmsg_edit"))（期望 100000001/true，模板与 ID 均来自页面真实链接；\(harvestOutcome.facts.line)）")
         } else {
-            lines.append("✗ 直达提取实测：合成页链接农场未提取到候选")
+            lines.append("✗ 直达提取实测：合成页链接农场未提取到候选（\(harvestOutcome.facts.line)）")
         }
         let censusBefore = await web.dialogCensus()
         lines.append("\(fmt(!censusBefore.hits.isEmpty)) 弹窗基线：绕行前 frame 普查命中弹窗 \(censusBefore.hits.count) 个（合成条款弹窗在场，按钮无行为、点按不关）")
@@ -1703,6 +2213,168 @@ enum DirectTargetHarvest {
         default:
             lines.append("✓ 全程无停车态：分类门与绕行梯驱动期间引擎未进入等待确认/等待手输状态")
         }
+        return lines
+    }
+
+    /// 自检二十一（LADDER-FIX）：绕行梯引擎驱动的回路级核查。诊断 D5
+    /// 指出旧自检只测纯函数状态机——本检除纯逻辑断言外，真实调用主
+    /// 循环同款生产函数（handleCapabilityStall／
+    /// noteExecutedActionForStall／advanceLadderIfNeeded／
+    /// evaluateDoneGate／handleInvalidAction／noteClarifyDuringStall）
+    /// 在两张合成页上驱动完整回路：单次信号开卡点→逐项验收→引擎自
+    /// 动推进到直达级；done 过梯门；零候选推进第 3 级并在梯尽结案文
+    /// 案里见到 harvest 实况；词表外动作不终结；澄清不吞卡点。测试
+    /// 前后保存/恢复引擎的梯账、卡点、步流、目标与预算，结束不留现
+    /// 场。不调用模型；要求引擎空闲（驱动会占用执行页打开合成页）。
+    func verifyLadderFix() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十一未执行（先等当前任务终结或停止）"] }
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        func el(_ href: String) -> PageElement {
+            PageElement(index: 0, tag: "a", type: "", text: "样本", placeholder: "", href: href, name: "", inputType: "", ariaLabel: "", nameSource: "text", inView: true, sensitive: false, disabled: false, editable: false)
+        }
+        // —— 纯逻辑部 ——
+        var stallProbe = OpenStall(stuck: "样本卡点", openURL: "https://example.com/list", openedAtDecision: 0, dialogAtOpen: false)
+        let freshOK = !stallProbe.rung1Complete && stallProbe.meansSummary.contains("未试")
+        stallProbe.noteClickTarget("target-a")
+        let oneClickOK = stallProbe.verified.contains(.revealClick) && stallProbe.verified.contains(.coordClick) && !stallProbe.verified.contains(.altEntry)
+        stallProbe.noteClickTarget("target-b")
+        stallProbe.verify(.siteMode)
+        let midOK = stallProbe.verified.contains(.altEntry) && stallProbe.verified.contains(.siteMode) && !stallProbe.rung1Complete
+        stallProbe.markNA(.frameClose, reason: "样本无弹窗")
+        lines.append("\(fmt(freshOK && oneClickOK && midOK && stallProbe.rung1Complete)) 第 1 级逐项验收（纯状态）：下达不记已试；一次真实 click 同时构成揭示复判＋坐标点击实证、同目标不冒充替代入口；第二个不同目标记替代入口；站点模式单独记账；frameClose 判不适用后本级才算完成")
+        let structured = DirectTargetHarvest.build(candidates: [
+            .init(source: .href, value: "https://example.com/s?__biz=Mz&mid=1&idx=1&sn=x&tempkey=abc"),
+            .init(source: .dataAttr, value: "100000777", attrName: "data-appmsgid"),
+            .init(source: .onclick, value: "openEditor('https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit')"),
+        ], memoryTemplate: nil)
+        lines.append("\(fmt(structured.result?.appmsgid == "100000777" && structured.result?.viaTemplate == true && structured.facts.previewExcluded == 1 && (structured.facts.perSource[.dataAttr] ?? 0) == 1)) harvest 扩展来源：data 属性裸 ID＋onclick 模板拼装成功；预览链接被排除并计数（其 mid 不冒充 appmsgid，未做任何标识映射假定）")
+        let embeddedOnly = DirectTargetHarvest.build(candidates: [
+            .init(source: .embedded, value: "{\"list\":[{\"link\":\"https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&appmsgid=100000888\"}]}"),
+        ], memoryTemplate: nil)
+        lines.append("\(fmt(embeddedOnly.result?.appmsgid == "100000888" && embeddedOnly.result?.viaTemplate == false)) harvest 内嵌数据：页面内嵌列表数据里的带 ID 编辑链接可直用")
+        let crossPage = DirectTargetHarvest.build(candidates: [
+            .init(source: .dataAttr, value: "100000999", attrName: "data-appmsgid"),
+        ], memoryTemplate: "https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit")
+        lines.append("\(fmt(crossPage.result?.appmsgid == "100000999" && crossPage.result?.crossPage == true)) harvest 跨页模板：本页只有实证 ID 时，用本任务先前页面实证见过的模板拼装并注明跨页")
+        let zeroFacts = DirectTargetHarvest.build(candidates: [], memoryTemplate: nil)
+        lines.append("\(fmt(zeroFacts.result == nil && zeroFacts.facts.total == 0 && zeroFacts.facts.line.contains("候选共 0 条"))) harvest 零候选：无结果且实况行明示候选共 0 条（F6 结案可见的口径）")
+        var ladderWithFact = BypassLadder()
+        ladderWithFact.noteHarvest(template: nil, templateFrom: nil, fact: zeroFacts.facts.line)
+        let summaryWithFact = InterventionGate.failureSummary(stuck: "样本卡点", ladder: ladderWithFact, evidence: "合成", harvestFact: ladderWithFact.harvestFact)
+        let summaryNoFact = InterventionGate.failureSummary(stuck: "样本卡点", ladder: BypassLadder(), evidence: "合成")
+        lines.append("\(fmt(summaryWithFact.contains("harvest 实况") && summaryWithFact.contains("候选共 0 条") && summaryNoFact.contains("未运行 harvest"))) 梯尽结案文案（F6）：强制含 harvest 实况节——有实况引实况，从未运行则明示未运行")
+        lines.append("\(fmt(Self.isUnexecutableActionError(MikaError("不可执行动作")) && !Self.isUnexecutableActionError(MikaError("其它错误")))) 词表外动作判定（F4）：执行层「不可执行动作」精确命中、其它错误不误吞")
+        lines.append("\(fmt(el("https://example.com/s?__biz=Mz&tempkey=abc").linkKind == "preview" && el("https://example.com/cgi-bin/appmsg?t=media/appmsg_edit&appmsgid=1").linkKind == "edit" && el("https://example.com/about").linkKind == "")) 感知区分（F5）：tempkey 预览链接、appmsg_edit 编辑链接与普通链接的 linkKind 判定正确（预览不冒充编辑入口）")
+        // —— 回路部：保存现场，结束恢复 ——
+        let savedLadder = bypassLadder
+        let savedStall = openStall
+        let savedSteps = steps
+        let savedSeq = stepSeq
+        let savedGoal = goal
+        let savedHint = pendingLoopHint
+        let savedBudget = stepBudget
+        // 场景 A：单次信号开卡点→生产记账喂齐手段→动作后钩子自动推进到直达级
+        do { try web.loadLocalOnExecutionTab("test-ladder") } catch {
+            lines.append("✗ 回路·场景A 合成页 test-ladder 加载失败：\(error.localizedDescription)")
+        }
+        if lines.last?.hasPrefix("✗ 回路·场景A") != true {
+            try? await Task.sleep(for: .milliseconds(900))
+            bypassLadder = BypassLadder(); openStall = nil
+            do {
+                try await handleCapabilityStall(stuck: "自检二十一·场景A：草稿编辑入口点不开", token: generation)
+                let openedOK = openStall != nil && !bypassLadder.attempted.contains(.existingMeans)
+                let perceptionOK = steps.contains { $0.action == "perception" }
+                lines.append("\(fmt(openedOK)) 回路·单次信号开卡点：第 1 级只下达不记 attempted（F2），卡点在开")
+                lines.append("\(fmt(perceptionOK)) 回路·入口型卡点感知（F5）：当前页无编辑链接/可编辑元素时已做 hover 显形探测，探到或盲区均已步流记账")
+                noteExecutedActionForStall(actionName: "click", targetKey: "card-a")
+                noteExecutedActionForStall(actionName: "click", targetKey: "card-b")
+                noteExecutedActionForStall(actionName: "set_site_mode", targetKey: "desktop")
+                try await advanceLadderIfNeeded(token: generation)
+                let factLine = bypassLadder.harvestFact ?? ""
+                let droveOK = bypassLadder.attempted.contains(.existingMeans) && bypassLadder.attempted.contains(.directURL) && openStall == nil
+                lines.append("\(fmt(droveOK && factLine.contains("data 属性"))) 回路·引擎自动推进：未等第二次 ask_user，动作后钩子已结第 1 级并驱动第 2 级直达成功、卡点关闭（harvest 实况：\(factLine)）")
+                let gateAfter = try await evaluateDoneGate(token: generation)
+                lines.append("\(fmt(gateAfter == nil)) 回路·卡点关闭后 done 梯门放行（无在开卡点时梯门不介入）")
+            } catch {
+                lines.append("✗ 回路·场景A 推进抛错：\(error.localizedDescription)")
+            }
+        }
+        // 场景 B：done 过梯门——卡点在开且梯未尽时 done 不直接结案，引擎驱动后才放行
+        do { try web.loadLocalOnExecutionTab("test-ladder") } catch {
+            lines.append("✗ 回路·场景B 合成页 test-ladder 加载失败：\(error.localizedDescription)")
+        }
+        if lines.last?.hasPrefix("✗ 回路·场景B") != true {
+            try? await Task.sleep(for: .milliseconds(900))
+            bypassLadder = BypassLadder(); openStall = nil
+            do {
+                try await handleCapabilityStall(stuck: "自检二十一·场景B：编辑入口点不开", token: generation)
+                let gate = try await evaluateDoneGate(token: generation)
+                let gateOK = gate == .driven && bypassLadder.attempted.contains(.directURL) && openStall == nil
+                    && steps.contains { $0.action == "bypass" && $0.reason.contains("done 梯门") }
+                lines.append("\(fmt(gateOK)) 回路·done 梯门：卡点在开且梯未尽时 done 被拦下，引擎强制结第 1 级并驱动直达级成功后才回到续跑（不直接结案、不读梯账结案）")
+            } catch {
+                lines.append("✗ 回路·场景B 梯门抛错：\(error.localizedDescription)")
+            }
+        }
+        // 场景 C：零候选页→第二次信号推进第 2 级落空→第 3 级重载后弹窗仍在→梯尽结案含 harvest 实况
+        do { try web.loadLocalOnExecutionTab("test-ladder-zero") } catch {
+            lines.append("✗ 回路·场景C 合成页 test-ladder-zero 加载失败：\(error.localizedDescription)")
+        }
+        if lines.last?.hasPrefix("✗ 回路·场景C") != true {
+            try? await Task.sleep(for: .milliseconds(900))
+            bypassLadder = BypassLadder(); openStall = nil
+            do {
+                try await handleCapabilityStall(stuck: "自检二十一·场景C：弹窗关不掉且无编辑入口", token: generation)
+                do {
+                    try await handleCapabilityStall(stuck: "自检二十一·场景C：仍然卡住", token: generation)
+                    lines.append("✗ 回路·梯尽结案：零候选＋弹窗绕行失败后未抛失败结案错误")
+                } catch {
+                    let text = error.localizedDescription
+                    let exhaustedOK = bypassLadder.exhausted && openStall == nil
+                        && text.contains("harvest 实况") && text.contains("预览链接排除 1 条")
+                    lines.append("\(fmt(exhaustedOK)) 回路·梯尽结案：零候选推进第 3 级、弹窗重载后仍在→梯尽抛失败结案，文案含 harvest 实况节且候选/排除数可见（实况：\(bypassLadder.harvestFact ?? "无")）")
+                }
+            } catch {
+                lines.append("✗ 回路·场景C 开卡点抛错：\(error.localizedDescription)")
+            }
+        }
+        // 场景 D：澄清不吞卡点＋词表外动作去终结化（同为生产函数直调）
+        do { try web.loadLocalOnExecutionTab("test-ladder") } catch {
+            lines.append("✗ 回路·场景D 合成页 test-ladder 加载失败：\(error.localizedDescription)")
+        }
+        if lines.last?.hasPrefix("✗ 回路·场景D") != true {
+            try? await Task.sleep(for: .milliseconds(900))
+            bypassLadder = BypassLadder(); openStall = nil
+            do {
+                try await handleCapabilityStall(stuck: "自检二十一·场景D：入口点不开", token: generation)
+                noteClarifyDuringStall(question: "这篇的目标读者是学生还是职场人？")
+                let clarifyOK = openStall != nil && steps.contains { $0.action == "bypass" && $0.reason.contains("保持在开") }
+                lines.append("\(fmt(clarifyOK)) 回路·澄清不吞卡点：澄清问题出现时卡点保持在开且步流明示（答复续跑后继续推进）")
+            } catch {
+                lines.append("✗ 回路·场景D 开卡点抛错：\(error.localizedDescription)")
+            }
+            let badAction = (try? JSONSerialization.data(withJSONObject: ["action": "teleport", "reason": "自检二十一词表外样本"])).flatMap { try? JSONDecoder().decode(AgentAction.self, from: $0) }
+            if let badAction {
+                handleInvalidAction(badAction)
+                var failed = false
+                if case .failed = status { failed = true }
+                let recorded = steps.contains { $0.action == "invalid" && $0.reason.contains("teleport") }
+                let counted = openStall?.invalidActions.contains("teleport") == true
+                lines.append("\(fmt(recorded && counted && !failed)) 回路·词表外动作去终结化（F4）：动作字符串「teleport」已先记账留痕、计入在开卡点证据，引擎未置失败、未清进度（处理函数结构上不碰快照清除与状态置位）")
+            } else {
+                lines.append("✗ 回路·词表外动作样本构造失败")
+            }
+        }
+        // 恢复现场：梯账/卡点/步流/目标/预算回到测试前，快照按恢复后状态重写
+        bypassLadder = savedLadder
+        openStall = savedStall
+        steps = savedSteps
+        stepSeq = savedSeq
+        goal = savedGoal
+        pendingLoopHint = savedHint
+        stepBudget = savedBudget
+        persistSnapshot()
         return lines
     }
 
@@ -2335,6 +3007,24 @@ enum DirectTargetHarvest {
         // 从梯级①重新开始）。
         var ladderAttempted: [String]? = nil
         var ladderNotes: [String]? = nil
+        // LADDER-FIX 起：梯账的 harvest 跨页模板记忆与最近实况、以及
+        // 在开卡点的全账（逐项验收／已点目标／词表外动作／感知盲
+        // 区）。全部可选，此前快照无此组键照常解码（恢复时无跨页记
+        // 忆、无在开卡点）。
+        var ladderTemplate: String? = nil
+        var ladderTemplateFrom: String? = nil
+        var ladderFact: String? = nil
+        var stallStuck: String? = nil
+        var stallOpenURL: String? = nil
+        var stallOpenedDecision: Int? = nil
+        var stallDialogAtOpen: Bool? = nil
+        var stallVerified: [String]? = nil
+        var stallNA: [String: String]? = nil
+        var stallClicked: [String]? = nil
+        var stallClickExecuted: Bool? = nil
+        var stallFrameTried: Bool? = nil
+        var stallInvalid: [String]? = nil
+        var stallBlind: String? = nil
     }
     /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
     /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
@@ -2421,7 +3111,13 @@ enum DirectTargetHarvest {
                                        },
                                        modelStepsUsed: stepBudget.segmentUsed, budgetSegment: stepBudget.segment,
                                        totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused,
-                                       ladderAttempted: bypassLadder.attemptedRaw, ladderNotes: bypassLadder.notes)
+                                       ladderAttempted: bypassLadder.attemptedRaw, ladderNotes: bypassLadder.notes,
+                                       ladderTemplate: bypassLadder.harvestTemplate, ladderTemplateFrom: bypassLadder.harvestTemplateFrom, ladderFact: bypassLadder.harvestFact,
+                                       stallStuck: openStall?.stuck, stallOpenURL: openStall?.openURL,
+                                       stallOpenedDecision: openStall?.openedAtDecision, stallDialogAtOpen: openStall?.dialogAtOpen,
+                                       stallVerified: openStall?.verifiedRaw, stallNA: openStall?.naRaw, stallClicked: openStall?.clickedRaw,
+                                       stallClickExecuted: openStall?.clickExecuted, stallFrameTried: openStall?.frameCloseTried,
+                                       stallInvalid: openStall?.invalidActions, stallBlind: openStall?.perceptionBlindNote)
         if let data = try? JSONEncoder().encode(snapshot) {
             // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
             // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
@@ -2483,9 +3179,23 @@ enum DirectTargetHarvest {
         // 绕行梯恢复（AUTONOMY-FIX）：带梯账的快照原样恢复（已试梯级
         // 不重走）；旧快照无此二键则梯账为空
         if let attemptedRaw = snapshot.ladderAttempted {
-            bypassLadder = BypassLadder(attemptedRaw: attemptedRaw, notes: snapshot.ladderNotes ?? [])
+            bypassLadder = BypassLadder(attemptedRaw: attemptedRaw, notes: snapshot.ladderNotes ?? [],
+                                         harvestTemplate: snapshot.ladderTemplate, harvestTemplateFrom: snapshot.ladderTemplateFrom, harvestFact: snapshot.ladderFact)
         } else {
             bypassLadder = BypassLadder()
+        }
+        // 在开卡点恢复（LADDER-FIX）：带卡点账的快照原样恢复——澄清
+        // 停车与进程恢复都不吞卡点，续跑后引擎按原进度继续推进梯子；
+        // 旧快照无此组键则无在开卡点
+        if let stuck = snapshot.stallStuck {
+            openStall = OpenStall(stuck: stuck, openURL: snapshot.stallOpenURL ?? "",
+                                  openedAtDecision: snapshot.stallOpenedDecision ?? 0, dialogAtOpen: snapshot.stallDialogAtOpen ?? false,
+                                  verifiedRaw: snapshot.stallVerified ?? [], na: snapshot.stallNA ?? [:],
+                                  clicked: snapshot.stallClicked ?? [], clickExecuted: snapshot.stallClickExecuted ?? false,
+                                  frameCloseTried: snapshot.stallFrameTried ?? false, invalid: snapshot.stallInvalid ?? [],
+                                  blind: snapshot.stallBlind)
+        } else {
+            openStall = nil
         }
         // 状态卡恢复（H1）：快照带卡则原样恢复（关键事实跨进程不丢）；旧
         // 快照无卡时按已恢复的步流派生一张（目标＋步流里程碑），关键事实
