@@ -129,10 +129,10 @@ def validate():
     builds = [x for phase in phases for x in phase.get("files", [])]
     assert set(builds) == {k for k,v in objects.items() if v["isa"] == "PBXBuildFile"} and len(builds) == len(set(builds)), "Orphan or duplicated build file"
     resources = phase_paths(resource_phases[0])
-    assert set(resources) == {ROOT / "MikaWeb/Assets.xcassets", ROOT / "MikaWeb/Resources/test-news.html", ROOT / "MikaWeb/Resources/test-form.html", ROOT / "MikaWeb/Resources/test-entries.html", ROOT / "MikaWeb/Resources/test-publish.html", ROOT / "MikaWeb/Resources/test-editor.html", ROOT / "MikaWeb/Resources/test-upload.html", ROOT / "MikaWeb/Resources/test-modal.html", ROOT / "MikaWeb/Resources/test-draft.html", ROOT / "MikaWeb/Resources/test-verify.html", ROOT / "MikaWeb/Resources/test-frames.html"} and len(resources) == 11
+    assert set(resources) == {ROOT / "MikaWeb/Assets.xcassets", ROOT / "MikaWeb/Resources/test-news.html", ROOT / "MikaWeb/Resources/test-form.html", ROOT / "MikaWeb/Resources/test-entries.html", ROOT / "MikaWeb/Resources/test-publish.html", ROOT / "MikaWeb/Resources/test-editor.html", ROOT / "MikaWeb/Resources/test-upload.html", ROOT / "MikaWeb/Resources/test-modal.html", ROOT / "MikaWeb/Resources/test-draft.html", ROOT / "MikaWeb/Resources/test-verify.html", ROOT / "MikaWeb/Resources/test-frames.html", ROOT / "MikaWeb/Resources/test-nav.html"} and len(resources) == 12
     asset_id = next(k for k,v in paths.items() if v.name == "Assets.xcassets")
     assert obj(asset_id)["lastKnownFileType"] == "folder.assetcatalog"
-    print(f"PASS: {len(sources)} Swift sources referenced and compiled exactly once; asset catalog and 10 HTML resources")
+    print(f"PASS: {len(sources)} Swift sources referenced and compiled exactly once; asset catalog and 11 HTML resources")
 
     scheme = ET.parse(ROOT / "MikaWeb.xcodeproj/xcshareddata/xcschemes/MikaWeb.xcscheme").getroot()
     for ref in scheme.iter("BuildableReference"):

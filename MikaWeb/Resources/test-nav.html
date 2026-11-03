@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检十六合成页：入口感知补盲</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  #result { border: 1px solid #999; padding: 8px; min-height: 24px; margin-bottom: 16px; }
+  .icon-btn { width: 48px; height: 48px; cursor: pointer; }
+  #altIcon { width: 48px; height: 48px; cursor: pointer; }
+  /* 无文本封面区入口：只有背景图、无文字无 aria（名源只能是背景图文件名） */
+  #coverEntry { width: 200px; height: 80px; cursor: pointer; background-image: url(cover-entry.png); background-size: cover; border: 1px dashed #666; }
+  #anchorCard { cursor: pointer; border: 1px solid #666; padding: 10px; width: 260px; }
+  #anchorSpan { cursor: pointer; display: inline-block; padding: 6px 10px; }
+  /* 内层滚动容器：入口在容器内容底部，容器本身又在整页折下 */
+  #spacer { height: 150vh; }
+  #scroller { height: 120px; overflow-y: auto; border: 1px solid #333; }
+  #scrollerContent { height: 600px; position: relative; }
+  #editEntry { position: absolute; bottom: 8px; left: 8px; display: block; padding: 10px 16px; background: #eef; }
+</style>
+</head>
+<body>
+<div id="result"></div>
+
+<!-- 盲区一甲：icon-only 按钮，只有 aria-label、无文本 -->
+<button type="button" class="icon-btn" id="iconBtn" aria-label="打开设置抽屉" onclick="mark('设置抽屉已打开')">
+  <svg width="24" height="24" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="#888"/></svg>
+</button>
+
+<!-- 盲区一乙：只有 alt 的图标图 -->
+<img id="altIcon" alt="封面设置入口" src="icon-alt.png" onclick="mark('封面设置已打开')">
+
+<!-- 盲区二：无文本封面区入口（背景图名源） -->
+<div id="coverEntry" onclick="mark('封面入口已打开')"></div>
+
+<!-- 盲区三锚点样本：目标词只是文本节点，可点的是整卡祖先 -->
+<div id="anchorCard" onclick="mark('锚点卡片已打开')">
+  <div>整卡标题文字</div>
+  <span id="anchorSpan">锚点目标词</span>
+</div>
+
+<!-- 盲区三：内层滚动容器下方＋整页折下的编辑入口 -->
+<div id="spacer"></div>
+<div id="scroller">
+  <div id="scrollerContent">
+    <a id="editEntry" href="javascript:void(0)" onclick="mark('草稿编辑器已打开')">编辑草稿</a>
+  </div>
+</div>
+
+<script>
+  function mark(text) { document.getElementById('result').textContent = text; }
+</script>
+</body>
+</html>

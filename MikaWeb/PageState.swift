@@ -2,6 +2,16 @@ import Foundation
 struct PageElement: Codable, Equatable {
     let index: Int
     let tag, type, text, placeholder, href, name, inputType, ariaLabel: String
+    /// 可达名称来源（WECHAT-EDITOR-NAV A1）：text 的取值出处——text／
+    /// aria-label／title／alt／label／placeholder／value／bg（背景图文件名）／
+    /// none（无名牌图标控件）。无文本控件不再因「无文字」在抽取层消失，
+    /// 模型据来源判断这是什么入口。
+    let nameSource: String
+    /// 元素矩形是否与当前视口相交（WECHAT-EDITOR-NAV A2）：false 只表示
+    /// 「在页面里但没进视口」，引擎点击前会先滚动揭示再复判，不得据此
+    /// 断言入口不存在。位置相关字段：guardScript 的身份校验豁免它
+    /// （滚动前后 legitimately 不同）。
+    let inView: Bool
     let sensitive: Bool
     // 按钮「存在但被禁用（灰的）」与「不存在」是两种失败，须在快照层就分开（FIX2 案卷 d/c 项）
     let disabled: Bool
@@ -19,16 +29,46 @@ enum PageScript {
       if(!document.body){return JSON.stringify({url:location.href,title:document.title||'',text:'',elements:[]});}
       document.querySelectorAll('[data-mika-idx]').forEach(e=>e.removeAttribute('data-mika-idx'));
       const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
+      // 可达名称解析（WECHAT-EDITOR-NAV A1）：公众号编辑器一类的入口常是
+      // 无文本图标控件（只有 aria-label／title／alt／背景图），旧抽取只认
+      // innerText 一路，无名即丢弃——模型看不见入口、只能报「无可操作
+      // 入口」。名源优先级：可见文本→aria-label→title→alt→关联 label→
+      // placeholder→value（提交类 input 的值即其文案）→背景图文件名词干
+      // （url(.../cover-entry.png)→「cover entry」）；全无则 source=none。
+      // name 切 300 字与快照 text 口径一致。
+      const nameOf=e=>{
+        const t=(e.innerText||'').trim();if(t)return{name:t.slice(0,300),source:'text'};
+        const aria=(e.getAttribute('aria-label')||'').trim();if(aria)return{name:aria.slice(0,300),source:'aria-label'};
+        const title=(e.title||'').trim();if(title)return{name:title.slice(0,300),source:'title'};
+        const alt=(e.getAttribute('alt')||'').trim();if(alt)return{name:alt.slice(0,300),source:'alt'};
+        const labs=[...(e.labels||[])].map(l=>(l.innerText||'').trim()).filter(Boolean).join(' ');if(labs)return{name:labs.slice(0,300),source:'label'};
+        const ph=(e.placeholder||'').trim();if(ph)return{name:ph.slice(0,300),source:'placeholder'};
+        if((e.tagName==='INPUT'||e.tagName==='BUTTON')&&e.value){const v=String(e.value).trim();if(v)return{name:v.slice(0,300),source:'value'};}
+        const bg=(getComputedStyle(e).backgroundImage||'');
+        const m=bg.match(/url\(["']?([^"')]+)["']?\)/);
+        // data:/blob: 背景图没有文件名可读（data URI 的内容段会被误当名），
+        // 只记名源 bg、名留空——元素仍在清单里，不编假名。
+        if(m&&!/^(data|blob):/.test(m[1])){const file=m[1].split('/').pop().replace(/\.[a-z0-9]+$/i,'').replace(/[-_]+/g,' ').trim();return{name:file.slice(0,300),source:'bg'};}
+        if(bg&&bg!=='none')return{name:'',source:'bg'};
+        return{name:'',source:'none'};
+      };
+      // 与视口相交与否（A2）：只问窗口视口——内层滚动容器裁剪不在此判，
+      // 可达性复判走引擎的揭示流程（滚动容器逐个滚动后再判）。
+      const inViewOf=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;};
       const semSel='a,button,input,textarea,select,[role="button"],[contenteditable="true"]';
       const roleSel='[role="tab"],[role="link"],[role="menuitem"],[role="option"],[role="switch"],[role="checkbox"],[role="treeitem"],[onclick]';
       const baseSet=new Set(document.querySelectorAll(semSel+','+roleSel));
       // 非语义可点元素补盲（RESOURCEFULNESS）：活动页一类的「发微头条／写文章／拍视频」
       // 入口常是 div/span＋JS 绑定的非语义元素，不在语义选择器内——模型看不见、
       // 只能请用户手动点。补入判据（须同时满足，防噪声）：不在语义元素内部、
-      // 也不包裹语义元素（真目标在内层时父级不重复列）；有可读文案（纯文本粗筛
-      // ≤120 字，再以 innerText／aria-label／title 复核）；可见且尺寸 ≥12×12；
-      // 计算样式 cursor:pointer。同类嵌套只留最内层（点击事件冒泡到父级处理器，
-      // 点内层等效）。补入上限 200 条（去重前），语义元素不受任何新门槛影响。
+      // 也不包裹语义元素（真目标在内层时父级不重复列）；纯文本粗筛 ≤120 字；
+      // 可见且尺寸 ≥12×12；计算样式 cursor:pointer；且有可达名称（名源见
+      // nameOf：文本／aria-label／title／alt／背景图任一）或至少带背景图
+      // （图标形态，名可为空）——A1 修订：旧判据只认文本与 aria／title，
+      // 纯图标入口（alt 图、背景图按钮）整类被滤掉，是编辑器入口盲区
+      // 的主因；全无名源又无背景图的透明热区无从指认，仍不入（防噪声）。
+      // 同类嵌套只留最内层（点击事件冒泡到父级处理器，点内层等效）。
+      // 补入上限 200 条（去重前），语义元素不受任何新门槛影响。
       const scanSel='div,span,li,td,th,p,i,em,b,strong,img,section,article,nav,header,footer,figure,figcaption,dd,dt';
       const rawExtras=[];
       for(const e of document.querySelectorAll(scanSel)){
@@ -37,13 +77,13 @@ enum PageScript {
         if(e.closest(semSel)||e.querySelector(semSel))continue;
         const cheap=(e.textContent||'').trim();
         if(cheap.length>120)continue;
-        if(!cheap&&!(e.getAttribute('aria-label')||'').trim()&&!(e.title||'').trim())continue;
         if(!visible(e))continue;
         const r=e.getBoundingClientRect();
         if(r.width<12||r.height<12)continue;
-        const label=((e.innerText||'').trim()||(e.getAttribute('aria-label')||'').trim()||(e.title||'').trim());
-        if(!label||label.length>120)continue;
         if(getComputedStyle(e).cursor!=='pointer')continue;
+        const nm=nameOf(e);
+        if(!nm.name&&nm.source!=='bg')continue;
+        if(nm.name.length>120)continue;
         rawExtras.push(e);
       }
       const extraSet=new Set(rawExtras.filter(e=>!rawExtras.some(o=>o!==e&&e.contains(o))));
@@ -53,9 +93,10 @@ enum PageScript {
       // 数量天然稀少（通常 0–1 个），一律保留进清单，upload_file 据此定位。
       const elements=merged.filter(e=>visible(e)||(e.tagName==='INPUT'&&e.type==='file')).map((e,index)=>{
         e.setAttribute('data-mika-idx',index);
+        const nm=nameOf(e);
         const labelText=[...(e.labels||[])].map(l=>l.innerText||'').join(' ');
-        const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.autocomplete,labelText].join(' ');
-        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:(e.innerText||labelText||e.getAttribute('aria-label')||e.getAttribute('title')||'').slice(0,300),placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
+        const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.getAttribute('alt'),e.autocomplete,labelText].join(' ');
+        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:nm.name,placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',nameSource:nm.source,inView:inViewOf(e),sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
       });
       let text='',n;const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
       while((n=walker.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&visible(n.parentElement))text+=n.textContent.trim()+' ';}

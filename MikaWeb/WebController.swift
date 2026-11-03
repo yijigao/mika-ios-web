@@ -1071,8 +1071,11 @@ enum SiteMode: String {
         let json = String(decoding: data, as: UTF8.self)
         let expectedJSON = String(decoding: try JSONEncoder().encode(expected), as: UTF8.self)
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
+        // inView 是位置字段（WECHAT-EDITOR-NAV A2）：同一元素在模型快照与
+        // 执行时两次抽取之间只要页面滚过一格就会不同，纳入逐字段相等会把
+        // 正当目标误判「已变化」——身份校验豁免它，其余字段照旧全等。
         let identityCheck = strict
-            ? "if(!target||!Object.keys(expected).every(k=>target[k]===expected[k]))throw new Error('目标元素已变化');"
+            ? "if(!target||!Object.keys(expected).every(k=>k==='inView'||target[k]===expected[k]))throw new Error('目标元素已变化');"
             : "if(!target||target.tag!==expected.tag||!!target.editable!==!!expected.editable)throw new Error('目标元素已变化');"
         return """
         const a=\(json),expected=\(expectedJSON);
@@ -1523,6 +1526,27 @@ enum SiteMode: String {
               const enabled=cands.find(x=>!dis(x));
               if(enabled)return tryClick(enabled);
               if(cands.length)return 'disabled';
+              // 文本锚点回退（WECHAT-EDITOR-NAV A3）：目标词只出现在文本
+              // 节点里、没有以它为文案的可点元素时（入口是包着文字的整块
+              // 卡片／图标区，公众号编辑器的封面区即此形态），取含该文本
+              // 最近的可点击祖先作候选——排在精确文案候选之后、缺失判定
+              // 之前。安全词只按目标词与祖先自身的无障碍名查（祖先的整段
+              // innerText 范围太大，拿它查会误伤整卡敏感词）。
+              const clickSel='a,button,[role="button"],[role="link"],input,[onclick]';
+              const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+              let tn;const anchors=[];
+              while((tn=walker.nextNode())){
+                if(tn.parentElement&&tn.parentElement.closest('script,style,noscript'))continue;
+                if(!norm(tn.textContent).includes(want))continue;
+                let anc=tn.parentElement,d=0;
+                while(anc&&d<6){if(anc.matches(clickSel)||getComputedStyle(anc).cursor==='pointer'){anchors.push(anc);break;}anc=anc.parentElement;d++;}
+              }
+              const anchorOK=anchors.find(x=>vis(x)&&!dis(x));
+              if(anchorOK){
+                const l=[want,anchorOK.getAttribute('aria-label')||'',anchorOK.title||''].join(' ').toLowerCase();
+                if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');
+                anchorOK.scrollIntoView({block:'center'});anchorOK.focus();anchorOK.click();return 'clicked';
+              }
             }
             if(node&&node.isConnected)return dis(node)?'disabled':'missing';
             return 'missing';})()
@@ -1834,11 +1858,74 @@ enum SiteMode: String {
         throw MikaError("\(Self.modalUnresponsivePrefix)：frame 探针实测——\(lastCensus?.summary ?? "无探针数据")。已在弹窗所在 frame 内依次尝试完整点按序列、触摸序列、Escape、关闭按钮与遮罩点击，两轮后弹窗仍在——合成事件 isTrusted=false 的边界未变，这类网页只认真实点按")
     }
 
+    // MARK: - 入口揭示复判（WECHAT-EDITOR-NAV A2）
+    //
+    // 真机现场（Joey 2026-11-03 09:20，公众号编辑器）：草稿编辑入口与
+    // 封面设置入口在感知里找不到／被判不可操作——入口其实在页面内层
+    // 滚动区下方或窗口折下，抽取在位但点击到不了。旧口径下模型据此在
+    // 步流写「无可操作入口」，等于凭没滚到位下结论。本节立规：判不可
+    // 达之前，引擎先做一遍确定性揭示（逐个滚动内层滚动容器＋窗口
+    // scrollIntoView）再复判；复判仍不可达才许报错，且失败原文必须带
+    // 揭示手段清单（见 RevealReport.triedSummary），步流里留得下证据。
+
+    /// 揭示复判的回報：found＝目标还在页面上；containers＝实际滚动过
+    /// 的内层滚动容器个数；inView／hit＝复判时元素矩形与视口相交、且
+    /// 中心点命中落在目标本身（或其子／祖先，事件冒泡等效）上。
+    struct RevealReport {
+        let found: Bool
+        let containers: Int
+        let inView: Bool
+        let hit: Bool
+        /// 步流留痕口径：判「无可操作入口」时必须写明已试过的揭示手段。
+        var triedSummary: String {
+            guard found else { return "揭示手段已试：按序号找目标元素时它已不在页面上（无从滚动揭示）" }
+            return "揭示手段已试：内层滚动容器逐个滚动（\(containers) 个）＋窗口 scrollIntoView，复判在视口=\(inView)、中心点可命中=\(hit)"
+        }
+    }
+
+    /// 把快照序号对应的元素滚动揭示出来再复判可达性。纯页面内操作：
+    /// 先自下而上逐个滚动可滚动祖先（把元素送进每个容器的可见区），
+    /// 再 scrollIntoView 让窗口跟上，最后按矩形相交＋中心点命中复判。
+    func revealElement(index: Int, on tab: BrowserTab) async -> RevealReport {
+        let script = """
+        (()=>{const e=document.querySelector('[data-mika-idx="\(index)"]');
+        if(!e||!e.isConnected)return JSON.stringify({found:false,containers:0,inView:false,hit:false});
+        const scrollable=x=>{const s=getComputedStyle(x);return /(auto|scroll|overlay)/.test(s.overflowY)||/(auto|scroll|overlay)/.test(s.overflowX);};
+        let containers=0;let node=e.parentElement;
+        while(node&&node!==document.documentElement){
+          if(scrollable(node)&&(node.scrollHeight>node.clientHeight+1||node.scrollWidth>node.clientWidth+1)){
+            const r=e.getBoundingClientRect(),cr=node.getBoundingClientRect();let adjusted=false;
+            if(r.bottom>cr.bottom||r.top<cr.top){node.scrollTop+=Math.round((r.top-cr.top)-(cr.height-r.height)/2);adjusted=true;}
+            if(r.right>cr.right||r.left<cr.left){node.scrollLeft+=Math.round((r.left-cr.left)-(cr.width-r.width)/2);adjusted=true;}
+            if(adjusted)containers++;
+          }
+          node=node.parentElement;
+        }
+        e.scrollIntoView({block:'center',inline:'center'});
+        const r=e.getBoundingClientRect();
+        const inView=r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;
+        let hit=false;
+        if(inView){const cx=Math.min(Math.max(r.left+r.width/2,1),innerWidth-1),cy=Math.min(Math.max(r.top+r.height/2,1),innerHeight-1);const h=document.elementFromPoint(cx,cy);hit=!!h&&(h===e||e.contains(h)||h.contains(e));}
+        return JSON.stringify({found:true,containers,inView,hit});})()
+        """
+        guard let raw = try? await evaluate(script, on: tab) as? String,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return RevealReport(found: false, containers: 0, inView: false, hit: false)
+        }
+        return RevealReport(found: (obj["found"] as? Bool) ?? false,
+                            containers: (obj["containers"] as? Int) ?? 0,
+                            inView: (obj["inView"] as? Bool) ?? false,
+                            hit: (obj["hit"] as? Bool) ?? false)
+    }
+
     /// click 总流程：先探针分流——目标在弹窗内直接走升级序列；普通目标
     /// 先按已校验元素点（旧口径），点后若观察到同一弹窗仍在再升级；
     /// 禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后按钮常
     /// 延迟启用或被重渲染替换，重扫点击成功后同样过一遍存续探针）；
-    /// 最终按「是灰的／找不到」两种口径分别报错并留诊断快照。
+    /// 缺失终局前再做一遍揭示复判（A2：滚动揭示后重点一次，仍不可达
+    /// 才报错且原文带揭示手段清单）；最终按「是灰的／找不到」两种
+    /// 口径分别报错并留诊断快照。
     private func performClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
         let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
@@ -1874,8 +1961,27 @@ enum SiteMode: String {
             await captureFailureSnapshot(context: "click 目标禁用：\(action.reason)", tab: tab)
             throw MikaError("「\(label)」按钮是灰的（存在但被禁用），无法点击")
         }
+        // 揭示复判（A2）：判「找不到」之前先把目标滚动揭示再重点一次——
+        // 入口在内层滚动区下方／窗口折下时，首轮点不到不等于不存在。
+        // 复判点中即按正常成功收口（含弹窗存续探针）；仍不可达才抛错，
+        // 错误原文附揭示手段清单，步流据此才许下「无可操作入口」结论。
+        let reveal = await revealElement(index: expected.index, on: tab)
+        if reveal.found {
+            let retry = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
+            if retry == "clicked" {
+                try await Task.sleep(for: .milliseconds(500))
+                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
+                }
+                return
+            }
+            if retry == "disabled" {
+                await captureFailureSnapshot(context: "click 目标禁用（揭示复判后）：\(action.reason)", tab: tab)
+                throw MikaError("「\(label)」按钮是灰的（存在但被禁用），无法点击")
+            }
+        }
         await captureFailureSnapshot(context: "click 目标缺失：\(action.reason)", tab: tab)
-        throw MikaError("页面上找不到要点的按钮「\(label)」（可能还没渲染出来或已经关闭）")
+        throw MikaError("页面上找不到可点的按钮「\(label)」（\(reveal.triedSummary)；可能还没渲染出来或已经关闭）")
     }
 
     // MARK: - 自检十一 Tier A（COVER-CONSENT）：弹窗点按升级的程序化核查
@@ -2018,6 +2124,96 @@ enum SiteMode: String {
         }
         let finalCensus = await probeFrames(on: tab)
         lines.append("\(fmt(finalCensus.hits.isEmpty)) 终局普查：全部 frame 内弹窗数=\(finalCensus.hits.count)（应为 0）")
+        return lines
+    }
+
+    // MARK: - 自检十六 Tier A（WECHAT-EDITOR-NAV）：入口感知补盲的程序化核查
+    //
+    // 合成页 test-nav 复刻三类现场盲区：①icon-only 按钮（只有 aria-label、
+    // 无文本）＋只有 alt 的图标图＋背景图无文本入口——旧抽取整类滤掉；
+    // ②无文本封面区入口（背景图名源）；③内层滚动容器下方、且整页折下
+    // 的编辑入口——抽取在位但 inView=false，须经揭示复判（逐个滚动内层
+    // 容器＋窗口跟随）后才可达。断言：三类入口都进快照且名源标注正确；
+    // 揭示回報 found／容器数 ≥1／复判 inView 与中心命中成立；补盲入口
+    // 经引擎 click 真点得动（页面结果标记在场）；文本锚点回退能点中
+    // 「只有文字、没有可点元素」的入口（A3）。真编辑器 DOM 形态不在
+    // 本页复刻范围——未证项留案卷，Tier B 真机第一条验。
+    func verifyEditorNavReveal() async -> [String] {
+        var lines: [String] = []
+        let tab = activeTab
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        func resultText() async -> String {
+            (try? await evaluate("(()=>{const r=document.getElementById('result');return r?r.textContent:'';})()", on: tab) as? String) ?? ""
+        }
+        do { try tab.loadLocal("test-nav") } catch {
+            return ["✗ 合成测试页 test-nav 加载失败：\(error.localizedDescription)"]
+        }
+        try? await Task.sleep(for: .milliseconds(1000))
+        guard let page = try? await state() else { return ["✗ 合成测试页状态抽取失败"] }
+        // —— 补盲在位与名源标注 ——
+        let iconBtn = page.elements.first(where: { $0.nameSource == "aria-label" && $0.text == "打开设置抽屉" })
+        lines.append("\(fmt(iconBtn != nil)) icon-only 按钮补盲：无文本按钮以 aria-label 为名进快照（名源=aria-label）=\(iconBtn != nil)")
+        let altIcon = page.elements.first(where: { $0.nameSource == "alt" && $0.text == "封面设置入口" })
+        lines.append("\(fmt(altIcon != nil)) alt 图标补盲：只有 alt 的图标图以 alt 为名进快照（名源=alt）=\(altIcon != nil)")
+        let bgEntry = page.elements.first(where: { $0.nameSource == "bg" && $0.text == "cover entry" })
+        lines.append("\(fmt(bgEntry != nil)) 背景图入口补盲：无文本封面区入口以背景图文件名为名进快照（名源=bg、名=cover entry）=\(bgEntry != nil)")
+        // —— 内层滚动容器下方的编辑入口：抽取在位、初始不在视口 ——
+        guard let editEntry = page.elements.first(where: { $0.text == "编辑草稿" }) else {
+            lines.append("✗ 内层滚动容器下方的「编辑草稿」入口未进快照")
+            return lines
+        }
+        lines.append("\(fmt(editEntry.inView == false)) 编辑入口初始状态：已进快照且 inView=false（在内层滚动区下方＋整页折下，与现场同型）=\(editEntry.inView == false)")
+        // —— 揭示复判 ——
+        let reveal = await revealElement(index: editEntry.index, on: tab)
+        lines.append("\(fmt(reveal.found && reveal.containers >= 1 && reveal.inView && reveal.hit)) 揭示复判：found=\(reveal.found)、滚动内层容器=\(reveal.containers)（应 ≥1）、复判在视口=\(reveal.inView)、中心点可命中=\(reveal.hit)；手段清单「\(reveal.triedSummary)」")
+        // —— 补盲入口经引擎 click 真点得动 ——
+        if let iconBtn, let act = Self.selfTestClickAction(index: iconBtn.index) {
+            do {
+                try await execute(act, expected: iconBtn)
+                try? await Task.sleep(for: .milliseconds(300))
+                let r = await resultText()
+                lines.append("\(fmt(r.contains("设置抽屉已打开"))) icon-only 按钮点击：引擎 click 点中、页面结果标记在场=\(r.contains("设置抽屉已打开"))")
+            } catch { lines.append("✗ icon-only 按钮点击抛错：\(error.localizedDescription)") }
+        } else { lines.append("✗ icon-only 按钮点击跳过（元素或动作构造失败）") }
+        if let bgEntry, let act = Self.selfTestClickAction(index: bgEntry.index) {
+            do {
+                try await execute(act, expected: bgEntry)
+                try? await Task.sleep(for: .milliseconds(300))
+                let r = await resultText()
+                lines.append("\(fmt(r.contains("封面入口已打开"))) 背景图封面入口点击：引擎 click 点中、页面结果标记在场=\(r.contains("封面入口已打开"))")
+            } catch { lines.append("✗ 背景图封面入口点击抛错：\(error.localizedDescription)") }
+        } else { lines.append("✗ 背景图封面入口点击跳过（元素或动作构造失败）") }
+        // —— 揭示后编辑入口可点 ——
+        guard let page2 = try? await state(), let editFresh = page2.elements.first(where: { $0.text == "编辑草稿" }) else {
+            lines.append("✗ 揭示后状态重取失败")
+            return lines
+        }
+        if let act = Self.selfTestClickAction(index: editFresh.index) {
+            do {
+                try await execute(act, expected: editFresh)
+                try? await Task.sleep(for: .milliseconds(300))
+                let r = await resultText()
+                lines.append("\(fmt(r.contains("草稿编辑器已打开"))) 编辑入口点击：揭示后引擎 click 点中、页面结果标记在场=\(r.contains("草稿编辑器已打开"))")
+            } catch { lines.append("✗ 编辑入口点击抛错：\(error.localizedDescription)") }
+        } else { lines.append("✗ 编辑入口点击动作构造失败") }
+        // —— 文本锚点回退（A3）：直接驱动重扫脚本验回退分支 ——
+        // 「锚点目标词」只是一个文本节点的内容，可点的是包着它的整卡；
+        // 先模拟页面重渲染（换新节点＋抹掉全部序号标记——重扫的真实触发
+        // 场景），此时按序号找不到节点、精确文案候选也不存在（卡片是
+        // div、文字在 span 里），重扫只能经文本锚点回退点中整卡。
+        guard let page3 = try? await state(), let spanEl = page3.elements.first(where: { $0.text == "锚点目标词" }) else {
+            lines.append("✗ 文本锚点样本元素（锚点目标词）未进快照")
+            return lines
+        }
+        _ = try? await evaluate("(()=>{const s=document.getElementById('anchorSpan');if(s){const c=s.cloneNode(true);s.replaceWith(c);}document.querySelectorAll('[data-mika-idx]').forEach(x=>x.removeAttribute('data-mika-idx'));return 'wiped';})()", on: tab)
+        if let act = Self.selfTestClickAction(index: spanEl.index) {
+            do {
+                let status = try await runClickScript(action: act, expected: spanEl, approved: false, rescan: true, tab: tab)
+                try? await Task.sleep(for: .milliseconds(300))
+                let r = await resultText()
+                lines.append("\(fmt(status == "clicked" && r.contains("锚点卡片已打开"))) 文本锚点回退：序号标记失效后重扫经文本节点→最近可点击祖先点中整卡（重扫回報=\(status)、页面结果在场=\(r.contains("锚点卡片已打开"))）")
+            } catch { lines.append("✗ 文本锚点回退点击抛错：\(error.localizedDescription)") }
+        } else { lines.append("✗ 文本锚点点击动作构造失败") }
         return lines
     }
 

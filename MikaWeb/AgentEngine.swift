@@ -934,7 +934,11 @@ struct StepBudget: Equatable {
                     stepLimitPaused = true
                     status = .paused("本段步数已用完（第 \(stepBudget.segment)/\(StepBudget.maxSegments) 段，累计模型步 \(stepBudget.totalUsed)/硬顶 \(stepBudget.hardTop)）——进度已存检查点（目标、成果台账、页面与历史都在），点「继续」开启下一段接着跑，不会重跑已完成部分")
                 } else {
-                    status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
+                    // 兜底分支（预算未到段限／硬顶却退出循环）：旧文案
+                    // 「已达最大 N 步，请检查结果或重新开始」是终局口径，
+                    // 与检查点续跑的事实不符（WECHAT-EDITOR-NAV Part C
+                    // 复核改定）——统一为进度已存＋点继续接着跑的口径。
+                    status = .paused("已暂停（第 \(stepBudget.segment)/\(StepBudget.maxSegments) 段，累计模型步 \(stepBudget.totalUsed)/硬顶 \(stepBudget.hardTop)）——进度已存检查点（目标、成果台账、页面与历史都在），点「继续」接着跑，不会重跑已完成部分")
                 }
                 persistSnapshot()
             } catch {
@@ -1298,6 +1302,15 @@ struct StepBudget: Equatable {
     func verifyFrameProbe() async -> [String] {
         guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（先等当前任务终结或停止）"] }
         return await web.verifyFrameProbeAndClick()
+    }
+
+    /// 自检十六·Tier A（WECHAT-EDITOR-NAV）：入口感知补盲——委托
+    /// WebController 在合成页 test-nav 上实测（icon-only／alt／背景图
+    /// 三类无文本入口进快照且名源正确、内层滚动容器下方入口经揭示
+    /// 复判可达、补盲入口真点得动、文本锚点回退点中整卡）。
+    func verifyEditorNav() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检十六 Tier A 未执行（先等当前任务终结或停止）"] }
+        return await web.verifyEditorNavReveal()
     }
 
     func verifyCoverAndModal() async -> [String] {
