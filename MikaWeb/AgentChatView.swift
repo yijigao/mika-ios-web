@@ -6,6 +6,7 @@ import SwiftUI
 /// 消息列表与停止／继续按钮行，底部留出实测的输入栏高度（bottomInset），保证最后
 /// 一条消息与按钮行不被输入栏压住。
 struct AgentChatView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
     @ObservedObject var conversation: AgentConversationStore
@@ -97,28 +98,39 @@ struct AgentChatView: View {
                 .onChange(of: scrollToBottomRequest) { _, _ in landAtBottom(proxy) }
                 .task { landAtBottom(proxy) }
             }
-            HStack(spacing: 8) {
-                // 停止走 stopFromUser（M1）：停掉当前任务后队列自动推进；
-                // 只在任务所在会话里可点——在别的会话点停会串会话
-                Button("停止") { engine.stopFromUser() }.disabled(!engine.busy || !engine.active || !viewingRunSession)
-                // 结束任务（SELFCHECK-UNBLOCK-FIX）：暂停态的彻底终结出口。
-                // 与「停止＝暂停、可继续」相对：点了清快照、不可续跑，引擎
-                // 随之解锁（自检与新任务不再被一个暂停任务挡住）；文案带
-                // 「不可续跑」明示区别。只在暂停态、且正看任务所在会话时
-                // 呈现（同停止／继续的会话归属口径）。
-                if isPaused, viewingRunSession {
-                    Button("结束任务（不可续跑）") { engine.finishTaskFromUser() }.disabled(!engine.active)
+            if showStop || showFinish || canResume || !settings.hasKey {
+                HStack(spacing: 8) {
+                    if !settings.hasKey {
+                        Text("请先在设置中配置密钥")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    Spacer(minLength: 0)
+                    if showStop {
+                        actionCapsule("停止", symbol: "pause.fill", foreground: .primary) {
+                            engine.stopFromUser()
+                        }
+                        .transition(.opacity)
+                    }
+                    if showFinish {
+                        actionCapsule("结束任务（不可续跑）", foreground: .primary) {
+                            engine.finishTaskFromUser()
+                        }
+                        .transition(.opacity)
+                    }
+                    if canResume {
+                        actionCapsule("继续", symbol: "play.fill", foreground: .accentColor) {
+                            engine.resume()
+                        }
+                        .transition(.opacity)
+                    }
                 }
-                // 手输等待的「已处理，继续」由置顶介入卡独占（同一时刻一个主入口，
-                // 见 InterventionPrompt）；本行「继续」只管暂停／失败的续跑。
-                Button("继续") { engine.resume() }
-                    .disabled(!canResume)
-                Spacer()
-                if !settings.hasKey { Text("请先在设置中配置密钥").font(.caption).foregroundStyle(.orange) }
+                .transition(.opacity)
             }
-            .buttonStyle(.bordered)
-            .font(.caption)
         }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: showStop)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: showFinish)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: canResume)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: settings.hasKey)
         .padding(12)
         // 输入栏浮在最上层，本层底部留出其实测高度，按钮行与最后一条消息不被压住
         .padding(.bottom, bottomInset)
@@ -131,6 +143,33 @@ struct AgentChatView: View {
         }
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
+    private var showStop: Bool {
+        guard engine.busy, engine.active, viewingRunSession, questionID == nil else { return false }
+        switch engine.status {
+        case .waitingConfirm, .waitingManual: return false
+        default: return true
+        }
+    }
+    private var showFinish: Bool { isPaused && viewingRunSession && engine.active }
+    private func actionCapsule(_ title: String, symbol: String? = nil,
+                               foreground: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if let symbol { Image(systemName: symbol).font(.system(size: 11)) }
+                Text(title).font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 14)
+            .frame(minWidth: 64, height: 32)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color(uiColor: .separator), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+            .frame(height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+    }
     /// 正看的就是任务所在会话（M1）：停止／继续／作答都只对本会话的
     /// 任务生效，看别的会话时这些入口一律让位（队列与浏览不受影响）。
     private var viewingRunSession: Bool { conversation.displayedSessionID == engine.runSessionID }
