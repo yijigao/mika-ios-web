@@ -19,6 +19,7 @@ struct SelfTestView: View {
     @State private var ladderFixTestRunning = false
     @State private var coverUploadFixTestRunning = false
     @State private var taskFinishTestRunning = false
+    @State private var editorEntryBindTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -172,6 +173,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || taskFinishTestRunning)
             Text("自检二十三预期（SELFCHECK-UNBLOCK-FIX）：不调用模型、不占用标签页（本按钮，要求引擎空闲）。程序化合成一个已暂停任务（目标与等待输入在位、快照落盘、busy 为真——同 0625 真机「停止后仍被自检挡下」的现场）：断言未结束时引擎保持锁定；调引擎 finishTask（即「结束任务」按钮的动作）后——busy 转假、状态落终结态、会话快照文件已删（重启 App 不会再恢复）、等待输入与目标已清、resume() 调之不复活、执行页绑定解除且待供文件未武装；演练毕引擎现场完整还原。真机人工部分（暂停态出现「结束任务（不可续跑）」按钮、点后自检二十二能跑、结束后重启不恢复、暂停后点继续仍能续跑、跑动中点停止仍是暂停）见案卷 Tier B 清单。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十四：标题配对与翻页（EDITOR-ENTRY-BIND）") {
+                guard !editorEntryBindTestRunning else { return }
+                editorEntryBindTestRunning = true
+                runEditorEntryBindTest()
+                dismiss()
+            }.disabled(!engine.active || editorEntryBindTestRunning)
+            Text("自检二十四预期（EDITOR-ENTRY-BIND）：不调用模型、不占用标签页、不要求引擎空闲（全部纯函数）。合成公众号列表页数据对象（六条目交错：两条同名不同 ID、一条标题以 unicode 转义写入、一条只有 ID 没有标题＋一段无标题噪声 ID）：断言配对只从同对象共现出（恰 5 组）、噪声与无标题条目不误配、同名歧义如实拒绝不猜、目标标题唯一命中时按配对拼编辑直达、别篇的带 ID 编辑链接不冒充目标（ID 与配对一致才直用）、卡片 DOM 同卡配对可直交、无目标时旧口径行为不变、列表翻页纯函数按 begin/count 递进且到上限停、无参数地址不误翻、目标标题提取口径正确。真实公众号列表页的配对命中属 Tier B 真机（见案卷清单）。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -249,6 +257,20 @@ struct SelfTestView: View {
             let failed = lines.filter { $0.hasPrefix("✗") }.count
             conversation.localFeedback(failed == 0 ? "自检二十三结论：全部通过——暂停态锁定、结束任务后解锁/清快照/封续跑/释放绑定均有实证，引擎现场已还原" : "自检二十三结论：\(failed) 项未通过，见上方逐条记录")
         }
+    }
+
+    /// 自检二十四编排（EDITOR-ENTRY-BIND）：标题↔appmsgid 配对与翻
+    /// 页纯函数断言，结论以「自检二十四」条目写进对话。不调用模
+    /// 型、不占用标签页、不要求引擎空闲。
+    private func runEditorEntryBindTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十四：开始——标题配对与翻页核查（不调用模型）")
+        defer { editorEntryBindTestRunning = false }
+        let lines = engine.verifyEditorEntryBind()
+        for line in lines { conversation.localFeedback("自检二十四：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检二十四结论：全部通过——配对只认同对象共现、噪声不误配、歧义不猜、翻页边界正确" : "自检二十四结论：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言

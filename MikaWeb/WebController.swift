@@ -420,7 +420,7 @@ enum SiteMode: String {
         run(0);
       };
       var collectHarvest = function(){
-        var hrefs = [], dataAttrs = [], onclicks = [], embedded = [];
+        var hrefs = [], dataAttrs = [], onclicks = [], embedded = [], embeddedObjs = [], domPairs = [];
         var links = document.querySelectorAll('a[href]');
         for (var i=0;i<links.length && hrefs.length<400;i++){ var h = links[i].getAttribute('href'); if (h) hrefs.push(h); }
         var all = document.querySelectorAll('*');
@@ -429,8 +429,23 @@ enum SiteMode: String {
           if (e.attributes){
             for (var k=0;k<e.attributes.length;k++){
               var at = e.attributes[k], v = at.value || '';
-              if (at.name.indexOf('data-')===0 && (v.indexOf('appmsg')>=0 || v.indexOf('://')>=0 || at.name.indexOf('appmsgid')>=0 || /^\d{5,}$/.test(v))){
+              if (at.name.indexOf('data-')===0 && (v.indexOf('appmsg')>=0 || v.indexOf('://')>=0 || at.name.indexOf('msgid')>=0 || /^\d{5,}$/.test(v))){
                 if (dataAttrs.length<120) dataAttrs.push({ name:at.name, value:v.slice(0,600) });
+              }
+              // 卡片 DOM 配对（EDITOR-ENTRY-BIND）：msgid 类属性是纯
+              // 数字 ID 时，沿祖先链在同一卡片容器内找标题文本——
+              // 标题与 ID 同卡共现才交回，宿主侧记为配对实证；找不
+              // 到标题就不交（不按卡片顺序与任何列表对位猜测）。
+              if (at.name.indexOf('msgid')>=0 && /^\d{5,}$/.test(v) && domPairs.length<40){
+                var card = e, cardTitle = '';
+                for (var up=0; up<6 && card && !cardTitle; up++){
+                  if (card.querySelector){
+                    var tel = card.querySelector('[class*="title"],[class*="Title"],h3,h4') || card.querySelector('a');
+                    if (tel){ var tt = (tel.textContent||'').replace(/\s+/g,' ').trim(); if (tt) cardTitle = tt.slice(0,120); }
+                  }
+                  card = card.parentElement;
+                }
+                if (cardTitle) domPairs.push({ title:cardTitle, id:v });
               }
             }
           }
@@ -444,7 +459,22 @@ enum SiteMode: String {
           var m = t.match(/[^\s"'<>]*appmsg[^\s"'<>]*/g) || [];
           for (var q=0;q<m.length && embedded.length<60;q++) embedded.push(m[q].slice(0,600));
         }
-        return { hrefs:hrefs, dataAttrs:dataAttrs, onclicks:onclicks, embedded:embedded };
+        // 内嵌数据对象窗口（EDITOR-ENTRY-BIND）：旧 embedded 只截
+        // 含 appmsg 的 URL 形片段，标题与 ID 的配对关系全丢——草稿
+        // 列表页的数据对象里两者同对象共存，必须把对象原文带回
+        // 宿主做同对象配对提取。以 appmsgid 类键出现点为锚截
+        // 前后各 2400 字（单个条目对象远小于此窗），每 frame 至
+        // 多 30 窗；宿主侧按括号配平找对象跨度、ID 唯一才成对。
+        for (var s2=0;s2<scripts.length && embeddedObjs.length<30;s2++){
+          var t2 = scripts[s2].textContent || '';
+          if (t2.indexOf('appmsgid')<0 && t2.indexOf('appmsg_id')<0 && t2.indexOf('app_id')<0) continue;
+          var re2 = /appmsgid|appmsg_id|app_id/g, mm2;
+          while ((mm2 = re2.exec(t2)) !== null && embeddedObjs.length<30){
+            var a2 = Math.max(0, mm2.index-2400), b2 = Math.min(t2.length, mm2.index+2400);
+            embeddedObjs.push(t2.slice(a2, b2));
+          }
+        }
+        return { hrefs:hrefs, dataAttrs:dataAttrs, onclicks:onclicks, embedded:embedded, embeddedObjs:embeddedObjs, domPairs:domPairs };
       };
       window.addEventListener('message', function(ev){
         var d = ev.data;
@@ -457,7 +487,7 @@ enum SiteMode: String {
           handleClick(d);
         } else if (d.kind === 'harvest'){
           var hv = collectHarvest();
-          post({ kind:'harvest-report', token:d.token, path:framePath(), href:hrefSafe(), hrefs:hv.hrefs, dataAttrs:hv.dataAttrs, onclicks:hv.onclicks, embedded:hv.embedded });
+          post({ kind:'harvest-report', token:d.token, path:framePath(), href:hrefSafe(), hrefs:hv.hrefs, dataAttrs:hv.dataAttrs, onclicks:hv.onclicks, embedded:hv.embedded, embeddedObjs:hv.embeddedObjs, domPairs:hv.domPairs });
         }
       });
     })();
@@ -1169,6 +1199,52 @@ enum TCProbeLogStore {
         return (result as? String) == "clicked"
     }
 
+    /// 文件控件形态诊断（EDITOR-ENTRY-BIND 第 4 项）：upload_file 步
+    /// 流的结构化记录原料——目标控件在哪里、页面里还有多少个文件
+    /// 控件。所在层口径：正文主 DOM／正文插入面板（工具栏区）／弹
+    /// 窗内；定位不到时给出主文档与同源 frame 的控件计数——封面菜
+    /// 单一类「根本不是 file input」的入口（公众号编辑器封面区二
+    /// 级菜单只有从正文选择/从图片库选择/扫码上传/一键生成、无本
+    /// 地上传，2026-11-03 真机实证）会落在这一支，步流据此可直接
+    /// 判「无本地入口」而非笼统的「回读未确认」。只读元数据。
+    func fileInputContext(index: Int) async -> String {
+        let tab = executionTab
+        let script = """
+        (()=>{const out={found:false,idxTag:'',mainFileInputs:0,frames:0,frameFileInputs:0,crossOriginFrames:0,hidden:false,accept:'',layer:''};
+        const countFI=(doc)=>{let n=0;try{doc.querySelectorAll('input[type="file"]').forEach(()=>n++);}catch(e){}return n;};
+        out.mainFileInputs=countFI(document);
+        document.querySelectorAll('iframe').forEach(f=>{out.frames++;try{const d=f.contentDocument;if(d)out.frameFileInputs+=countFI(d);else out.crossOriginFrames++;}catch(e){out.crossOriginFrames++;}});
+        const e=document.querySelector('[data-mika-idx="\(index)"]');
+        if(e){out.idxTag=e.tagName.toLowerCase()+'/'+(e.type||'');
+          if(e.tagName==='INPUT'&&e.type==='file'){out.found=true;
+            const cs=getComputedStyle(e);out.hidden=(cs.display==='none'||cs.visibility==='hidden');
+            out.accept=e.getAttribute('accept')||'';
+            const dlg=e.closest('[role="dialog"],dialog,[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"],[class*="popup"],[class*="Popup"]');
+            if(dlg){out.layer='弹窗内（'+(((dlg.getAttribute('class')||dlg.tagName)+'').slice(0,40))+'）';}
+            else{out.layer='正文主 DOM';let a=e;for(let i=0;i<6&&a;i++){a=a.parentElement;if(a&&/toolbar|insert|editor/i.test((a.className||'')+'')){out.layer='正文插入面板/工具栏区';break;}}}
+          }}
+        return JSON.stringify(out);})()
+        """
+        guard let raw = try? await evaluate(script, on: tab) as? String,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "控件形态读取失败（页面脚本未回報）"
+        }
+        let found = (obj["found"] as? Bool) ?? false
+        let main = (obj["mainFileInputs"] as? Int) ?? 0
+        let frameFI = (obj["frameFileInputs"] as? Int) ?? 0
+        let frames = (obj["frames"] as? Int) ?? 0
+        let cross = (obj["crossOriginFrames"] as? Int) ?? 0
+        if found {
+            let hidden = (obj["hidden"] as? Bool) ?? false
+            let accept = (obj["accept"] as? String) ?? ""
+            let layer = (obj["layer"] as? String) ?? "正文主 DOM"
+            return "控件所在层＝\(layer)；呈现＝\(hidden ? "隐藏（站点惯例，label/按钮冒充入口）" : "可见")；accept＝\(accept.isEmpty ? "未限定" : accept)；页面 file input 分布：主文档 \(main) 个、同源 frame \(frameFI) 个（iframe \(frames) 个）"
+        }
+        let idxTag = (obj["idxTag"] as? String) ?? ""
+        return "目标序号处\(idxTag.isEmpty ? "无元素" : "是 \(idxTag)、不是 file input")；页面 file input 分布：主文档 \(main) 个、同源 frame \(frameFI) 个（iframe \(frames) 个、跨源不可读 \(cross) 个）——控件可能在跨源 frame 内/未渲染，或该入口根本不是 file input（封面菜单无本地入口即属此类）"
+    }
+
     /// 回读执行页上文件控件已持有的文件（上传核验）：只读文件名与大小
     /// 元数据，不读内容；控件不在或未选文件返回空数组。
     func probeFileInput(index: Int) async -> [String] {
@@ -1314,14 +1390,82 @@ enum TCProbeLogStore {
         let facts: DirectTargetHarvest.Facts
     }
 
-    /// 直达目标 harvest（AUTONOMY-FIX 梯级②、LADDER-FIX F3 扩展）：
-    /// 经 frame 探针向整棵 frame 树采集候选——链接 href、data-* 属
-    /// 性、onclick 属性、页面内嵌列表数据（内联脚本文本中含 appmsg
-    /// 的片段），交 DirectTargetHarvest.build 做纯函数提取：模板与
-    /// 目标 ID 只从实证候选出，禁止任何未实证的标识映射假定（如
-    /// mid＝appmsgid）。探针未覆盖（零 frame 回報）时回落主 frame
-    /// 链接采集（旧口径下限），回落事实记入实况不隐瞒。
-    func harvestDirectTargets(memoryTemplate: String?) async -> HarvestOutcome {
+    /// 直达目标 harvest（AUTONOMY-FIX 梯级②、LADDER-FIX F3 扩展、
+    /// EDITOR-ENTRY-BIND 再扩展）：经 frame 探针向整棵 frame 树采集
+    /// 候选——链接 href、data-* 属性、onclick 属性、页面内嵌列表数
+    /// 据（URL 形片段＋以 appmsgid 为锚的对象窗口）、卡片 DOM 配对，
+    /// 交 DirectTargetHarvest.build 做纯函数提取：模板与目标 ID 只
+    /// 从实证候选出，禁止任何未实证的标识映射假定（如 mid＝
+    /// appmsgid）；给出目标标题时只认标题配对（同对象/同卡共现）。
+    /// 列表翻页：当前页地址带 begin/count 参数且本页未出结果时，
+    /// 按 begin 递进自动翻页累积（至多 5 页），实况注明覆盖页数。
+    /// 探针未覆盖（零 frame 回報）时回落主 frame 链接采集（旧口径
+    /// 下限），回落事实记入实况不隐瞒。
+    func harvestDirectTargets(memoryTemplate: String?, targetTitle: String? = nil) async -> HarvestOutcome {
+        let maxPages = 5
+        var allCandidates: [DirectTargetHarvest.Candidate] = []
+        var allDomPairs: [DirectTargetHarvest.Pair] = []
+        var pagesCovered = 0
+        var currentURL = (try? await state())?.url ?? ""
+        // 翻页上限：以首頁 begin/count 推 maxBegin（纯函数口径共用）
+        var maxBegin = Int.max
+        if let comps = URLComponents(string: currentURL), let items = comps.queryItems,
+           let b = Int(items.first(where: { $0.name == "begin" })?.value ?? ""),
+           let c = Int(items.first(where: { $0.name == "count" })?.value ?? ""), c > 0 {
+            maxBegin = b + (maxPages - 1) * c
+        }
+        while pagesCovered < maxPages {
+            let (pageCandidates, pagePairs, covered) = await collectHarvestOnce()
+            if pagesCovered == 0, !covered {
+                // 探针未覆盖：回落主 frame 链接采集（旧口径下限）
+                let tab = executionTab
+                let result = try? await evaluate("""
+                (()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const h=a.getAttribute('href');if(h)out.push(h);if(out.length>=400)break;}return JSON.stringify(out);})()
+                """, on: tab)
+                var fallback = allCandidates
+                if let raw = result as? String, let data = raw.data(using: .utf8),
+                   let hrefs = try? JSONDecoder().decode([String].self, from: data) {
+                    fallback = hrefs.map { .init(source: .href, value: $0) }
+                }
+                var built = DirectTargetHarvest.build(candidates: fallback, memoryTemplate: memoryTemplate, targetTitle: targetTitle, domPairs: allDomPairs)
+                built.facts.note += (built.facts.note.isEmpty ? "" : "；") + "frame 探针未覆盖，已回落主 frame 链接采集"
+                return HarvestOutcome(result: built.result, facts: built.facts)
+            }
+            allCandidates += pageCandidates
+            for p in pagePairs where !allDomPairs.contains(p) { allDomPairs.append(p) }
+            pagesCovered += 1
+            let built = DirectTargetHarvest.build(candidates: allCandidates, memoryTemplate: memoryTemplate, targetTitle: targetTitle, domPairs: allDomPairs)
+            if built.result != nil {
+                var facts = built.facts
+                if pagesCovered > 1 { facts.note += "；翻页累积覆盖 \(pagesCovered) 页" }
+                return HarvestOutcome(result: built.result, facts: facts)
+            }
+            // 未出结果：有下一页才翻（begin/count 列表才有此形态）
+            guard let next = DirectTargetHarvest.nextListPageURL(currentURL, maxBegin: maxBegin) else {
+                var facts = built.facts
+                if pagesCovered > 1 { facts.note += "；翻页累积覆盖 \(pagesCovered) 页" }
+                return HarvestOutcome(result: nil, facts: facts)
+            }
+            do { try loadOnExecutionTab(next) } catch {
+                var facts = built.facts
+                facts.note += "；翻页导航失败（\(error.localizedDescription)），已覆盖 \(pagesCovered) 页"
+                return HarvestOutcome(result: nil, facts: facts)
+            }
+            currentURL = next
+            try? await Task.sleep(for: .milliseconds(900))
+            _ = await settledCapture()
+        }
+        let built = DirectTargetHarvest.build(candidates: allCandidates, memoryTemplate: memoryTemplate, targetTitle: targetTitle, domPairs: allDomPairs)
+        var facts = built.facts
+        if pagesCovered > 1 { facts.note += "；翻页累积覆盖 \(pagesCovered) 页（已达翻页上限 \(maxPages) 页）" }
+        return HarvestOutcome(result: built.result, facts: facts)
+    }
+
+    /// 单页 harvest 采集（frame 探针洪泛→收集一轮回報）：候选、卡
+    /// 片 DOM 配对、探针是否覆盖（有 frame 回報）。harvestDirectTargets
+    /// 的翻页循环逐页调用；消息盒按本轮 token 隔离，迟到的上一轮
+    /// 回報不串入。
+    private func collectHarvestOnce() async -> (candidates: [DirectTargetHarvest.Candidate], domPairs: [DirectTargetHarvest.Pair], covered: Bool) {
         let tab = executionTab
         let token = UUID().uuidString
         let box = FrameMessageBox()
@@ -1333,6 +1477,7 @@ enum TCProbeLogStore {
         _ = try? await evaluate(flood, on: tab)
         try? await Task.sleep(for: .milliseconds(900))
         var candidates: [DirectTargetHarvest.Candidate] = []
+        var domPairs: [DirectTargetHarvest.Pair] = []
         for message in box.messages {
             let base = (message["href"] as? String) ?? ""
             for href in (message["hrefs"] as? [String]) ?? [] {
@@ -1347,21 +1492,19 @@ enum TCProbeLogStore {
             for em in (message["embedded"] as? [String]) ?? [] {
                 candidates.append(.init(source: .embedded, value: em, baseURL: base))
             }
-        }
-        if box.messages.isEmpty {
-            let result = try? await evaluate("""
-            (()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const h=a.getAttribute('href');if(h)out.push(h);if(out.length>=400)break;}return JSON.stringify(out);})()
-            """, on: tab)
-            if let raw = result as? String, let data = raw.data(using: .utf8),
-               let hrefs = try? JSONDecoder().decode([String].self, from: data) {
-                candidates = hrefs.map { .init(source: .href, value: $0) }
+            for em in (message["embeddedObjs"] as? [String]) ?? [] {
+                candidates.append(.init(source: .embedded, value: em, baseURL: base))
             }
-            var built = DirectTargetHarvest.build(candidates: candidates, memoryTemplate: memoryTemplate)
-            built.facts.note += (built.facts.note.isEmpty ? "" : "；") + "frame 探针未覆盖，已回落主 frame 链接采集"
-            return HarvestOutcome(result: built.result, facts: built.facts)
+            for dp in (message["domPairs"] as? [[String: Any]]) ?? [] {
+                let title = (dp["title"] as? String) ?? ""
+                let id = (dp["id"] as? String) ?? ""
+                if !title.isEmpty, !id.isEmpty {
+                    let pair = DirectTargetHarvest.Pair(title: title, appmsgid: id, evidence: "卡片 DOM 同卡共现")
+                    if !domPairs.contains(pair) { domPairs.append(pair) }
+                }
+            }
         }
-        let built = DirectTargetHarvest.build(candidates: candidates, memoryTemplate: memoryTemplate)
-        return HarvestOutcome(result: built.result, facts: built.facts)
+        return (candidates, domPairs, !box.messages.isEmpty)
     }
 
     /// hover 显形探测的回報（LADDER-FIX F5）。
@@ -1475,10 +1618,25 @@ enum TCProbeLogStore {
         if let supply = armedUploadSupply,
            let tab = tabs.first(where: { $0.webView === webView }), tab.id == supply.tabID {
             armedUploadSupply = nil
+            openPanelEvents.append((at: Date(), consumedSupply: true))
             completionHandler([supply.url])
             return
         }
+        openPanelEvents.append((at: Date(), consumedSupply: false))
         OpenPanelFallback.present(parameters: parameters, from: webView, completion: completionHandler)
+    }
+
+    /// 文件面板回调活动记录（EDITOR-ENTRY-BIND 上传诊断）：每次
+    /// runOpenPanel 被拉起都记一笔（是否消费了武装待供文件）。只记
+    /// 元数据（时刻＋布尔），不记文件名/路径。
+    private(set) var openPanelEvents: [(at: Date, consumedSupply: Bool)] = []
+
+    /// 某时刻以来的面板回调活动（上传步流结构化诊断用）：fired＝
+    /// 回调被拉起次数，consumed＝其中消费待供文件的次数。据此可
+    /// 区分「控件触发了但页面走宿主选择器」与「回调根本没来」。
+    func openPanelActivity(since: Date) -> (fired: Int, consumed: Int) {
+        let recent = openPanelEvents.filter { $0.at >= since }
+        return (recent.count, recent.filter { $0.consumedSupply }.count)
     }
 
     // MARK: - agent 执行通道（路由到执行页）

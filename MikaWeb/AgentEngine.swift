@@ -198,6 +198,12 @@ struct BypassLadder: Equatable {
 /// → nil（此级失败）。候选来源（F3）：链接 href、data-* 属性、
 /// onclick 属性、页面内嵌列表数据（内联脚本文本）——预览链接
 /// （/s? 类带 tempkey）按 F5 明确排除出编辑入口候选并计数留痕。
+/// EDITOR-ENTRY-BIND 扩展：内嵌数据不再只截 URL 片段——采集层以
+/// appmsgid 类键为锚截取对象窗口，本枚举从窗口里做「同对象共现」
+/// 配对提取（标题与 appmsgid 必须出现在同一个对象字面量内、且该
+/// 对象内 appmsgid 取值唯一才成对，见 extractPairs）；引擎给出目
+/// 标标题（卡点/目标里的书名号引文）时只许采用与标题配对的那一个
+/// ID——配不到或配到多组一律落空，禁止按位置/顺序猜测配对。
 enum DirectTargetHarvest {
     struct Result: Equatable {
         let url: String
@@ -207,6 +213,19 @@ enum DirectTargetHarvest {
         var source: String = ""
         /// 模板来自本任务先前页面的跨页记忆时为 true。
         var crossPage: Bool = false
+        /// 经标题配对采用时，被实证绑定的目标标题（步流留痕用）。
+        var pairedTitle: String? = nil
+    }
+
+    /// 一组标题↔appmsgid 实证配对：两者在同一证据单元内共现——
+    /// 内嵌数据＝同一对象字面量；卡片 DOM＝同一卡片子树（采集层
+    /// 在卡片容器内同时取到标题文本与 msgid 类属性）。位置相邻、
+    /// 顺序对应不算配对，提取口径见 extractPairs 与采集层注释。
+    struct Pair: Equatable {
+        let title: String
+        let appmsgid: String
+        /// 证据来源说明（步流与案卷留痕用）。
+        let evidence: String
     }
 
     enum Source: String, CaseIterable {
@@ -238,6 +257,8 @@ enum DirectTargetHarvest {
         var previewExcluded: Int = 0
         var knownIDs: [String] = []
         var note: String = ""
+        /// 标题↔appmsgid 实证配对（同对象/同卡共现，见 Pair）。
+        var pairs: [Pair] = []
         /// 本页实证见到的编辑链接模板（已解析的绝对地址；供引擎回写
         /// 梯账作跨页模板记忆，不进 line 文案）。
         var editTemplate: String? = nil
@@ -250,6 +271,7 @@ enum DirectTargetHarvest {
             if !dist.isEmpty { text += "（来源：\(dist)）" }
             if previewExcluded > 0 { text += "；预览链接排除 \(previewExcluded) 条" }
             text += "；实证 appmsgid \(knownIDs.count) 个"
+            if !pairs.isEmpty { text += "；标题配对实证 \(pairs.count) 组（同对象/同卡共现）" }
             if !note.isEmpty { text += "；\(note)" }
             return text
         }
@@ -260,7 +282,7 @@ enum DirectTargetHarvest {
         build(candidates: hrefs.map { Candidate(source: .href, value: $0) }, memoryTemplate: nil).result
     }
 
-    static func build(candidates: [Candidate], memoryTemplate: String?) -> (result: Result?, facts: Facts) {
+    static func build(candidates: [Candidate], memoryTemplate: String?, targetTitle: String? = nil, domPairs: [Pair] = []) -> (result: Result?, facts: Facts) {
         var facts = Facts()
         facts.total = candidates.count
         for c in candidates { facts.perSource[c.source, default: 0] += 1 }
@@ -287,7 +309,50 @@ enum DirectTargetHarvest {
                 }
             }
         }
+        // 标题配对提取（EDITOR-ENTRY-BIND）：内嵌数据候选走同对象
+        // 共现提取，卡片 DOM 配对由采集层直接交入——两路都是证据
+        // 绑定，配对 ID 同样计入实证 ID 集。
+        var pairs = domPairs
+        for c in candidates where c.source == .embedded {
+            for p in extractPairs(fromScriptText: c.value) where !pairs.contains(p) { pairs.append(p) }
+        }
+        facts.pairs = pairs
+        for p in pairs where !facts.knownIDs.contains(p.appmsgid) { facts.knownIDs.append(p.appmsgid) }
         facts.editTemplate = editTemplate?.url
+        // 有目标标题时只认标题配对：配不到唯一一组即落空——绝不
+        // 退回「模板＋第一个 ID」的顺序猜测（会打开错的那篇草稿）。
+        // 带 ID 编辑链接直用也受此约束：其 ID 必须与目标标题的唯
+        // 一配对一致才用（链接本身只绑定模板与 ID、不绑定标题，
+        // 列表页上多条编辑链接时拿第一条就是位置猜测）。
+        if let target = targetTitle, !normalizeTitle(target).isEmpty {
+            let matches = pairs.filter { titleMatches(pairTitle: $0.title, target: target) }
+            if matches.count == 1, let pair = matches.first {
+                if let d = directEdit, d.id == pair.appmsgid {
+                    facts.note = "采用带 ID 编辑链接直用，且与标题配对实证一致：《\(pair.title)》↔ appmsgid=\(pair.appmsgid)（\(pair.evidence)；链接来源：\(d.source.label)）"
+                    return (Result(url: d.url, appmsgid: d.id, viaTemplate: false, source: d.source.label, pairedTitle: pair.title), facts)
+                }
+                if let t = editTemplate {
+                    facts.note = "采用标题配对实证：《\(pair.title)》与 appmsgid=\(pair.appmsgid) \(pair.evidence)，拼编辑链接模板（模板来源：\(t.source.label)）"
+                    let separator = t.url.contains("?") ? "&" : "?"
+                    return (Result(url: t.url + separator + "appmsgid=" + pair.appmsgid, appmsgid: pair.appmsgid, viaTemplate: true, source: "标题配对（\(pair.evidence)）", pairedTitle: pair.title), facts)
+                }
+                if let memory = memoryTemplate {
+                    facts.note = "采用标题配对实证：《\(pair.title)》与 appmsgid=\(pair.appmsgid) \(pair.evidence)，拼跨页模板记忆"
+                    let separator = memory.contains("?") ? "&" : "?"
+                    return (Result(url: memory + separator + "appmsgid=" + pair.appmsgid, appmsgid: pair.appmsgid, viaTemplate: true, source: "标题配对（\(pair.evidence)）", crossPage: true, pairedTitle: pair.title), facts)
+                }
+                facts.note = "落空：目标标题《\(target)》已配到 appmsgid=\(pair.appmsgid)（\(pair.evidence)），但本页与跨页记忆均无编辑链接模板可拼"
+                return (nil, facts)
+            }
+            if matches.count > 1 {
+                facts.note = "落空：目标标题《\(target)》匹配到 \(matches.count) 组配对，无法唯一确定，未采用任何一组（不猜测）"
+            } else if pairs.isEmpty {
+                facts.note = "落空：目标标题《\(target)》在位，但页面未提取到任何标题配对（内嵌数据无同对象共现、卡片 DOM 无共现）——不按位置/顺序猜测配对"
+            } else {
+                facts.note = "落空：已提取标题配对 \(pairs.count) 组，无一与目标标题《\(target)》匹配（不按位置/顺序猜测配对）"
+            }
+            return (nil, facts)
+        }
         if let d = directEdit {
             facts.note = "采用带 ID 编辑链接直用（来源：\(d.source.label)）"
             return (Result(url: d.url, appmsgid: d.id, viaTemplate: false, source: d.source.label), facts)
@@ -306,6 +371,179 @@ enum DirectTargetHarvest {
         else if facts.knownIDs.isEmpty { facts.note = "落空：\(facts.total) 条候选中未见 appmsgid 实证（不假定任何标识映射）" }
         else { facts.note = "落空：有实证 ID 但无编辑链接模板（本页与跨页记忆均无）" }
         return (nil, facts)
+    }
+
+    // MARK: - 标题配对提取（EDITOR-ENTRY-BIND，纯函数）
+
+    /// 目标标题提取：引擎从任务目标/卡点文案里取书名号（或直角引
+    /// 号）引文作目标标题——harvest 据此在配对里找唯一对应。取不到
+    /// 返回 nil（harvest 退回无目标口径）。引文过短（<4 字）不认，
+    /// 防「草稿」一类泛称被当成标题去配对。
+    static func extractTargetTitle(goal: String, stuck: String) -> String? {
+        for text in [goal, stuck] {
+            for (open, close) in [("《", "》"), ("「", "」"), ("“", "”")] {
+                guard let r1 = text.range(of: open),
+                      let r2 = text.range(of: close, range: r1.upperBound..<text.endIndex) else { continue }
+                let inner = String(text[r1.upperBound..<r2.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if inner.count >= 4 { return inner }
+            }
+        }
+        return nil
+    }
+
+    /// 标题归一化（配对匹配用）：去书名号、折叠空白、小写——只做
+    /// 书写差异消除，不做语义近似。
+    static func normalizeTitle(_ s: String) -> String {
+        s.replacingOccurrences(of: "《", with: "")
+            .replacingOccurrences(of: "》", with: "")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    /// 配对标题与目标标题是否同一篇：归一化后全等，或一方完整包
+    /// 含另一方（目标文案可能截断/带后缀说明）。泛称短串在提取侧
+    /// 已被长度门挡下，这里不另设近似匹配。
+    static func titleMatches(pairTitle: String, target: String) -> Bool {
+        let a = normalizeTitle(pairTitle), b = normalizeTitle(target)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a == b || a.contains(b) || b.contains(a)
+    }
+
+    /// 从一段内嵌脚本文本里提取标题↔appmsgid 配对。口径（证据绑
+    /// 定，宁缺勿滥）：
+    /// 1) 找出全部 appmsgid 类键（appmsgid/appmsg_id/app_id，含 URL
+    ///    形 appmsgid=）的数值出现点；
+    /// 2) 对每个出现点，由内向外逐层取包含它的对象字面量跨度——
+    ///    某层跨度内 appmsgid 取值唯一、且含 title 键字符串值时，
+    ///    两者成对（同对象共现）；跨度内出现第二个不同 ID 即停
+    ///    （再外层只会更杂），该出现点不成对；
+    /// 3) 对象跨度按字符串感知的括号配平求出（引号内括号不计）。
+    /// JS 字面量不是严格 JSON（键可无引号、值可单引号），故不用
+    /// JSON 解析、走容错扫描；解析失败的最坏结果是漏配（实况行
+    /// 如实记 0），不会误配。
+    static func extractPairs(fromScriptText raw: String) -> [Pair] {
+        let text = raw.replacingOccurrences(of: "\\/", with: "/")
+        guard text.count <= 200_000 else { return [] }
+        guard let idRegex = try? NSRegularExpression(pattern: "(?i)(?:appmsgid|appmsg_id|app_id)[\"']?\\s*[:=]\\s*[\"']?(\\d{5,})") else { return [] }
+        let fullRange = NSRange(text.startIndex..., in: text)
+        var occurrences: [(value: String, location: Int)] = []
+        for m in idRegex.matches(in: text, range: fullRange) {
+            if let r = Range(m.range(at: 1), in: text) { occurrences.append((String(text[r]), m.range(at: 1).location)) }
+        }
+        guard !occurrences.isEmpty else { return [] }
+        let spans = objectSpans(in: text)
+        var pairs: [Pair] = []
+        for occ in occurrences {
+            // 包含该出现点的对象跨度，由小到大逐层试
+            let containing = spans.filter { $0.open < occ.location && occ.location < $0.close }.sorted { ($0.close - $0.open) < ($1.close - $1.open) }
+            for span in containing.prefix(3) {
+                let idsInSpan = Set(occurrences.filter { span.open < $0.location && $0.location < span.close }.map { $0.value })
+                guard idsInSpan.count == 1 else { break }
+                guard let nsRange = Range(NSRange(location: span.open, length: span.close - span.open + 1), in: text) else { break }
+                let spanText = String(text[nsRange])
+                if let title = titleValue(inSpanText: spanText) {
+                    let pair = Pair(title: title, appmsgid: occ.value, evidence: "内嵌数据同对象共现")
+                    if !pairs.contains(pair) { pairs.append(pair) }
+                    break
+                }
+            }
+        }
+        return pairs
+    }
+
+    /// 字符串感知的对象跨度扫描：返回全部成对 { } 的 utf16 起止位
+    /// 置（引号/转义内的括号不计；模板字符串整体按引号跳过——其内
+    /// ${} 表达式里的对象字面量会漏检，属可接受的漏配方向）。
+    private static func objectSpans(in text: String) -> [(open: Int, close: Int)] {
+        let units = Array(text.utf16)
+        var spans: [(open: Int, close: Int)] = []
+        var stack: [Int] = []
+        var quote: UInt16? = nil
+        var escaped = false
+        for (i, u) in units.enumerated() {
+            if let q = quote {
+                if escaped { escaped = false }
+                else if u == 0x5C { escaped = true }
+                else if u == q { quote = nil }
+                continue
+            }
+            if u == 0x22 || u == 0x27 || u == 0x60 { quote = u; continue }
+            if u == 0x7B { stack.append(i) }
+            else if u == 0x7D, let open = stack.popLast() { spans.append((open, i)) }
+        }
+        return spans
+    }
+
+    /// 在对象跨度文本里找 title 键的字符串值（双/单引号、键可带
+    /// 引号），并解 JS 转义（含 \uXXXX——中文标题在内嵌数据里常
+    /// 以此形态出现）。找不到返回 nil。
+    private static func titleValue(inSpanText spanText: String) -> String? {
+        let pattern = "(?:[\"']title[\"']|(?:^|[\\s{,])title)\\s*:\\s*(?:\"((?:\\\\.|[^\"\\\\])*)\"|'((?:\\\\.|[^'\\\\])*)')"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let m = regex.firstMatch(in: spanText, range: NSRange(spanText.startIndex..., in: spanText)) else { return nil }
+        for group in 1...2 {
+            if let r = Range(m.range(at: group), in: spanText) {
+                let decoded = decodeJSString(String(spanText[r])).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !decoded.isEmpty { return decoded }
+            }
+        }
+        return nil
+    }
+
+    /// JS 字符串转义解码：\uXXXX、\xXX 与常见单字转义；解不了的
+    /// 转义按字面保留后一位，不抛错。
+    private static func decodeJSString(_ raw: String) -> String {
+        var out = ""
+        var idx = raw.startIndex
+        while idx < raw.endIndex {
+            let ch = raw[idx]
+            guard ch == "\\" else { out.append(ch); idx = raw.index(after: idx); continue }
+            let next = raw.index(after: idx)
+            guard next < raw.endIndex else { break }
+            let esc = raw[next]
+            switch esc {
+            case "n": out.append("\n"); idx = raw.index(after: next)
+            case "t": out.append("\t"); idx = raw.index(after: next)
+            case "r": out.append("\r"); idx = raw.index(after: next)
+            case "u":
+                var hex = ""
+                var cur = raw.index(after: next)
+                while hex.count < 4, cur < raw.endIndex, raw[cur].isHexDigit {
+                    hex.append(raw[cur]); cur = raw.index(after: cur)
+                }
+                if hex.count == 4, let v = UInt32(hex, radix: 16), let scalar = UnicodeScalar(v) {
+                    out.append(Character(scalar)); idx = cur
+                } else { idx = raw.index(after: next) }
+            case "x":
+                var hex = ""
+                var cur = raw.index(after: next)
+                while hex.count < 2, cur < raw.endIndex, raw[cur].isHexDigit {
+                    hex.append(raw[cur]); cur = raw.index(after: cur)
+                }
+                if hex.count == 2, let v = UInt32(hex, radix: 16), let scalar = UnicodeScalar(v) {
+                    out.append(Character(scalar)); idx = cur
+                } else { idx = raw.index(after: next) }
+            default:
+                out.append(esc); idx = raw.index(after: next)
+            }
+        }
+        return out
+    }
+
+    /// 列表翻页地址（纯函数）：URL 带 begin/count 查询参数时给出
+    /// 下一页地址（begin += count），begin 超过 maxBegin、参数缺失
+    /// 或 count 非正即 nil（无下一页/不是翻页列表）。harvest 的翻
+    /// 页累积与自检二十四共用此口径。
+    static func nextListPageURL(_ urlString: String, maxBegin: Int) -> String? {
+        guard var comps = URLComponents(string: urlString), let items = comps.queryItems,
+              let beginText = items.first(where: { $0.name == "begin" })?.value, let begin = Int(beginText),
+              let countText = items.first(where: { $0.name == "count" })?.value, let count = Int(countText), count > 0
+        else { return nil }
+        let next = begin + count
+        guard next <= maxBegin else { return nil }
+        comps.queryItems = items.map { $0.name == "begin" ? URLQueryItem(name: "begin", value: String(next)) : $0 }
+        return comps.url?.absoluteString
     }
 
     /// 预览链接判定（F5）：带 tempkey 的 /s? 短链是临时预览、非编辑
@@ -1614,10 +1852,20 @@ struct OpenStall {
            let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
             supplyArmed = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
         }
-        _ = await web.triggerFileInput(index: upload.elementIndex)
+        // 上传结构化诊断（EDITOR-ENTRY-BIND 第 4 项）：触发前记控件
+        // 形态、触发后记面板回调与供文件消费——下次真机在真实编辑
+        // 器里跑上传，从步流就能判「控件没找到/回调没触发/页面不
+        // 认」是哪一种，不再只有一句「回读未确认」。只加诊断，不
+        // 改上传机制与 SP-01 语义。
+        let controlContext = await web.fileInputContext(index: upload.elementIndex)
+        let panelStart = Date()
+        let triggered = await web.triggerFileInput(index: upload.elementIndex)
         if supplyArmed {
             try? await Task.sleep(for: .milliseconds(1200))
-            if !web.uploadSupplyArmed {
+            let panel = web.openPanelActivity(since: panelStart)
+            let consumed = !web.uploadSupplyArmed
+            appendStep("upload", "上传诊断：\(controlContext)；合成触发＝\(triggered ? "已派发" : "控件不在（触发失败）")；文件面板回调＝\(panel.fired > 0 ? "已拉起 \(panel.fired) 次（消费待供 \(panel.consumed) 次）" : "未拉起")；供文件＝\(consumed ? "已被页面消费" : "仍武装待真点")")
+            if consumed {
                 appendStep("upload", "App 已直接供文件：SP-01 已过后由 App 把「\(upload.attachmentName)」直接交给了页面文件控件（iOS 文件面板公开回调，未经系统选择器、未再向用户索取确认）")
                 pendingUpload = nil
                 waitingInput = nil
@@ -1625,6 +1873,10 @@ struct OpenStall {
                 return true
             }
             appendStep("upload", "自动供文件未触发（合成触发未拉起文件面板）——文件已由 App 备好并保持待供：在网页上点一次上传按钮就会自动带上，不用在选择器里翻找")
+        } else {
+            try? await Task.sleep(for: .milliseconds(600))
+            let panel = web.openPanelActivity(since: panelStart)
+            appendStep("upload", "上传诊断：\(controlContext)；合成触发＝\(triggered ? "已派发" : "控件不在（触发失败）")；文件面板回调＝\(panel.fired > 0 ? "已拉起 \(panel.fired) 次（手动路径，宿主选择器转发）" : "未拉起")；供文件＝未武装（手动选文件路径）")
         }
         let text = "请选择要上传的文件（目标：\(upload.attachmentName)）"
         // 等待 id 每阶段一换：对话层按 id 去重，复用确认阶段的 id 会把
@@ -1717,14 +1969,22 @@ struct OpenStall {
         let baseline = Set(upload.preUploadImages)
         let names = await web.probeFileInput(index: index)
         if names.isEmpty {
+            // 诊断口径（EDITOR-ENTRY-BIND）：第二回读也照取——控件
+            // 未持有但页面已出现新图（页面用另一控件/弹窗收文件）
+            // 与双空（页面根本不认）是两种不同的失败，分开记录。
+            let afterImages = await web.probePageImages()
+            let newImages = afterImages.filter { !baseline.contains($0) }
             appendStep("upload", "上传回读核验：页面文件控件里未读到已选文件——可能还没选完或页面未持有该文件，不要声称已上传成功；确需上传时重新发起 upload_file")
+            appendStep("upload", "上传诊断小结：回读①控件持有＝✗未读到；回读②页面新增图像＝\(newImages.isEmpty ? "✗无" : "✓ \(newImages.count) 处（控件未持有而页面有新图——页面可能经其它控件/弹窗收下文件，以页面现状为准）")；结论＝未确认持有")
         } else {
             let afterImages = await web.probePageImages()
             let newImages = afterImages.filter { !baseline.contains($0) }
             if newImages.isEmpty {
                 appendStep("upload", "上传回读核验（unknown）：文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），但页面上未见新增的封面/预览图像——封面可能尚未设上或预览未渲染，不要声称封面已设好；下一轮看页面现状再判断（可稍等预览出现或核对封面区）")
+                appendStep("upload", "上传诊断小结：回读①控件持有＝✓（\(names.joined(separator: "、"))）；回读②页面新增图像＝✗无；结论＝unknown（单回读过、双回读未齐）")
             } else {
                 appendStep("upload", "上传回读核验（双回读通过）：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），且页面新增了 \(newImages.count) 处图像（封面缩略图/预览已出现）——两项回读相互印证，封面已设上；是否已提交到服务器以下一轮页面反馈为准")
+                appendStep("upload", "上传诊断小结：回读①控件持有＝✓（\(names.joined(separator: "、"))）；回读②页面新增图像＝✓ \(newImages.count) 处；结论＝双回读通过")
                 stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
             }
         }
@@ -1819,6 +2079,7 @@ struct OpenStall {
                         // pendingVerificationStep 在 outcome 步之后补入）
                         await runPostSubmissionVerification(recordID: outcome.recordID, element: target, pageURL: snapshot.url, before: modelPage, token: token)
                     }
+                    await noteOverlayDiagnosticAfterClick(clicked: original)
                 }
                 return .executed
             } catch {
@@ -1848,6 +2109,24 @@ struct OpenStall {
                 refinds += 1
                 snapshot = try await web.state()
             }
+        }
+    }
+
+    /// 浮动层诊断（EDITOR-ENTRY-BIND 第 4 项扩展）：点击疑似菜单入
+    /// 口（图标名源/无名控件，或文案含 +／菜单／更多）后回读一帧，
+    /// 回答「浮动层/二级菜单进没进感知」——进了记所在层与条目文本
+    /// （playbook 可按文本定位）；没进如实记未感知（可能在状态稳
+    /// 定等待期间已被页面自动关闭、或位于抽取够不到的层），play-
+    /// book 按固定布局坐标打法处理。只记诊断，不改点击语义。
+    private func noteOverlayDiagnosticAfterClick(clicked: PageElement) async {
+        let label = !clicked.text.isEmpty ? clicked.text : clicked.ariaLabel
+        let looksLikeOpener = clicked.nameSource == "icon" || clicked.nameSource == "none"
+            || label.contains("+") || label.contains("＋") || label.contains("菜单") || label.contains("更多")
+        guard looksLikeOpener, let after = try? await web.state() else { return }
+        if after.overlayNotes.isEmpty {
+            appendStep("perception", "浮动层诊断：点击「\(label.isEmpty ? "图标控件" : label)」后，主文档 frame 未感知到菜单类浮动层——菜单可能已在状态稳定等待期间自动关闭、或位于抽取够不到的层（跨源 frame／原生层）；按 playbook 的固定布局坐标打法处理，不依赖看见菜单本身")
+        } else {
+            appendStep("perception", "浮动层诊断：点击「\(label.isEmpty ? "图标控件" : label)」后感知到浮动层 \(after.overlayNotes.count) 处——\(after.overlayNotes.joined(separator: "；"))（菜单项已进入感知，可按文本定位点选）")
         }
     }
 
@@ -1997,6 +2276,21 @@ struct OpenStall {
             }
             openStall = stall
         }
+        // 揭示复判/坐标点击收口（EDITOR-ENTRY-BIND，与 frameClose 同
+        // pattern）：结级前引擎亲自动手一轮——真机三次现场这两项都
+        // 因模型从未在第 1 级点过任何东西而记「未试」，等模型自觉
+        // 已被实证不可靠。点击把页面带离卡点页时本级按绕过收口。
+        if await attemptRung1RevealClick(token: token) {
+            if !bypassLadder.attempted.contains(.existingMeans) {
+                let summary = openStall?.meansSummary ?? stall.meansSummary
+                bypassLadder.markAttempted(.existingMeans, note: "逐项验收：\(summary)（引擎揭示复判点击打开新页面，卡点绕过）")
+            }
+            appendStep("bypass", "绕行梯第 1 级结级（\(forcedBy)）：引擎揭示复判点击后页面已离开卡点页，卡点按绕过关闭，不再推进后续梯级")
+            closeStall(note: "第 1 级引擎揭示复判点击打开新页面")
+            persistSnapshot()
+            return
+        }
+        stall = openStall ?? stall
         if !bypassLadder.attempted.contains(.existingMeans) {
             let forced = !stall.rung1Complete
             bypassLadder.markAttempted(.existingMeans, note: "逐项验收：\(stall.meansSummary)\(forced ? "（\(forcedBy)强制结级，未试项如上如实记录）" : "（全部验收齐或判定不适用）")")
@@ -2004,6 +2298,76 @@ struct OpenStall {
         appendStep("bypass", "绕行梯第 1 级结级（\(forcedBy)）：\(stall.meansSummary)，引擎推进下一级")
         persistSnapshot()
         try await progressRungsBeyondFirst(token: token)
+    }
+
+    /// 引擎驱动的第 1 级「揭示复判再点」收口（EDITOR-ENTRY-BIND）：
+    /// 两项（revealClick/coordClick）仍无实证时引擎亲自动手一轮——
+    /// 先 hover 显形探测、再取新快照复判，按编辑语义挑候选（编辑链
+    /// 接，或文案/无障碍名含编辑语义的控件，含图标名源 icon；预览链
+    /// 接、禁用、敏感一律排除；文案含删除/发表/发布等破坏性或发表
+    /// 语义的一律不点——图标无名时引擎不盲点未知控件），过
+    /// SafetyPolicy（须 .allow）后经执行层 click（与模型 click 同一
+    /// 实现面：点前滚动揭示复判＋按元素中心真实坐标派发，一次真实
+    /// 执行同时记两项实证，记账走 noteExecutedActionForStall 既有
+    /// 口径）。无可指认候选→两项记不适用并注明依据，不留「未试」。
+    /// 返回 true＝点击后页面已离开卡点页或已进入可编辑页（卡点按
+    /// 绕过收口，调用方不再推进后续梯级）。
+    private func attemptRung1RevealClick(token: UUID) async -> Bool {
+        guard let stall = openStall else { return false }
+        if stall.verified.contains(.revealClick), stall.verified.contains(.coordClick) { return false }
+        let destructive = ["删除", "发表", "发布", "delete", "publish", "remove"]
+        func pickCandidate(in page: PageState) -> PageElement? {
+            page.elements.first { e in
+                if e.disabled || e.sensitive { return false }
+                let label = (e.text + " " + e.ariaLabel).lowercased()
+                if destructive.contains(where: { label.contains($0) }) { return false }
+                if e.linkKind == "preview" { return false }
+                if e.linkKind == "edit" { return true }
+                return label.contains("编辑") || label.contains("修改") || label.contains("铅笔")
+                    || label.contains("edit") || label.contains("pencil")
+            }
+        }
+        guard var page = try? await web.state() else { return false }
+        var target = pickCandidate(in: page)
+        if target == nil {
+            // 揭示一轮再复判：hover 显形后重新抽取快照（显形元素只
+            // 进新快照，旧快照里没有的东西不硬点）
+            _ = await web.hoverRevealProbe()
+            try? await Task.sleep(for: .milliseconds(300))
+            if let refreshed = try? await web.state() {
+                page = refreshed
+                target = pickCandidate(in: refreshed)
+            }
+        }
+        guard let target else {
+            if var current = openStall {
+                let reason = "引擎 hover 揭示＋新快照复判后，感知清单无可指认的编辑入口候选（编辑链接与编辑语义控件均无），未盲点未知图标"
+                if !current.verified.contains(.revealClick) { current.markNA(.revealClick, reason: reason) }
+                if !current.verified.contains(.coordClick) { current.markNA(.coordClick, reason: reason) }
+                openStall = current
+            }
+            appendStep("bypass", "绕行梯第 1 级引擎揭示复判：揭示后仍无可指认的编辑入口候选，揭示复判再点/坐标点击记不适用（依据见梯账），不盲点未知控件")
+            return false
+        }
+        guard let click = Self.clickAction(index: target.index, reason: "绕行梯第 1 级引擎揭示复判点击编辑入口候选") else { return false }
+        guard SafetyPolicy.check(click, target) == .allow else {
+            appendStep("bypass", "绕行梯第 1 级引擎揭示复判：候选「\(target.text.isEmpty ? target.ariaLabel : target.text)」未过安全策略，未代点")
+            return false
+        }
+        do {
+            try await web.execute(click, expected: target)
+        } catch {
+            appendStep("bypass", "绕行梯第 1 级引擎揭示复判：候选点击抛错：\(error.localizedDescription)")
+            return false
+        }
+        noteExecutedActionForStall(actionName: "click", targetKey: ElementDescriptor(target).key)
+        appendStep("bypass", "绕行梯第 1 级引擎揭示复判：已按编辑语义点击候选「\(target.text.isEmpty ? target.ariaLabel : target.text)」（点前揭示＋坐标派发，与模型 click 同一实现面），揭示复判再点/坐标点击记实证")
+        _ = await web.settledCapture()
+        if let now = try? await web.state() {
+            if now.url != stall.openURL { return true }
+            if now.elements.contains(where: { $0.editable }) { return true }
+        }
+        return false
     }
 
     /// 驱动第 2、3 级（引擎同步执行，不等模型）：任一级成功即关卡点
@@ -2019,7 +2383,8 @@ struct OpenStall {
                 // 快照恢复等边角下若它仍是下一级，按已下达口径补记并继续
                 bypassLadder.markAttempted(.existingMeans, note: "第 1 级已下达（恢复现场补记，逐项验收以在开卡点账为准）")
             case .directURL:
-                let outcome = await web.harvestDirectTargets(memoryTemplate: bypassLadder.harvestTemplate)
+                let targetTitle = DirectTargetHarvest.extractTargetTitle(goal: goal, stuck: openStall?.stuck ?? "")
+                let outcome = await web.harvestDirectTargets(memoryTemplate: bypassLadder.harvestTemplate, targetTitle: targetTitle)
                 let pageURL = (try? await web.state())?.url ?? ""
                 bypassLadder.noteHarvest(template: outcome.facts.editTemplate, templateFrom: outcome.facts.editTemplate == nil ? nil : pageURL, fact: outcome.facts.line)
                 if let harvest = outcome.result {
@@ -2033,7 +2398,7 @@ struct OpenStall {
                         appendStep("bypass", "绕行梯第 2 级「直达 URL」导航失败：\(error.localizedDescription)（\(outcome.facts.line)），推进下一级")
                         continue
                     }
-                    bypassLadder.markAttempted(.directURL, note: "采用候选 appmsgid=\(harvest.appmsgid)（来源：\(harvest.source)\(harvest.viaTemplate ? "、模板拼装" : "、带 ID 直用")\(harvest.crossPage ? "、跨页模板记忆" : "")），已导航直达；\(outcome.facts.line)")
+                    bypassLadder.markAttempted(.directURL, note: "采用候选 appmsgid=\(harvest.appmsgid)（来源：\(harvest.source)\(harvest.viaTemplate ? "、模板拼装" : "、带 ID 直用")\(harvest.crossPage ? "、跨页模板记忆" : "")\(harvest.pairedTitle.map { "、标题配对《\($0)》" } ?? ""))，已导航直达；\(outcome.facts.line)")
                     appendStep("bypass", "绕行梯第 2 级「直达 URL」成功：\(outcome.facts.line)；已导航直达：\(harvest.url)")
                     _ = await web.settledCapture()
                     closeStall(note: "直达 URL 已打开目标页")
@@ -2359,7 +2724,12 @@ struct OpenStall {
         let mixed = CoverGenerator.GeneratedFileName.coverFileName(title: "AI Weekly Report 2026!")
         lines.append("\(fmt(mixed == "cover-ai-weekly-report-2026.png")) 命名·混合标题：「AI Weekly Report 2026!」→ \(mixed)（小写 slug、标点折连字符）")
         let fullWidth = CoverGenerator.GeneratedFileName.coverFileName(title: "别让AI替你瞎编；用这套三步法")
-        let fullWidthOK = fullWidth.hasPrefix("cover-ai-") && fullWidth.hasSuffix(".png") && fullWidth.unicodeScalars.allSatisfy { $0.isASCII }
+        // 断言修正（EDITOR-ENTRY-BIND 搭车，0713 真机实证）：该标题
+        // 唯一的拉丁字母就是 AI，其余中文/全角标点按设计折掉，正
+        // 确产出就是 cover-ai.png；旧断言要求前缀 cover-ai-（ai 后
+        // 还须有一段 slug），对此输入不可能成立——是断言写错、不
+        // 是命名函数错。改精确断言＋全 ASCII 检查保留。
+        let fullWidthOK = fullWidth == "cover-ai.png" && fullWidth.unicodeScalars.allSatisfy { $0.isASCII }
         lines.append("\(fmt(fullWidthOK)) 命名·全角标点剔除：0336 现场标题（含全角分号）→ \(fullWidth)（全 ASCII、无全角残留）")
         let fixedDate = Date(timeIntervalSince1970: 1762142400)
         let chineseOnly = CoverGenerator.GeneratedFileName.coverFileName(title: "纯中文标题没有英文", date: fixedDate)
@@ -2453,6 +2823,61 @@ struct OpenStall {
         stateCard = savedStateCard
         clearSnapshot()
         lines.append("\(fmt(!busy)) 现场还原：引擎回到演练前的空闲状态（演练快照已一并清除）")
+        return lines
+    }
+
+    /// 自检二十四（EDITOR-ENTRY-BIND）：标题↔appmsgid 配对与列表翻
+    /// 页的纯逻辑核查。合成内嵌数据＝公众号列表页数据对象的同构样
+    /// 本：六个条目交错排列（两条同名不同 ID、一条标题以 \u 转义写
+    /// 入、一条只有 ID 没有标题）＋一段无标题的噪声 ID。断言：配对
+    /// 只从同对象共现出（恰 5 组）、噪声与无标题条目不误配、同名
+    /// 歧义如实拒绝（不猜）、目标标题唯一命中时按配对拼直达、卡片
+    /// DOM 配对直交可用、无目标时旧口径行为不变、翻页纯函数边界
+    /// 正确、目标标题提取口径正确。不调用模型、不占用页面、不要求
+    /// 引擎空闲（全部纯函数）。
+    func verifyEditorEntryBind() -> [String] {
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        let script = """
+        window.__LIST__ = {"item_list":[
+         {"appmsgid":100000301,"title":"甲稿先行","update_time":1730073600},
+         {"appmsgid":100000302,"title":"乙稿居中","update_time":1730073601},
+         {"appmsgid":100000303,"title":"\\u4e19\\u7a3f\\u7532\\u4e59","update_time":1730073602},
+         {"appmsgid":100000401,"title":"甲稿先行","update_time":1730073603},
+         {"appmsgid":100000402,"title":"戊稿压尾","update_time":1730073604},
+         {"appmsgid":100000501}
+        ],"total_count":6};
+        var unrelated = {"appmsgid":100000999};
+        """
+        let scriptCand = DirectTargetHarvest.Candidate(source: .embedded, value: script)
+        let templateCand = DirectTargetHarvest.Candidate(source: .href, value: "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&type=10")
+        let pairs = DirectTargetHarvest.extractPairs(fromScriptText: script)
+        lines.append("\(fmt(pairs.count == 5)) 内嵌配对提取：六条目＋噪声的合成数据对象里提取到 \(pairs.count) 组配对（期望恰 5 组：同对象共现才成对）")
+        lines.append("\(fmt(pairs.contains(.init(title: "乙稿居中", appmsgid: "100000302", evidence: "内嵌数据同对象共现")) && pairs.contains(.init(title: "丙稿甲乙", appmsgid: "100000303", evidence: "内嵌数据同对象共现")))) 配对内容：常规条目与 \\u 转义标题条目均正确配对（乙稿居中↔100000302、丙稿甲乙↔100000303）")
+        lines.append("\(fmt(!pairs.contains(where: { $0.appmsgid == "100000999" }) && !pairs.contains(where: { $0.appmsgid == "100000501" }))) 不误配：无标题噪声 ID（100000999）与只有 ID 的条目（100000501）均未成对——无配对如实 0 实证，不按位置猜测")
+        let hit = DirectTargetHarvest.build(candidates: [scriptCand], memoryTemplate: templateCand.value, targetTitle: "乙稿居中")
+        lines.append("\(fmt(hit.result?.appmsgid == "100000302" && hit.result?.pairedTitle == "乙稿居中" && hit.result?.viaTemplate == true)) 标题定向直达：目标「乙稿居中」唯一命中配对 → 以记忆模板拼出 appmsgid=100000302 的编辑直达")
+        let wrongDirect = DirectTargetHarvest.Candidate(source: .href, value: "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&appmsgid=100000777")
+        let guarded = DirectTargetHarvest.build(candidates: [scriptCand, wrongDirect], memoryTemplate: templateCand.value, targetTitle: "乙稿居中")
+        lines.append("\(fmt(guarded.result?.appmsgid == "100000302")) 直达链接防错篇：页面另有一条别篇的带 ID 编辑链接（100000777）时，有目标标题仍只认标题配对（取 100000302），不拿第一条编辑链接开错草稿")
+        let rightDirect = DirectTargetHarvest.Candidate(source: .href, value: "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&appmsgid=100000302")
+        let directHit = DirectTargetHarvest.build(candidates: [scriptCand, rightDirect], memoryTemplate: nil, targetTitle: "乙稿居中")
+        lines.append("\(fmt(directHit.result?.appmsgid == "100000302" && directHit.result?.viaTemplate == false && directHit.result?.pairedTitle == "乙稿居中")) 直达链接与配对一致：带 ID 编辑链接的 ID 与目标标题唯一配对相同时直用，并留配对标题痕")
+        let ambiguous = DirectTargetHarvest.build(candidates: [scriptCand], memoryTemplate: templateCand.value, targetTitle: "甲稿先行")
+        lines.append("\(fmt(ambiguous.result == nil && ambiguous.facts.note.contains("无法唯一"))) 同名歧义拒绝：两条同名草稿（100000301/100000401）时不猜——直达为空且实况注明无法唯一配对")
+        let missing = DirectTargetHarvest.build(candidates: [scriptCand], memoryTemplate: templateCand.value, targetTitle: "查无此稿")
+        lines.append("\(fmt(missing.result == nil)) 无此标题：目标标题不在列表数据里时直达为空，不拿任何候选 ID 冒充")
+        let legacy = DirectTargetHarvest.build(candidates: [scriptCand, templateCand], memoryTemplate: nil, targetTitle: nil)
+        lines.append("\(fmt(legacy.result?.appmsgid == "100000301" && legacy.result?.viaTemplate == true)) 旧口径不变：未给目标标题时沿用既有口径（本页模板＋首个实证 ID），配对通道不扰动无标题任务")
+        let domHit = DirectTargetHarvest.build(candidates: [templateCand], memoryTemplate: nil, targetTitle: "卡片标题稿", domPairs: [.init(title: "卡片标题稿", appmsgid: "100000555", evidence: "卡片 DOM 同卡共现")])
+        lines.append("\(fmt(domHit.result?.appmsgid == "100000555" && domHit.result?.pairedTitle == "卡片标题稿")) 卡片 DOM 配对：标题与 msgid 属性同卡共现的配对可直交拼直达（appmsgid=100000555）")
+        let page0 = "https://mp.weixin.qq.com/cgi-bin/appmsg?begin=0&count=10&t=media/appmsg_list&type=77&action=list_card"
+        let page1 = DirectTargetHarvest.nextListPageURL(page0, maxBegin: 20)
+        let page2 = page1.flatMap { DirectTargetHarvest.nextListPageURL($0, maxBegin: 20) }
+        let page3 = page2.flatMap { DirectTargetHarvest.nextListPageURL($0, maxBegin: 20) }
+        lines.append("\(fmt(page1?.contains("begin=10") == true && page2?.contains("begin=20") == true && page3 == nil)) 翻页纯函数：begin/count 列表按 count 递进（0→10→20），到达 maxBegin 后停止，不越界乱翻")
+        lines.append("\(fmt(DirectTargetHarvest.nextListPageURL("https://example.com/list", maxBegin: 20) == nil)) 翻页纯函数：无 begin/count 参数的地址不翻页（普通页不被误当列表续翻）")
+        lines.append("\(fmt(DirectTargetHarvest.extractTargetTitle(goal: "帮我打开《把待办清单变短》继续编辑", stuck: "") == "把待办清单变短" && DirectTargetHarvest.extractTargetTitle(goal: "", stuck: "草稿「稍后再看的出口」打不开") == "稍后再看的出口" && DirectTargetHarvest.extractTargetTitle(goal: "打开《短》", stuck: "") == nil)) 目标标题提取：任务目标/卡点原文里的书名号/引号标题可提取，太短的引号内容不冒充标题")
         return lines
     }
 

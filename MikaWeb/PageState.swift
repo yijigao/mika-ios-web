@@ -3,9 +3,10 @@ struct PageElement: Codable, Equatable {
     let index: Int
     let tag, type, text, placeholder, href, name, inputType, ariaLabel: String
     /// 可达名称来源（WECHAT-EDITOR-NAV A1）：text 的取值出处——text／
-    /// aria-label／title／alt／label／placeholder／value／bg（背景图文件名）／
-    /// none（无名牌图标控件）。无文本控件不再因「无文字」在抽取层消失，
-    /// 模型据来源判断这是什么入口。
+    /// aria-label／title／alt／label／placeholder／value／icon（内嵌 svg
+    /// 的 title/aria/use 引用推导，EDITOR-ENTRY-BIND 补）／bg（背景图
+    /// 文件名）／none（无名牌图标控件）。无文本控件不再因「无文字」在
+    /// 抽取层消失，模型据来源判断这是什么入口。
     let nameSource: String
     /// 元素矩形是否与当前视口相交（WECHAT-EDITOR-NAV A2）：false 只表示
     /// 「在页面里但没进视口」，引擎点击前会先滚动揭示再复判，不得据此
@@ -36,6 +37,28 @@ extension PageElement {
 struct PageState: Codable {
     let url, title, text: String
     let elements: [PageElement]
+    /// 浮动层诊断（EDITOR-ENTRY-BIND 第 4 项扩展，Joey 16:51 定性
+    /// 「agent 读不到二级菜单」）：抽取时同 frame 内的菜单/弹窗类浮
+    /// 动层清单（容器类名＋可见条目文本）——静态 DOM 之外的浮动层
+    /// 是感知的系统性盲区，这份清单只作诊断证据（步流与感知文本
+    /// 各留一行），不改变元素清单与点击语义。旧快照 JSON 无此键
+    /// 时解码为空（decodeIfPresent）。
+    var overlayNotes: [String] = []
+    enum CodingKeys: String, CodingKey {
+        case url, title, text, elements
+        case overlayNotes = "overlays"
+    }
+    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = []) {
+        self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        url = try c.decode(String.self, forKey: .url)
+        title = try c.decode(String.self, forKey: .title)
+        text = try c.decode(String.self, forKey: .text)
+        elements = try c.decode([PageElement].self, forKey: .elements)
+        overlayNotes = try c.decodeIfPresent([String].self, forKey: .overlayNotes) ?? []
+    }
 }
 enum PageScript {
     static let extract = #"""
@@ -58,6 +81,21 @@ enum PageScript {
         const labs=[...(e.labels||[])].map(l=>(l.innerText||'').trim()).filter(Boolean).join(' ');if(labs)return{name:labs.slice(0,300),source:'label'};
         const ph=(e.placeholder||'').trim();if(ph)return{name:ph.slice(0,300),source:'placeholder'};
         if((e.tagName==='INPUT'||e.tagName==='BUTTON')&&e.value){const v=String(e.value).trim();if(v)return{name:v.slice(0,300),source:'value'};}
+        // 图标名推导（EDITOR-ENTRY-BIND）：只有内嵌 svg 的图标控件
+        // （草稿卡编辑铅笔一类）——从 svg 的 <title>／aria-label／
+        // <use> 引用名（如 #icon-edit →「edit」）／svg class 词干推
+        // 导名字，推不出不编造、继续往下走 bg/none。
+        const svg=e.querySelector?e.querySelector('svg'):null;
+        if(svg){
+          const stEl=svg.querySelector('title');const st=stEl?(stEl.textContent||'').trim():'';
+          if(st)return{name:st.slice(0,300),source:'icon'};
+          const sa=(svg.getAttribute('aria-label')||'').trim();if(sa)return{name:sa.slice(0,300),source:'icon'};
+          const use=svg.querySelector('use');const uh=use?(use.getAttribute('href')||use.getAttribute('xlink:href')||''):'';
+          const frag=(uh.split('#').pop()||'').replace(/^icon[-_]?/i,'').replace(/[-_]+/g,' ').trim();
+          if(frag)return{name:frag.slice(0,300),source:'icon'};
+          const sc=((svg.getAttribute('class')||'').trim().split(/\s+/)[0]||'').replace(/^icon[-_]?/i,'').replace(/[-_]+/g,' ').trim();
+          if(sc)return{name:sc.slice(0,300),source:'icon'};
+        }
         const bg=(getComputedStyle(e).backgroundImage||'');
         const m=bg.match(/url\(["']?([^"')]+)["']?\)/);
         // data:/blob: 背景图没有文件名可读（data URI 的内容段会被误当名），
@@ -110,7 +148,13 @@ enum PageScript {
         const hasEvt=e.hasAttribute('onclick')||typeof e.onclick==='function'||e.hasAttribute('onmousedown')||typeof e.onmousedown==='function'||e.hasAttribute('onmouseup')||typeof e.onmouseup==='function';
         if(getComputedStyle(e).cursor!=='pointer'&&!hasEvt)continue;
         const nm=nameOf(e);
-        if(!nm.name&&nm.source!=='bg'&&!hasEvt)continue;
+        // 图标准入（EDITOR-ENTRY-BIND）：内嵌 svg/img 图标本身就是
+        // 形态证据——名字推导不出来（source=none）也入清单，模型与
+        // 引擎至少看得见这个可点图标的存在（带 data-mika-idx 可点、
+        // 点按按元素中心坐标派发）；全无名源、无背景图、无事件属
+        // 性、又无图标的透明热区仍不入（防噪声口径不变）。
+        const hasIcon=!!e.querySelector('svg,img');
+        if(!nm.name&&nm.source!=='bg'&&!hasEvt&&!hasIcon)continue;
         if(nm.name.length>120)continue;
         rawExtras.push(e);
       }
@@ -128,7 +172,20 @@ enum PageScript {
       });
       let text='',n;const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
       while((n=walker.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&visible(n.parentElement))text+=n.textContent.trim()+' ';}
-      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements});
+      // 浮动层盘点（EDITOR-ENTRY-BIND 诊断）：菜单/弹层类容器（role=
+      // menu 或 class 含 menu/popover/dropdown/popup）在本 frame 内
+      // 可见时，记容器类名与叶子条目文本——回答「点开二级菜单后，
+      // 菜单项进没进感知、在哪一层」这个问题。菜单若在抽取时刻已
+      // 自动关闭、或位于本脚本够不到的层（跨源 frame/原生层），
+      // 这里就是空——空本身也是诊断结论，步流据此落 playbook 的
+      // 固定布局坐标打法。只记结构与文本，不改元素清单。
+      const overlayScan=()=>{const out=[];let nodes=[];try{nodes=Array.from(document.querySelectorAll('[role="menu"],[class*="menu"],[class*="Menu"],[class*="popover"],[class*="dropdown"],[class*="popup"],[class*="Popup"]'));}catch(e){}
+        for(const nd of nodes){if(out.length>=4)break;const cs=getComputedStyle(nd);if(cs.display==='none'||cs.visibility==='hidden')continue;const r=nd.getBoundingClientRect();if(r.width===0||r.height===0)continue;
+          const items=[];nd.querySelectorAll('li,a,button,[role="menuitem"],div,span').forEach(it=>{if(items.length>=8)return;if(it.children.length>0)return;const t=(it.textContent||'').trim().replace(/\s+/g,' ');if(t&&t.length<=24&&!items.includes(t))items.push(t);});
+          const own=(nd.textContent||'').trim().replace(/\s+/g,' ').slice(0,80);
+          out.push('主文档 frame·'+((nd.getAttribute('class')||nd.tagName||'').slice(0,50))+' → '+(items.length?items.join('／'):own));}
+        return out;};
+      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements,overlays:overlayScan()});
     })()
     """#
 }
