@@ -52,8 +52,8 @@ struct ContentView: View {
             // 坞（expanded 全屏／mini 悬浮小窗，WKWebView 实例常驻保活，见
             // BrowserDockView.swift）＜ 变暗遮罩＋介入提示卡（仅等待确认／手输时
             // 出现，固定在输入栏上方，小窗与展开态都可见）＜ 聊天输入栏（输入框
-            // ＋发送键，永远在最上层，坞怎么拖/展开都盖不住；键盘升起时随根层
-            // 安全区上浮、仍在最上层）。介入态用户点卡上「打开浏览器*」后进入
+            // ＋发送键，浮窗态在最上层，键盘升起时随根层安全区上浮；浏览器进入
+            // 全屏时输入栏与夹挂开关作为整组收起）。介入态用户点卡上「打开浏览器*」后进入
             // 置顶态：只交换坞与遮罩的名次（遮罩退到坞之下、不再覆盖浏览器
             // 窗口），介入卡收成坞之上的小条，处理完点小条上的解决按钮即随
             // 介入解除自动复位。
@@ -87,15 +87,18 @@ struct ContentView: View {
                         .padding(.bottom, inputBarHeight + 6)
                         .zIndex(InterventionZOrder.card(browserRaised: interventionBrowserRaised))
                 }
-                ChatInputBar(engine: engine, conversation: conversation,
-                             inputFocus: $chatInputFocused, followLatest: $followLatest,
-                             onSendJumpToBottom: { requestBottom() })
+                if !web.dockState.fullScreen {
+                    ChatInputBar(engine: engine, conversation: conversation, dock: web.dockState,
+                                 inputFocus: $chatInputFocused, followLatest: $followLatest,
+                                 onSendJumpToBottom: { requestBottom() })
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                     .zIndex(InterventionZOrder.inputBar(browserRaised: interventionBrowserRaised))
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.size.height
                     } action: { newHeight in
                         inputBarHeight = newHeight
                     }
+                }
             }
             .overlay {
                 if showSessions {

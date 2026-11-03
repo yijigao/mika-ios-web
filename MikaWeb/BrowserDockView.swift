@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum FloatingBrowserStatus {
+enum FloatingBrowserStatus: Equatable {
     case idle, running, intervention, completed, failed
     var color: Color {
         switch self {
@@ -8,6 +8,93 @@ enum FloatingBrowserStatus {
         case .running: return .blue
         case .intervention, .failed: return .red
         case .completed: return .green
+        }
+    }
+}
+
+/// Shared production geometry for the visibility control clipped onto the
+/// input bar. Tier A consumes these same values so layout assertions cannot
+/// drift away from the mounted view.
+enum FloatingVisibilityToggleGeometry {
+    static let diameter: CGFloat = 32
+    static let leading: CGFloat = 12
+    static let top: CGFloat = -diameter / 2
+    static let textLeading: CGFloat = 52
+
+    static func buttonFrame(inputBar: CGRect) -> CGRect {
+        CGRect(x: inputBar.minX + leading, y: inputBar.minY + top,
+               width: diameter, height: diameter)
+    }
+    static func textEntryFrame(inputBar: CGRect, trailingWidth: CGFloat = 82) -> CGRect {
+        CGRect(x: inputBar.minX + textLeading, y: inputBar.minY + 8,
+               width: max(0, inputBar.width - textLeading - trailingWidth),
+               height: max(0, inputBar.height - 16))
+    }
+    static func isVisible(inputBarShown: Bool, browserFullScreen: Bool) -> Bool {
+        inputBarShown && !browserFullScreen
+    }
+}
+
+private struct FloatingVisibilityPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1)
+            .animation(.spring(response: 0.22, dampingFraction: 0.68), value: configuration.isPressed)
+    }
+}
+
+struct FloatingVisibilityToggle: View {
+    @ObservedObject var engine: AgentEngine
+    @ObservedObject var dock: DockStateStore
+    @State private var statusPulse = false
+    private let spring = Animation.spring(response: 0.42, dampingFraction: 0.86)
+
+    private var needsIntervention: Bool {
+        if engine.pendingUpload != nil { return true }
+        if case .waitingConfirm = engine.status { return true }
+        if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput { return true }
+        return false
+    }
+    private var status: FloatingBrowserStatus {
+        if needsIntervention { return .intervention }
+        switch engine.status {
+        case .running: return .running
+        case .done, .ended: return .completed
+        case .failed: return .failed
+        default: return engine.sessionActive ? .running : .idle
+        }
+    }
+    private var running: Bool { if case .running = status { return true }; return false }
+
+    var body: some View {
+        Button { withAnimation(spring) { dock.toggle() } } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "safari")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(status == .idle ? Color.secondary : Color.accentColor)
+                    .frame(width: FloatingVisibilityToggleGeometry.diameter,
+                           height: FloatingVisibilityToggleGeometry.diameter)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay(Circle().strokeBorder(.white.opacity(0.42), lineWidth: 0.7))
+                    .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
+                Circle().fill(status.color).frame(width: 9, height: 9)
+                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 1.5))
+                    .scaleEffect(running && statusPulse ? 1.18 : 1)
+                    .opacity(status == .idle ? 0.62 : (running && statusPulse ? 0.72 : 1))
+                    .offset(x: 1, y: -1)
+            }
+            .contentShape(Circle())
+        }
+        .buttonStyle(FloatingVisibilityPressStyle())
+        .disabled(needsIntervention)
+        .accessibilityLabel(dock.isVisible ? "隐藏浏览器浮窗" : "显示浏览器浮窗")
+        .accessibilityHint(needsIntervention ? "安全介入处理完成前不能隐藏" : "切换浏览器浮窗显隐")
+        .animation(spring, value: dock.isVisible)
+        .animation(spring, value: status)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.15).repeatForever(autoreverses: true)) {
+                statusPulse = true
+            }
         }
     }
 }
@@ -104,7 +191,6 @@ struct BrowserDockView: View {
     @State private var area: CGSize = .zero
     @State private var dragDelta: CGSize = .zero
     @State private var dragStartCenter: CGPoint?
-    @State private var statusPulse = false
     @AppStorage("dock.floatingCenterXFrac") private var storedXFrac: Double = -1
     @AppStorage("dock.floatingCenterYFrac") private var storedYFrac: Double = -1
     private var spring: Animation { .spring(response: 0.42, dampingFraction: 0.86) }
@@ -115,20 +201,6 @@ struct BrowserDockView: View {
         if case .waitingManual = engine.status, case .some(.manual) = engine.waitingInput { return true }
         return false
     }
-    private var status: FloatingBrowserStatus {
-        if needsIntervention { return .intervention }
-        switch engine.status {
-        case .running: return .running
-        case .done, .ended: return .completed
-        case .failed: return .failed
-        default: return engine.sessionActive ? .running : .idle
-        }
-    }
-    private var statusIsRunning: Bool {
-        if case .running = status { return true }
-        return false
-    }
-
     var body: some View {
         GeometryReader { geo in
             let size = geo.size
@@ -163,7 +235,6 @@ struct BrowserDockView: View {
                     .position(x: size.width - 34, y: size.height - bottomReserve - 34)
                     .accessibilityLabel("收起为浮窗")
                 }
-                if dock.showsVisibilityToggle { visibilityToggle(in: size) }
             }
             .frame(width: size.width, height: size.height)
             .onAppear { initialize(area: size) }
@@ -181,11 +252,6 @@ struct BrowserDockView: View {
         .onChange(of: needsIntervention) { _, needed in
             withAnimation(spring) { dock.setInterventionRequired(needed) }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                statusPulse = true
-            }
-        }
     }
 
     private var panelControls: some View {
@@ -194,27 +260,6 @@ struct BrowserDockView: View {
         }
         .accessibilityLabel("展开全屏")
         .padding(8).background(.ultraThinMaterial, in: Circle()).padding(8)
-    }
-
-    private func visibilityToggle(in size: CGSize) -> some View {
-        Button { withAnimation(spring) { dock.toggle() } } label: {
-            ZStack(alignment: .bottomTrailing) {
-                Image(systemName: "safari").font(.system(size: 18, weight: .semibold))
-                    .frame(width: 44, height: 44).background(.ultraThinMaterial, in: Circle())
-                    .overlay(Circle().strokeBorder(.white.opacity(0.35)))
-                    .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
-                Circle().fill(status.color).frame(width: 10, height: 10)
-                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
-                    .scaleEffect(statusIsRunning && statusPulse ? 1.25 : 1)
-                    .opacity(statusIsRunning && statusPulse ? 0.68 : 1)
-                    .offset(x: -1, y: -1)
-            }
-        }
-        .buttonStyle(.plain).disabled(needsIntervention)
-        .accessibilityLabel(dock.isVisible ? "隐藏浏览器浮窗" : "显示浏览器浮窗")
-        .accessibilityHint(needsIntervention ? "安全介入处理完成前不能隐藏" : "切换浏览器浮窗显隐")
-        // A separate trailing height from SESSION-UX's scroll-to-bottom button.
-        .position(x: size.width - 34, y: max(34, size.height - bottomReserve - 78))
     }
 
     private func liveSurfaceCenter(in size: CGSize) -> CGPoint {

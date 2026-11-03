@@ -188,7 +188,7 @@ struct SelfTestView: View {
                 runFloatingVisibilityTest()
                 dismiss()
             }.disabled(!engine.active || floatingVisibilityTestRunning)
-            Text("自检二十五预期：不调用模型。冷启动静默隐藏；任务开始自动显示、终态自动隐藏；静默可手动开关；任务内手动隐藏保持到终态；介入强制显示且解除后回到任务内隐藏选择；隐藏时 JS 探针仍可执行回读；显隐前后 live WKWebView frame 与 window.innerWidth 不变。固定圆形开关的可见性与位置属生产视图结构断言。").font(.caption).foregroundStyle(.secondary)
+            Text("自检二十五预期：不调用模型。既有显隐状态机、介入覆盖、隐藏执行与视口不变；新增生产布局断言：按钮在键盘收起/升起两态相对输入栏左上角偏移恒定，输入栏隐藏或浏览器全屏时不可见，且不与文字输入区相交。").font(.caption).foregroundStyle(.secondary)
             Button("自检二十六：会话抽屉与滚动（SESSION-UX）") {
                 guard !sessionUXTestRunning else { return }
                 sessionUXTestRunning = true
@@ -220,7 +220,7 @@ struct SelfTestView: View {
             let lines = await engine.verifyFloatingVisibility()
             for line in lines { conversation.localFeedback("自检二十五：\(line)") }
             let failed = lines.filter { $0.hasPrefix("✗") }.count
-            conversation.localFeedback(failed == 0 ? "自检二十五结论：全部通过——显隐状态机、介入覆盖、隐藏执行与视口不变均有实证" : "自检二十五结论：\(failed) 项未通过，见逐条记录")
+            conversation.localFeedback(failed == 0 ? "自检二十五结论：全部通过——显隐状态机、输入栏夹挂几何、随栏隐藏、文字避让、隐藏执行与视口不变均有实证" : "自检二十五结论：\(failed) 项未通过，见逐条记录")
         }
     }
 

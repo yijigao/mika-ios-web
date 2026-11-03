@@ -211,12 +211,14 @@ enum SessionUXTierA {
 }
 
 /// 聊天输入栏（输入框＋发送键）：ContentView 的 ZStack 最上层，渲染在浏览器坞之上——
-/// 小窗态、展开态都一样，坞怎么拖、怎么展开都盖不住它（问题 3）。背景用材质填充并
-/// 向底部安全区延伸，键盘升起时随根层安全区上浮、仍在最上层。高度由 ContentView
+/// 浮窗态下坞怎么拖都盖不住它（问题 3）；浏览器全屏时由 ContentView 将输入栏与
+/// 左上夹挂开关整组收起。背景用材质填充并向底部安全区延伸，键盘升起时随根层安全区
+/// 上浮、仍在最上层。高度由 ContentView
 /// 实测（草稿多行时变高）并下传给消息层避让与坞的钳制／避让。
 struct ChatInputBar: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var conversation: AgentConversationStore
+    @ObservedObject var dock: DockStateStore
     var inputFocus: FocusState<Bool>.Binding
     var followLatest: Binding<Bool>
     var onSendJumpToBottom: () -> Void
@@ -243,8 +245,14 @@ struct ChatInputBar: View {
             Button(questionID != nil ? "回答并继续" : (canQueue ? "加入队列" : (isNewTask && isPaused ? "新任务" : "发送"))) { send() }
                 .disabled(!canSend).buttonStyle(.borderedProminent)
         }
-        .padding(.horizontal, 12)
+        .padding(.leading, FloatingVisibilityToggleGeometry.textLeading)
+        .padding(.trailing, 12)
         .padding(.vertical, 8)
+        .overlay(alignment: .topLeading) {
+            FloatingVisibilityToggle(engine: engine, dock: dock)
+                .offset(x: FloatingVisibilityToggleGeometry.leading,
+                        y: FloatingVisibilityToggleGeometry.top)
+        }
         .background {
             // 顶部分隔线＋材质背景，背景向底部安全区（Home 指示条区）延伸填满
             VStack(spacing: 0) {

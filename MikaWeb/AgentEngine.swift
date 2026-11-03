@@ -2909,6 +2909,20 @@ struct OpenStall {
         state.taskTerminated()
         lines.append("\(mark(!state.isVisible)) 介入解除后的终态：回到默认隐藏")
 
+        let barDown = CGRect(x: 0, y: 760, width: 390, height: 60)
+        let barUp = CGRect(x: 0, y: 430, width: 390, height: 60)
+        let buttonDown = FloatingVisibilityToggleGeometry.buttonFrame(inputBar: barDown)
+        let buttonUp = FloatingVisibilityToggleGeometry.buttonFrame(inputBar: barUp)
+        let offsetDown = CGPoint(x: buttonDown.minX - barDown.minX, y: buttonDown.minY - barDown.minY)
+        let offsetUp = CGPoint(x: buttonUp.minX - barUp.minX, y: buttonUp.minY - barUp.minY)
+        lines.append("\(mark(offsetDown == offsetUp && offsetDown == CGPoint(x: FloatingVisibilityToggleGeometry.leading, y: FloatingVisibilityToggleGeometry.top))) 挂载锚点：键盘收起/升起时按钮相对输入栏左上角偏移恒定（\(offsetDown)）")
+        let hiddenWithBar = !FloatingVisibilityToggleGeometry.isVisible(inputBarShown: false, browserFullScreen: false)
+        let hiddenFullScreen = !FloatingVisibilityToggleGeometry.isVisible(inputBarShown: true, browserFullScreen: true)
+        lines.append("\(mark(hiddenWithBar && hiddenFullScreen)) 输入栏隐藏或浏览器全屏时，夹挂按钮不可见")
+        let textDown = FloatingVisibilityToggleGeometry.textEntryFrame(inputBar: barDown)
+        let textUp = FloatingVisibilityToggleGeometry.textEntryFrame(inputBar: barUp)
+        lines.append("\(mark(!buttonDown.intersects(textDown) && !buttonUp.intersects(textUp))) 不遮挡：键盘收起/升起两态按钮均不与文字输入区相交")
+
         let dock = web.dockState
         let savedDesired = dock.desiredVisible
         let savedIntervention = dock.interventionRequired
