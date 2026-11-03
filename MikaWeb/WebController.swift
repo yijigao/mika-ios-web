@@ -63,9 +63,10 @@ extension Notification.Name {
     /// 给配置装探针：同一 controller 只装一次（脚本同理只注入一次；
     /// 探针脚本自身另有页面级防重入标记，属第三重保险）。
     /// WECHAT-COVER-FIX 起同一装配点一并装弹窗 frame 探针（handler 与
-    /// 脚本）：两者共用「每 controller 只装一次」的守卫——在共享
-    /// controller 上重复注册同名 handler 同样会抛异常致 abort，绝不能
-    /// 另起一套逐标签注册。
+    /// 脚本），TRUSTED-CLICK-EXP 起再加可信点按只读插桩（同理）：三者
+    /// 共用「每 controller 只装一次」的守卫——在共享 controller 上重复
+    /// 注册同名 handler 同样会抛异常致 abort，绝不能另起一套逐标签
+    /// 注册。
     func equip(_ controller: WKUserContentController) {
         guard !equippedControllers.contains(controller) else { return }
         controller.removeScriptMessageHandler(forName: BrowserTab.webAuthnHandlerName, contentWorld: .page)
@@ -74,6 +75,9 @@ extension Notification.Name {
         controller.removeScriptMessageHandler(forName: BrowserTab.frameProbeHandlerName, contentWorld: .page)
         controller.add(self, contentWorld: .page, name: BrowserTab.frameProbeHandlerName)
         controller.addUserScript(WKUserScript(source: BrowserTab.frameProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        controller.removeScriptMessageHandler(forName: BrowserTab.tcProbeHandlerName, contentWorld: .page)
+        controller.add(self, contentWorld: .page, name: BrowserTab.tcProbeHandlerName)
+        controller.addUserScript(WKUserScript(source: BrowserTab.tcProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         equippedControllers.add(controller)
     }
 
@@ -82,8 +86,9 @@ extension Notification.Name {
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        // frame 探针消息不归标签页处理：按 token 交给探针中枢的收集者
-        if message.name == BrowserTab.frameProbeHandlerName {
+        // frame 探针与可信点按插桩消息不归标签页处理：按 token 交给
+        // 探针中枢的收集者（中枢按 token＋webView 身份匹配，两探针共用）
+        if message.name == BrowserTab.frameProbeHandlerName || message.name == BrowserTab.tcProbeHandlerName {
             FrameProbeHub.shared.deliver(message)
             return
         }
@@ -425,6 +430,111 @@ enum SiteMode: String {
     })();
     """#
 
+    static let tcProbeHandlerName = "mikaTCProbe"
+
+    /// 可信点按实验的只读插桩脚本（TRUSTED-CLICK-EXP，E1）：随 frame
+    /// 探针同一装配点注入每个 frame（含跨源），默认未武装、零记录；
+    /// 收到带 token 的 arm 洪泛后才开始记录，dump 时按 token 回報、
+    /// disarm 后停记。只读性：监听全部走捕获阶段＋passive，从不
+    /// preventDefault／stopPropagation；MutationObserver 只观察。
+    /// 记录面刻意收窄：只记事件元数据（type／目标形态／isTrusted／
+    /// touches 长度／pointerId／pressure／timeStamp）与 DOM 变化计数；
+    /// 表单控件只记 tag 与 type，绝不记 value／文本（凭据安全）；
+    /// 一般元素只记截断 24 字的 aria-label 或文本（按钮文案级信息，
+    /// 与 frame 探针的按钮特征同口径）。用途：E1 金标准对照——真机
+    /// 现场先装插桩，Joey 真点一次与合成序列重放逐字段 diff，把
+    /// 「点按无响应」的成因收敛到 MEMO §6 九类表中的具体类别。
+    static let tcProbeScript = #"""
+    (function(){
+      if (window.__mikaTCProbe) return;
+      window.__mikaTCProbe = true;
+      var post = function(payload){ try { window.webkit.messageHandlers.mikaTCProbe.postMessage(payload); } catch (e) {} };
+      var armed = null;
+      var events = [];
+      var mutations = [];
+      var truncated = false;
+      var MAXE = 1000, MAXM = 300;
+      var framePath = function(){
+        var p = [], w = window;
+        try {
+          while (w !== w.parent){
+            var par = w.parent, idx = -1;
+            for (var i = 0; i < par.frames.length; i++){ if (par.frames[i] === w){ idx = i; break; } }
+            if (idx < 0) return 'partial';
+            p.unshift(idx); w = par;
+          }
+        } catch (e) { return 'unknown'; }
+        return p.length ? p.join('.') : 'top';
+      };
+      var hrefSafe = function(){ try { return location.href; } catch (e) { return ''; } };
+      var desc = function(el){
+        if (!el || !el.tagName) return { tag: '?' };
+        var d = { tag: el.tagName.toLowerCase() };
+        if (el.id) d.id = ('' + el.id).slice(0, 40);
+        var cls = (typeof el.className === 'string') ? el.className : '';
+        if (cls) d.cls = cls.slice(0, 60);
+        var role = el.getAttribute ? el.getAttribute('role') : null;
+        if (role) d.role = role;
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT'){
+          var t = el.getAttribute ? el.getAttribute('type') : null;
+          if (t) d.inputType = t;
+          return d;
+        }
+        var lab = '';
+        try { lab = (el.getAttribute && el.getAttribute('aria-label')) || el.innerText || ''; } catch (e) {}
+        lab = ('' + lab).replace(/\s+/g, ' ').trim();
+        if (lab) d.label = lab.slice(0, 24);
+        return d;
+      };
+      var TYPES = ['pointerover','pointerdown','pointerup','pointercancel','mousedown','mouseup','click','touchstart','touchend','touchcancel','keydown','keyup'];
+      var record = function(e){
+        if (!armed) return;
+        if (events.length >= MAXE){ truncated = true; return; }
+        var r = { type: e.type, target: desc(e.target), trusted: !!e.isTrusted, ts: e.timeStamp, wall: Date.now() };
+        if (e.changedTouches) r.ct = e.changedTouches.length;
+        if (e.touches) r.t = e.touches.length;
+        if (typeof e.pointerId === 'number') r.pid = e.pointerId;
+        if (e.pointerType) r.ptype = e.pointerType;
+        if (typeof e.pressure === 'number') r.pressure = e.pressure;
+        if (typeof e.isPrimary === 'boolean') r.primary = e.isPrimary;
+        events.push(r);
+      };
+      for (var i = 0; i < TYPES.length; i++){
+        document.addEventListener(TYPES[i], record, { capture: true, passive: true });
+      }
+      var observer = null;
+      var startObserver = function(){
+        if (observer) return;
+        try {
+          observer = new MutationObserver(function(list){
+            if (!armed) return;
+            for (var i = 0; i < list.length; i++){
+              if (mutations.length >= MAXM){ truncated = true; break; }
+              var m = list[i];
+              mutations.push({ kind: m.type, target: desc(m.target), added: m.addedNodes ? m.addedNodes.length : 0, removed: m.removedNodes ? m.removedNodes.length : 0, attr: m.attributeName || null });
+            }
+          });
+          observer.observe(document, { childList: true, subtree: true, attributes: true });
+        } catch (e) { observer = null; }
+      };
+      var stopObserver = function(){ if (observer){ try { observer.disconnect(); } catch (e) {} observer = null; } };
+      window.addEventListener('message', function(ev){
+        var d = ev.data;
+        if (!d || d.__mikaTC !== 1) return;
+        for (var i = 0; i < window.frames.length; i++){ try { window.frames[i].postMessage(d, '*'); } catch (e) {} }
+        if (d.kind === 'arm'){
+          armed = d.token; events = []; mutations = []; truncated = false; startObserver();
+        } else if (d.kind === 'dump'){
+          if (armed && d.token === armed){
+            post({ kind: 'tc-report', token: d.token, path: framePath(), href: hrefSafe(), isTop: window === window.top, events: events, mutations: mutations, truncated: truncated });
+          }
+        } else if (d.kind === 'disarm'){
+          if (d.token === armed){ armed = null; stopObserver(); }
+        }
+      });
+    })();
+    """#
+
     /// 探针消息处理（由 WebAuthnProbeMultiplexer 按 webView 路由调用）：
     /// 全量记诊断；仅「模态调用被拒／同步抛错」才通知对话区提示
     /// （conditional 自动填充调用失败是常态静默路径，不打扰用户）。
@@ -541,6 +651,36 @@ enum SiteMode: String {
     ///（该页的 JS／表单状态无法保留，属系统行为；其余标签不受影响）。
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         if let url = webView.url ?? lastKnownURL { webView.load(URLRequest(url: url)) }
+    }
+}
+
+/// 可信点按实验结构化日志的落盘与导出（TRUSTED-CLICK-EXP）：每次
+/// 自检二十把 E1 插桩 dump 与 E2 探针结果合成一份 JSON 写到
+/// Application Support/MikaWeb/TrustedClick/tc-exp-<时间>.json；
+/// 真机 E1 金标准（真实弹窗现场）走同一通道落盘，文件名即采集凭据。
+/// 自检页提供最近一份的分享导出入口。内容只含实验元数据（事件
+/// 字段与判定），不含凭据类页面数据（插桩记录面本身已收窄）。
+enum TCProbeLogStore {
+    static var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/TrustedClick", isDirectory: true)
+    }
+
+    static func save(payload: [String: Any]) -> String? {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let formatter = ISO8601DateFormatter()
+            let name = "tc-exp-" + formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-") + ".json"
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys, .prettyPrinted])
+            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+            return name
+        } catch { return nil }
+    }
+
+    static func latestURL() -> URL? {
+        let urls = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        return urls.filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }.first
     }
 }
 
@@ -2403,6 +2543,236 @@ enum SiteMode: String {
             lines.append("✗ 场景丁驱动失败（按钮定位或点击异常）")
         }
         return (lines, records)
+    }
+
+    // MARK: - 自检二十（TRUSTED-CLICK-EXP）：E1 金标准对照插桩＋E2 AX 激活探针
+    //
+    // 依据调研备忘（research_notes/trusted-click-2026-11-03/MEMO.md）：
+    // JS 注入产不出 isTrusted=true 是规范＋源码级定论；未证的只剩
+    // ①弹窗无响应的真实成因（九类表，须金标准对照分清）、②AX 无障碍
+    // 激活这条 UA 内部路径宿主侧够不够得到。本节提供实验设施：
+    // E1 只读插桩（BrowserTab.tcProbeScript，arm/dump/disarm 三令经
+    // postMessage 洪泛＋FrameProbeHub 按 token 收集）与 E2 宿主侧
+    // 无障碍树枚举＋accessibilityActivate()。E1 的真机金标准（真实
+    // 条款弹窗上 Joey 真点一次再由 agent 重放 diff）不在自检页内，
+    // 插桩装上即可采、步骤见案卷；E3 受 E1 真机结果门控，本节不做。
+
+    /// 一帧的插桩回報（E1 dump）。
+    struct TCProbeReport {
+        let path: String
+        let href: String
+        let isTop: Bool
+        let events: [[String: Any]]
+        let mutations: [[String: Any]]
+        let truncated: Bool
+    }
+
+    private final class TCMessageBox {
+        var reports: [TCProbeReport] = []
+    }
+
+    private func floodTC(on tab: BrowserTab, kind: String, token: String) async {
+        let script = "(()=>{const d={__mikaTC:1,kind:'\(kind)',token:'\(token)'};window.postMessage(d,'*');return 'flooded';})()"
+        _ = try? await evaluate(script, on: tab)
+    }
+
+    /// 武装插桩：返回本次实验 token（dump/disarm 以同一 token 对话）。
+    func armTCProbe(on tab: BrowserTab) async -> String {
+        let token = UUID().uuidString
+        await floodTC(on: tab, kind: "arm", token: token)
+        return token
+    }
+
+    /// 收取各 frame 的插桩回報（900ms 窗口，与 frame 普查同口径）。
+    func dumpTCProbe(on tab: BrowserTab, token: String) async -> [TCProbeReport] {
+        let box = TCMessageBox()
+        FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
+            guard (body["kind"] as? String) == "tc-report" else { return }
+            box.reports.append(TCProbeReport(
+                path: (body["path"] as? String) ?? "?",
+                href: (body["href"] as? String) ?? "",
+                isTop: (body["isTop"] as? Bool) ?? false,
+                events: (body["events"] as? [[String: Any]]) ?? [],
+                mutations: (body["mutations"] as? [[String: Any]]) ?? [],
+                truncated: (body["truncated"] as? Bool) ?? false))
+        }
+        defer { FrameProbeHub.shared.unregister(token: token) }
+        await floodTC(on: tab, kind: "dump", token: token)
+        try? await Task.sleep(for: .milliseconds(900))
+        return box.reports
+    }
+
+    func disarmTCProbe(on tab: BrowserTab, token: String) async {
+        await floodTC(on: tab, kind: "disarm", token: token)
+    }
+
+    /// E2 宿主侧无障碍树递归枚举：从给定根（WKWebView）出发，优先走
+    /// accessibilityElements 数组、否则走 count/at 索引通道；以对象
+    /// 身份去重、深度与总量双封顶，防止容器自引用把遍历拖死。
+    private func collectAXElements(from root: NSObject) -> [NSObject] {
+        var out: [NSObject] = []
+        var seen = Set<ObjectIdentifier>()
+        func walk(_ el: NSObject, _ depth: Int) {
+            guard depth <= 14, out.count < 800 else { return }
+            guard seen.insert(ObjectIdentifier(el)).inserted else { return }
+            out.append(el)
+            var children: [NSObject] = []
+            if let arr = el.accessibilityElements as? [NSObject], !arr.isEmpty {
+                children = arr
+            } else {
+                let n = el.accessibilityElementCount()
+                if n > 0, n < 1000 {
+                    for i in 0..<n {
+                        if let c = el.accessibilityElement(at: i) as? NSObject { children.append(c) }
+                    }
+                }
+            }
+            for c in children { walk(c, depth + 1) }
+        }
+        walk(root, 0)
+        return out
+    }
+
+    /// 自检二十·Tier A（TRUSTED-CLICK-EXP）：在合成页 test-trusted 上
+    /// 完成 agent 侧可自完的全部实验——
+    /// E1：武装只读插桩 → 普通按钮走引擎 click（阴性对照）→ 打开触摸
+    /// 状态机复刻弹窗 → 派现行 pointer 序列＋合成 TouchEvent 序列 →
+    /// dump 插桩与页面自有事件账逐字段对照（touches 恒空双证、
+    /// isTrusted 全 false、弹窗保持打开＝现象复现）；
+    /// E2：重载页面 → 宿主侧枚举本页无障碍树 → 按 aria-label 定位
+    /// 探针按钮 → 公开 API accessibilityActivate() → 回读页面计数与
+    /// isTrusted 证据，按规格判据给「通／不通＋卡点层」结论。
+    /// 实验合成一份结构化 JSON 落盘（TCProbeLogStore）。
+    func verifyTrustedClickExp() async -> [String] {
+        var lines: [String] = []
+        let tab = activeTab
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        func pageJSON(_ expr: String) async -> [String: Any]? {
+            guard let raw = try? await evaluate(expr, on: tab) as? String,
+                  let data = raw.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return obj
+        }
+        func tcState() async -> [String: Any]? { await pageJSON("(()=>{return window.__tcState?window.__tcState():'{}';})()") }
+        func axState() async -> [String: Any]? { await pageJSON("(()=>{return window.__axState?window.__axState():'{}';})()") }
+        var payload: [String: Any] = ["experiment": "TRUSTED-CLICK-EXP", "page": "test-trusted",
+                                      "startedAt": ISO8601DateFormatter().string(from: Date())]
+
+        do { try tab.loadLocal("test-trusted") } catch {
+            return ["✗ 合成页 test-trusted 加载失败：\(error.localizedDescription)"]
+        }
+        try? await Task.sleep(for: .milliseconds(1100))
+
+        // ---------- E1：插桩对照与 touches 恒空复现 ----------
+        let token = await armTCProbe(on: tab)
+        try? await Task.sleep(for: .milliseconds(250))
+
+        var normalOK = false
+        if let page = try? await state(), let btn = page.elements.first(where: { $0.text.contains("普通计数按钮") }),
+           let action = Self.selfTestClickAction(index: btn.index) {
+            do { try await execute(action, expected: btn) } catch {}
+            try? await Task.sleep(for: .milliseconds(350))
+            if let st = await tcState() { normalOK = (st["normalClicks"] as? Int) == 1 }
+        }
+        lines.append("\(fmt(normalOK)) E1 对照：普通按钮经引擎 click 后页面计数=1 期望成立=\(normalOK)（插桩与派发管线对普通控件有效，阴性对照成立）")
+
+        _ = try? await evaluate("(()=>{if(window.__tcOpenDialog)window.__tcOpenDialog();return 'opened';})()", on: tab)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        let seqResult = (try? await evaluate("""
+        (()=>{const el=document.getElementById('tcAgree');if(!el)return 'missing';
+        const steps=['pointerover','pointerdown','mousedown','focus','pointerup','mouseup','click'];
+        return new Promise(res=>{let i=0;const next=()=>{if(i>=steps.length){res('done');return;}
+          const step=steps[i++];try{const r=el.getBoundingClientRect();const x=r.left+r.width/2,y=r.top+r.height/2;
+          if(step==='focus'){el.focus();}
+          else if(step==='click'){el.click();}
+          else{const down=step==='pointerdown'||step==='mousedown';
+            const opts={bubbles:true,composed:true,cancelable:true,clientX:x,clientY:y,button:0,buttons:down?1:0,view:window};
+            let ev=null;
+            if(step.indexOf('pointer')===0){try{ev=new PointerEvent(step,Object.assign({},opts,{pointerId:1,pointerType:'mouse',isPrimary:true}));}catch(_){}}
+            if(!ev){try{ev=new MouseEvent(step,opts);}catch(__){}}
+            if(ev)el.dispatchEvent(ev);}
+          }catch(_){}
+          setTimeout(next,70);};next();});})()
+        """, on: tab) as? String) ?? "evaluate-failed"
+        let touchResult = (try? await evaluate("""
+        (()=>{const el=document.getElementById('tcAgree');if(!el)return 'missing';
+        try{el.dispatchEvent(new TouchEvent('touchstart',{bubbles:true,composed:true,cancelable:true,touches:[],targetTouches:[],changedTouches:[]}));}catch(e){return 'touchstart-threw:'+((e&&e.name)||'Error');}
+        try{el.dispatchEvent(new TouchEvent('touchend',{bubbles:true,composed:true,cancelable:true,touches:[],targetTouches:[],changedTouches:[]}));}catch(e){return 'touchend-threw:'+((e&&e.name)||'Error');}
+        return 'dispatched';})()
+        """, on: tab) as? String) ?? "evaluate-failed"
+        try? await Task.sleep(for: .milliseconds(350))
+
+        let pageAfter = await tcState()
+        let decisions = (pageAfter?["decisions"] as? [[String: Any]]) ?? []
+        let pageLog = (pageAfter?["log"] as? [[String: Any]]) ?? []
+        let dialogStillOpen = (pageAfter?["dialogOpen"] as? Bool) == true
+        let ignoredEmpty = decisions.contains { ($0["verdict"] as? String) == "ignored-empty-touches" }
+        let pageTouchEnd = pageLog.filter { ($0["type"] as? String) == "touchend" }
+        let pageTouchEndEmpty = !pageTouchEnd.isEmpty && pageTouchEnd.allSatisfy { ($0["ct"] as? Int) == 0 }
+        lines.append("\(fmt(dialogStillOpen && ignoredEmpty)) E1 复刻弹窗：现行 pointer 序列（\(seqResult)）＋合成触摸序列（\(touchResult)）之后弹窗仍打开=\(dialogStillOpen)、状态机「空 touches 忽略」判读在场=\(ignoredEmpty)（现象复现：合成序列关不掉触摸状态机弹窗）")
+        lines.append("\(fmt(pageTouchEndEmpty)) E1 现象双证·页面账：页面自有监听收到 touchend \(pageTouchEnd.count) 笔、changedTouches.length 全部为 0=\(pageTouchEndEmpty)；Touch 构造器实测＝\((pageAfter?["touchCtor"] as? String) ?? "未记录")（MEMO §5 结构性缺口）")
+
+        let reports = await dumpTCProbe(on: tab, token: token)
+        await disarmTCProbe(on: tab, token: token)
+        let top = reports.first(where: { $0.isTop }) ?? reports.first
+        let dumpEvents = top?.events ?? []
+        func dumpCount(_ type: String) -> Int { dumpEvents.filter { ($0["type"] as? String) == type }.count }
+        func pageCount(_ type: String) -> Int { pageLog.filter { ($0["type"] as? String) == type }.count }
+        let sharedTypes = ["pointerdown", "pointerup", "mousedown", "mouseup", "click", "touchstart", "touchend"]
+        let countsAgree = top != nil && sharedTypes.allSatisfy { dumpCount($0) == pageCount($0) }
+        let dumpTouchEnd = dumpEvents.filter { ($0["type"] as? String) == "touchend" }
+        let dumpTouchEndEmpty = !dumpTouchEnd.isEmpty && dumpTouchEnd.allSatisfy { ($0["ct"] as? Int) == 0 }
+        let anyTrusted = dumpEvents.contains { ($0["trusted"] as? Bool) == true }
+        lines.append("\(fmt(countsAgree)) E1 插桩对照：dump 回報 frame 数=\(reports.count)（主 frame 事件 \(dumpEvents.count) 笔、DOM 变化 \(top?.mutations.count ?? 0) 笔、截断=\(top?.truncated == true)）；逐类型计数与页面账一致=\(countsAgree)（click 插桩 \(dumpCount("click"))／页面 \(pageCount("click"))；touchend 插桩 \(dumpCount("touchend"))／页面 \(pageCount("touchend"))）——插桩工作正常")
+        lines.append("\(fmt(dumpTouchEndEmpty && !anyTrusted)) E1 现象双证·插桩账：插桩侧 touchend 的 changedTouches.length 全部为 0=\(dumpTouchEndEmpty)；全部 \(dumpEvents.count) 笔事件 isTrusted 均为 false=\(!anyTrusted)（合成事件信任位恒假，与 MEMO §2 一致）")
+        payload["e1"] = ["normalButtonOK": normalOK, "dialogStillOpen": dialogStillOpen,
+                         "touchCtor": (pageAfter?["touchCtor"] as? String) ?? "",
+                         "pointerSeq": seqResult, "touchSeq": touchResult,
+                         "pageDecisions": decisions,
+                         "dumpFrames": reports.map { ["path": $0.path, "href": $0.href, "isTop": $0.isTop,
+                                                       "events": $0.events, "mutations": $0.mutations,
+                                                       "truncated": $0.truncated] }] as [String: Any]
+
+        // ---------- E2：AX 激活探针 ----------
+        do { try tab.loadLocal("test-trusted") } catch {
+            lines.append("✗ E2 未执行：合成页重载失败（\(error.localizedDescription)）")
+            if let name = TCProbeLogStore.save(payload: payload) { lines.append("· 实验结构化日志已落盘：\(name)") }
+            return lines
+        }
+        try? await Task.sleep(for: .milliseconds(1100))
+        let tree = collectAXElements(from: tab.webView)
+        let target = tree.first { ($0.accessibilityLabel ?? "").contains("AX探针目标按钮") }
+        var e2Passed = false
+        var e2Verdict = ""
+        if let target {
+            let activated = target.accessibilityActivate()
+            try? await Task.sleep(for: .milliseconds(700))
+            let ax = await axState()
+            let clicks = (ax?["clicks"] as? Int) ?? 0
+            let axEvents = (ax?["events"] as? [[String: Any]]) ?? []
+            let trustedClick = axEvents.contains { ($0["type"] as? String) == "click" && ($0["isTrusted"] as? Bool) == true }
+            if clicks > 0 {
+                e2Passed = true
+                e2Verdict = trustedClick
+                    ? "通：页面收到 click 且 isTrusted=true——UA 内部激活路径成立（字段证据在实验日志）"
+                    : "通（动作生效口径）：页面 click 计数=\(clicks)，控件动作确实生效；但收到的 click isTrusted=false（如实记录：激活有效、信任位未如假设翻真）"
+            } else {
+                e2Verdict = "不通：目标元素可达、accessibilityActivate() 已调用（返回 \(activated)），页面未收到任何 click——卡在 UA 内部激活转化层"
+            }
+            lines.append("\(fmt(e2Passed)) E2 AX 探针：无障碍树共 \(tree.count) 个元素、按 aria-label 命中目标（button trait=\(target.accessibilityTraits.contains(.button))）；activate 返回 \(activated)；页面 click 计数=\(clicks)、isTrusted=true 的 click 在场=\(trustedClick)。判定：\(e2Verdict)")
+        } else {
+            e2Verdict = "不通：宿主够不到网页目标元素（无障碍树元素 \(tree.count) 个，未命中 aria-label 目标）——卡在宿主可达层"
+            lines.append("✗ E2 AX 探针：无障碍树共 \(tree.count) 个元素、未命中 aria-label 目标——不通，卡在「宿主够不到网页目标元素」层（树为 0＝WebKit 未建树；树非空未命中＝网页元素未以 label 暴露）")
+        }
+        payload["e2"] = ["treeCount": tree.count, "targetFound": target != nil,
+                         "passed": e2Passed, "verdict": e2Verdict] as [String: Any]
+        if let name = TCProbeLogStore.save(payload: payload) {
+            lines.append("· 实验结构化日志已落盘：\(name)（自检页顶部可导出最近一份；真机 E1 金标准同通道落盘）")
+        } else {
+            lines.append("✗ 实验结构化日志落盘失败")
+        }
+        return lines
     }
 
     // MARK: - 失败留证（写入既有 DiagnosticStore 通道：同目录、同信封格式，诊断页可见）

@@ -1458,6 +1458,16 @@ enum DirectTargetHarvest {
         return await web.verifyEditorNavReveal()
     }
 
+    /// 自检二十（TRUSTED-CLICK-EXP）：E1 金标准对照插桩的复刻页实验
+    /// （插桩自证＋touches 恒空复现）＋E2 AX 激活探针——委托
+    /// WebController 在合成页 test-trusted 上实测并落盘结构化日志。
+    /// E1 真机金标准（真实弹窗上 Joey 真点一次）由阿仁另行约，不在
+    /// 本入口内；E3 受 E1 真机结果门控、不做。
+    func verifyTrustedClick() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十未执行（先等当前任务终结或停止）"] }
+        return await web.verifyTrustedClickExp()
+    }
+
     func verifyCoverAndModal() async -> [String] {
         guard !busy else { return ["✗ 引擎忙碌中，自检十一 Tier A 未执行（先等当前任务终结或停止）"] }
         var lines = CoverGenerator.verifyCoverGeneration()

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检二十合成页：可信点按实验（E1 复刻＋E2 探针）</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  #result { border: 1px solid #999; padding: 8px; min-height: 24px; margin-bottom: 16px; }
+  button { margin: 4px 4px 4px 0; padding: 8px 14px; }
+  /* 条款弹窗复刻：形态对齐微信 AI 配图条款弹窗（居中浮层＋双按钮）。
+     按钮由下方的触摸状态机驱动：只有带坐标的合法触摸序列能关，
+     合成 click 与空 touches 的触摸事件只被记录、不被接受。 */
+  #tcDlg { position: fixed; left: 40px; right: 40px; top: 150px; background: #fff;
+           border: 2px solid #c00; padding: 16px; z-index: 99; }
+</style>
+</head>
+<body>
+<div id="result">合成页已加载</div>
+
+<h3>E2 无障碍（AX）激活探针区</h3>
+<p>宿主侧自检将枚举本页的无障碍树、按 aria-label 定位下面这个按钮并调用
+accessibilityActivate()；本区记录页面实际收到的事件与 isTrusted 原值。</p>
+<button type="button" id="axTarget" aria-label="AX探针目标按钮">AX 探针目标</button>
+<p id="axText">AX 点击计数：0</p>
+
+<h3>E1 对照区（普通控件）</h3>
+<button type="button" id="normalBtn">普通计数按钮</button>
+<p id="normalText">普通点击计数：0</p>
+<button type="button" id="openDlg">打开复刻弹窗</button>
+
+<!-- 条款弹窗复刻（触摸状态机）：关闭条件＝touchstart 在按钮内记录到
+     changedTouches[0] 的坐标，且随后 800ms 内同一按钮的 touchend 仍携带
+     changedTouches[0] 且落点在按钮内（与真实触摸状态机的判读同型）。
+     JS 合成 TouchEvent 在 WebKit 里造不出 Touch 对象，changedTouches
+     必然为空——状态机如实记「ignored-empty」，弹窗保持打开。 -->
+<div id="tcDlg" role="dialog" aria-modal="true" style="display:none">
+  <p>《AI 配图功能使用条款》复刻样本：本弹窗只认带真实坐标的触摸序列。
+  合成点按（pointer/mouse/click）与空 touches 的触摸事件都不会关闭它，
+  但每一笔都会被记录，供与宿主插桩逐字段对照。</p>
+  <button type="button" id="tcCancel">取消</button>
+  <button type="button" id="tcAgree">同意并继续</button>
+</div>
+
+<script>
+(function(){
+  'use strict';
+  // ---------- 页面自有事件账（与宿主插桩相互独立的第二观察者） ----------
+  var pageLog = [];
+  function tagOf(el){
+    if (!el || !el.tagName) return '?';
+    return el.tagName.toLowerCase() + (el.id ? '#'+el.id : '');
+  }
+  function rec(e){
+    pageLog.push({ type: e.type, target: tagOf(e.target), isTrusted: !!e.isTrusted,
+                   ct: (e.changedTouches ? e.changedTouches.length : null),
+                   pid: (typeof e.pointerId === 'number' ? e.pointerId : null),
+                   pressure: (typeof e.pressure === 'number' ? e.pressure : null),
+                   ts: e.timeStamp });
+    if (pageLog.length > 600) pageLog.shift();
+  }
+  ['pointerover','pointerdown','pointerup','mousedown','mouseup','click','touchstart','touchend']
+    .forEach(function(t){ document.addEventListener(t, rec, true); });
+
+  // ---------- Touch 构造器实测（MEMO §5 的结构性缺口） ----------
+  var touchCtor = 'not-tried';
+  try {
+    var probe = new Touch({ identifier: 1, target: document.body, clientX: 1, clientY: 1 });
+    touchCtor = probe ? 'constructed' : 'constructed-null';
+  } catch (err) {
+    touchCtor = 'threw:' + ((err && err.name) || 'Error');
+  }
+
+  // ---------- E1 对照：普通按钮 ----------
+  var normalClicks = 0;
+  document.getElementById('normalBtn').addEventListener('click', function(){
+    normalClicks += 1;
+    document.getElementById('normalText').textContent = '普通点击计数：' + normalClicks;
+  });
+  document.getElementById('openDlg').addEventListener('click', function(){ openDialog(); });
+
+  // ---------- E1 复刻弹窗：触摸状态机 ----------
+  var dlg = document.getElementById('tcDlg');
+  var dialogOpen = false, closedBy = '';
+  var pending = null;   // {btn, x, y, t}
+  var decisions = [];
+  function decide(what, verdict){ decisions.push({ what: what, verdict: verdict }); if (decisions.length > 200) decisions.shift(); }
+  function openDialog(){ dlg.style.display = 'block'; dialogOpen = true; closedBy = ''; pending = null; }
+  function closeDialog(how){ dlg.style.display = 'none'; dialogOpen = false; closedBy = how; }
+  ['tcCancel','tcAgree'].forEach(function(id){
+    var btn = document.getElementById(id);
+    btn.addEventListener('touchstart', function(e){
+      var t = e.changedTouches && e.changedTouches[0];
+      if (t) { pending = { btn: id, x: t.clientX, y: t.clientY, t: Date.now() }; decide(id+':touchstart', 'recorded-point'); }
+      else { decide(id+':touchstart', 'ignored-empty-touches'); }
+    }, true);
+    btn.addEventListener('touchend', function(e){
+      var t = e.changedTouches && e.changedTouches[0];
+      if (!t) { decide(id+':touchend', 'ignored-empty-touches'); return; }
+      var r = btn.getBoundingClientRect();
+      var inside = t.clientX >= r.left && t.clientX <= r.right && t.clientY >= r.top && t.clientY <= r.bottom;
+      if (pending && pending.btn === id && inside && (Date.now() - pending.t) < 800) {
+        decide(id+':touchend', 'valid-touch-close');
+        closeDialog('touch-state-machine');
+      } else {
+        decide(id+':touchend', 'ignored-no-matching-start');
+      }
+    }, true);
+    btn.addEventListener('click', function(){
+      // 真实触摸点按在 touchend 后还会补一个 click：若状态机刚刚以合法
+      // 触摸关闭则 click 不会到达（元素已隐藏）；弹窗还开着时收到的
+      // click 一律不是合法触摸序列的产物——记录并忽略（与现场同型：
+      // 合成 click 到达了 handler，但动作分支不走）。
+      if (dialogOpen) decide(id+':click', 'ignored-click-without-valid-touch');
+    }, true);
+  });
+  window.__tcOpenDialog = openDialog;
+  window.__tcState = function(){
+    return JSON.stringify({ dialogOpen: dialogOpen, closedBy: closedBy,
+      normalClicks: normalClicks, touchCtor: touchCtor,
+      decisions: decisions, log: pageLog });
+  };
+
+  // ---------- E2 AX 探针 ----------
+  var axClicks = 0, axEvents = [];
+  var axBtn = document.getElementById('axTarget');
+  ['pointerdown','mousedown','mouseup','click'].forEach(function(t){
+    axBtn.addEventListener(t, function(e){
+      axEvents.push({ type: e.type, isTrusted: !!e.isTrusted });
+      if (axEvents.length > 100) axEvents.shift();
+    }, true);
+  });
+  axBtn.addEventListener('click', function(){
+    axClicks += 1;
+    document.getElementById('axText').textContent = 'AX 点击计数：' + axClicks;
+  });
+  window.__axState = function(){
+    return JSON.stringify({ clicks: axClicks, events: axEvents });
+  };
+})();
+</script>
+</body>
+</html>

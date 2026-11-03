@@ -15,6 +15,7 @@ struct SelfTestView: View {
     @State private var legibilityTestRunning = false
     @State private var autonomyTestRunning = false
     @State private var zOrderTestRunning = false
+    @State private var trustedClickTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -140,7 +141,35 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || zOrderTestRunning)
             Text("自检十九预期（ZORDER-FIX）：两层。Tier A 不调用模型（本按钮）：结构断言——直接核对根层级表纯函数 InterventionZOrder（ContentView 实际使用的同一份数值）：常态下遮罩＞坞、卡＞遮罩、输入栏最上（与 UI-LEGIBILITY 定版一致，非介入态层级零回归）；介入态点「打开浏览器」进入置顶态后坞＞遮罩（变暗遮罩不覆盖浏览器窗口、网页可看可亲手点）、卡（小条）＞坞（「已处理，继续」等解决按钮在浏览器置顶时可达）、遮罩仍＞对话层、输入栏仍最上；置顶切换只交换坞与遮罩名次、卡与输入栏名次不变；小条形态与置顶态同进退（置顶即收条、复位即全卡）。Tier B 真机人工（步骤见案卷 ZORDER-FIX-IMPL 的复测清单）：公众号场遇介入→点「打开浏览器」→浏览器浮到顶层能亲手点网页弹窗→点小条「已处理，继续」→层级恢复、任务按 AUTONOMY 口径续跑；安全类停车（发表确认）在小条上点「已处理」后的回读口径不变。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十：可信点按实验（E1 插桩对照＋E2 AX 探针）") {
+                guard !trustedClickTestRunning else { return }
+                trustedClickTestRunning = true
+                runTrustedClickTest()
+                dismiss()
+            }.disabled(!engine.active || trustedClickTestRunning)
+            Text("自检二十预期（TRUSTED-CLICK-EXP）：不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-trusted）。E1——武装只读插桩后：普通按钮经引擎 click 计数应为 1（阴性对照）；触摸状态机复刻弹窗在现行 pointer 序列＋合成 TouchEvent 序列后应仍打开（现象复现），页面账与插桩账双证 touchend 的 changedTouches 恒为 0、全部事件 isTrusted=false，两账逐类型计数应一致（插桩工作正常）。E2——宿主枚举本页无障碍树、按 aria-label 命中探针按钮并调 accessibilityActivate()，页面收到 click 且 isTrusted=true、或控件动作确实生效（计数增长）记「通」并留字段证据；够不到元素或激活无事件记「不通」并写明卡点层。实验合成一份结构化 JSON 落盘，本页下方可导出最近一份。E1 的真机金标准（真实条款弹窗上真人点一次再重放 diff）不在本按钮内，步骤见案卷 TRUSTED-CLICK-EXP-IMPL。").font(.caption).foregroundStyle(.secondary)
+            if let tcLogURL = TCProbeLogStore.latestURL() {
+                ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
+            }
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检二十编排（TRUSTED-CLICK-EXP）：E1 插桩复刻页对照＋E2 AX
+    /// 激活探针，委托引擎侧 verifyTrustedClick（WebController 在合成
+    /// 页 test-trusted 真实驱动并落盘结构化日志），结论以「自检二十」
+    /// 条目写进对话。不调用模型、不起任务；要求引擎空闲（会占用
+    /// 当前标签页打开合成页）。E1 真机金标准与 E3 不在本按钮内。
+    private func runTrustedClickTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十：开始——可信点按实验 E1 插桩对照＋E2 AX 探针（不调用模型）")
+        Task { @MainActor in
+            defer { trustedClickTestRunning = false }
+            let lines = await engine.verifyTrustedClick()
+            for line in lines { conversation.localFeedback("自检二十：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检二十结论：全部通过——插桩自证与 touches 恒空复现成立、E2 探针判定见上（通／不通均以字段证据为准）；E1 真机金标准按案卷步骤另行采集" : "自检二十结论：\(failed) 项未通过，见上方逐条记录（E2 判「不通」属实验结论、同样计未通过以便醒目）")
+        }
     }
 
     /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言
