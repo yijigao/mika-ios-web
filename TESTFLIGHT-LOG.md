@@ -225,3 +225,11 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 264c1d8 实查均 0 行）；无新第三方依赖；未合 main；新增文案无「并行执行」；探针只做证据与受控点按，click 指令在出手 frame 内重跑安全词复查。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后，再交 Joey 按案卷复测清单复测（第一条＝自检十四 Tier A，须特别留意沙箱 frame 乙的探针回報是否如期到达——该前提未经真机证实，如实记录不放水）；验收通过前不合 main。
 - 附记：上一构建 1932 条目末尾的阿仁 ASC 亲验行（03:43）此前未提交，随本次日志提交一并入库（系阿仁所记，非本单代记）。
+
+## 增补（2026-11-03）：WECHAT-EDITOR-NAV（公众号编辑器入口感知盲区修复），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030144**（0.1.0）：分支 `feat/wechat-editor-nav`（基线＝feat/wechat-cover-fix tip 9995b46，含构建 0042，未合 main），提交 `2479fb7`（功能）＋`9977984`（Part C 纠正撤回）＋`e6ea9ca`（轮子适配）；CI Run 41561457667 success（日志原文双核对：70 条 SwiftCompile、六个改动 Swift 文件均在编译列、test-nav 资源打包在位、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41561654443 success（agvtool 置号 202611030144、Successfully uploaded package、dSYM artifact dsym-41561654443 4,748,912 字节实存未过期）；validate_project.py 全 PASS（31 源、12 项资源集）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 WECHAT-EDITOR-NAV-IMPL-2026-11-03.md）：Part A 感知补盲（通用改进）——①抽取补入无文本控件：名源解析（innerText→aria-label→title→alt→关联 label→placeholder→value→背景图文件名词干），快照新增 nameSource 名源标注与 inView 视口标注（guard 身份校验豁免位置字段），语义元素的 alt/value 名从此在位，非语义补入的门槛与事件属性回退同步放宽（无名透明热区仍不入）；②「不可操作」判定前先揭示复判：performClick 终局前逐个滚动内层可滚动祖先＋scrollIntoView 后复判在视口与中心点命中，仍不可达才许报错且原文附「揭示手段已试」清单；③重扫点击新增文本锚点回退（文本节点→最近可点击祖先，安全词窄口径）。轮子盘点（Joey 09:38 指示）：通读 browser-use 的 buildDomTree.js @0.2.7（MIT）后只适配两处手法——内联事件属性回退判定、getClientRects 任一矩形判视口相交（源码注释与 NOTICE 均已标注出处）；整体脚本不移植（快照契约与 WKWebView 环境不合：树形 map＋高亮覆盖层、getEventListeners 在页面世界不可用、视口外不索引与本单规格方向相反、无滚动揭示逻辑），逐盲区对照表在案卷。Part B playbook wechat-oa-editor 新增专节：未存草稿回读成功前禁 set_site_mode/重载逃生、入口寻找顺序写死每类落点只试一次、发表记录对账＝标题精确匹配＋台账时刻 ±10 分钟双条件只读。Part C 段限文案：回读 0042 原文存证——段限暂停已是「进度已存检查点＋点继续开新段」的明确口径，未动；硬顶文案为真终局保留。**事实口径注记**：09:20 截图中的「已达最大 42 步」死路系更新前构建 1932 的旧账（Joey 09:37 纠正），0042 真机未撞段限，本单不得记为 0042 已撞段限。自检十六（新页 test-nav：四类无文本入口补盲＋名源断言、内层滚动容器下方入口的揭示复判、补盲入口与编辑入口真点、文本锚点点整卡）。
+- 过程注记：中间构建 **202611030133**（Release Run 41560472592、dSYM 4,745,239 字节）含一处依中途 steer 所作的兜底文案对齐，Joey 纠正口径后已撤回并被 0144 取代，不作复测目标。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 9995b46 实查均 0 行）；无新第三方依赖（两处手法为改编、已注出处许可）；未合 main；文案无「并行执行」；凭据不落盘；父级 SPEC 文件未动未提交。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝公众号编辑器原场景：入口按写死顺序找到、失败步流带揭示手段清单、未保存不重载逃生、发表记录双条件对账；真编辑器 DOM 形态未经本单证实，不得视为已验）；验收通过前不合 main。
