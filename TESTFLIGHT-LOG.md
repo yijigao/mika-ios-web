@@ -248,3 +248,11 @@
 - 过程注记：CI 首跑 41565837632 为 tee 假绿（run 结论 success、日志实为 BUILD FAILED——一处编辑行合并致 AgentEngine.swift:1680 编译错误），日志双核对识破、修复 2f7265d 后重跑 41565955352 通过；最终 tip 验收只认 41565955352。
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 8a518e3 实查均 0 行）；无新依赖；未合 main；新增文案无「并行执行」；凭据不落盘；父级 SPEC 文件未动未提交。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝自检十八 Tier A；第二条＝公众号场复刻 0042 两例：入口点不开走绕行梯/直达、条款弹窗走保存→离开→直达返回往返且回读正文不丢——真编辑器往返不丢稿未经本单证实，不得视为已验；安全类发表确认与澄清类 ask_user 停车回归同程）；亲验后本构建取代 0209 成为唯一复测目标；验收通过前不合 main。
+
+## 增补（2026-11-03）：ZORDER-FIX（介入态浏览器置顶层级：坞/遮罩换位＋介入卡收小条），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030239**（0.1.0）：分支 `feat/zorder-fix`（基线＝feat/autonomy-fix tip a45afc4，含构建 0227，未合 main），功能提交 `c439f73`；CI Run 41567228809 success（日志原文双核对：70 条 SwiftCompile、ContentView/AgentChatView/SelfTestView 均在编译列、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41567382463 success（agvtool 置号 202611030239、Archive Succeeded、Successfully uploaded package、dSYM artifact dsym-41567382463 4,988,814 字节实存未过期）；validate_project.py 全 PASS（31 源、12 项资源集）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 ZORDER-FIX-IMPL-2026-11-03.md）：Joey 10:20 截图实证的层级缺陷修复——介入卡点「打开浏览器」后介入卡＋变暗遮罩仍压在浏览器之上、亲手处理那一步被自己的弹窗堵死。修法纯呈现层：根层级抽纯函数表 InterventionZOrder（视图与自检十九共用同一份数值）——常态名次与 0209 逐值一致（对话 0＜坞 1＜遮罩 2＜卡 3＜输入栏 4，OverlayStyle 与遮罩参数未动）；用户点卡上「打开浏览器*」进入置顶态时只交换坞与遮罩名次（遮罩退到坞之下、结构上不再覆盖浏览器窗口，网页可看可亲手点），介入卡收成坞之上的单行小条（短标题＋本卡解决按钮＋回全卡的「说明」，背景仍走 interventionCardBackground 厚材质），三卡小条的解决按钮与全卡走同一守卫与引擎路径、紧凑渲染在各卡 body 内分支（@State 防重复锁不因形态切换丢失）；点小条「已处理，继续」等解决动作使介入解除后置顶状态自动复位、层级恢复常态，与 AUTONOMY 介入语义一致（安全类停车回读口径未动）。自检十九（层级表 7 项结构断言＋Tier B 真机清单：公众号场遇介入→打开浏览器→亲手点网页弹窗→小条已处理继续→层级恢复）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy、AgentEngine 及全部引擎/感知文件对基线 a45afc4 的 git diff 均 0 行（只动 ContentView/AgentChatView/SelfTestView 三个呈现层文件）；无新依赖；未合 main；新增文案无「并行执行」；凭据不落盘；父级 SPEC 文件未动未提交。
+- 未证项：自检十九 Tier A 未真机运行（待真机点按回读）；真机层级观感（浏览器是否真浮顶、网页弹窗是否真可点、小条是否挡具体页面操作区）与 zIndex 换位下 WKWebView 不重载/不丢状态，均待 Tier B 实测，不得视为已验；小条与坞收起按钮几何邻接为静态推算。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测；亲验后本构建取代 0227 成为唯一复测目标；验收通过前不合 main。
