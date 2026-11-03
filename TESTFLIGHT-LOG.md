@@ -273,3 +273,12 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 aee0241 实查均 0 行）；介入分类门语义不回退（安全类照常停车、澄清类不收紧）；无新依赖；未合 main；新增文案无「并行执行」；凭据不落盘；父级 SPEC 文件与诊断文件未动未提交。
 - 未证项：自检二十一 Tier A 未真机运行；真公众号草稿列表 harvest 实况与 hover 显形待 Tier B（详见案卷 §10），不得视为已验。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝自检二十一；第二条＝公众号场接续：《给信息做减法》草稿自主跑完＋E1 金标准真点一次）；亲验后本构建取代 0252 成为唯一复测目标；验收通过前不合 main。
+
+## 增补（2026-11-03）：COVER-UPLOAD-FIX（封面存相册＋命名规整＋iOS 18.4 文件面板自动供文件），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030625**（0.1.0）：分支 `feat/cover-upload-fix`（基线＝feat/ladder-fix tip 47ead2d，含构建 0336，未合 main），功能提交 `fe89cd9`＋回调 Swift 名修正 `1194766`＋嵌套类型限定修正 `5d24e8f`；CI Run 41589504945 success（日志原文双核对：70 条 SwiftCompile、BUILD SUCCEEDED ×1、唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41589717416 success（agvtool 置号 202611030625、Archive Succeeded、Successfully uploaded、dSYM artifact dsym-41589717416 5,488,322 字节实存未过期）；validate_project.py 全 PASS（31 源、资源集 15 项 HTML）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 COVER-UPLOAD-FIX-IMPL-2026-11-03.md，调研结论单列 §1）：针对 0336 真机现场——封面已生成却传不上、Joey 手动在相册里找不到生成图、文件名全角标点难对号。调研定案：iOS 18.4 起 `WKUIDelegate` 文件面板回调公开（WebKit 官方头文件 WK_API_AVAILABLE(macos 10.12, ios 18.4)＋Chromium iOS 源码独立佐证；JS 拼 File 路线以脚本伪造否决、私有 API 不碰）。A：generate_cover 生成后同步写入系统相册（PHPhotoLibrary addOnly＋Info.plist 用途说明），PhotoSaveOutcome 三态步流文案如实带文件名，附件记录 savedToPhotos 标记。B：GeneratedFileName ASCII slug 短名（全角/中文折连字符、纯中文退时间戳名、slug ≤24），附件中心与注入段本任务生成置顶＋徽标。C：uploadPickGuidance 统一找图指引（相册「最近项目」最新一张／附件中心置顶项＋确切文件名／待供武装时「点上传按钮自动带上」），选文件卡与快照恢复共用。D：文件面板回调命中武装待供文件（仅 SP-01 过后：任务生成豁免或确认卡已消费；绑定执行页、消费即作废）直接供文件、双回读收口、任务不停等待续跑；未触发保持武装待用户真点上传按钮供文件；无武装时宿主回退选择器（PHPicker／UIDocumentPicker asCopy，补回用户自选路径；拍照入口无法等价复刻已记案卷）；iOS 18.4 以下整条 D 自动不存在、走 A–C。收口重构 verifyPickedUpload 与手动路共用。自检二十二（命名四例＋相册三态文案＋置顶排序＋指引三态＋环境门纯逻辑；test-upload 供文件回路，合成触发未拉起记环境结论）。
+- 过程注记：CI 首跑 41589121305 为 tee 假绿（run 结论 success、日志实为回调 Swift 名错误、BUILD SUCCEEDED ×0），双核对识破后修正重跑；二跑 41589273725 暴露嵌套类型引用未限定，修正后三跑 41589504945 通过；最终 tip 验收只认 41589504945。
+- 红线复核：SafetyPolicy 与 MikaWebApp.swift 对基线 47ead2d 的 diff 实查均 0 行；SP-01 确认卡语义与一次性凭据规则不变（供文件只在判定之后）；无新依赖（Photos/PhotosUI/UTI 均系统框架）；新增文案无「并行」表述；未合 main；父级 SPEC 文件未动未提交。
+- 未证项：自检二十二 Tier A 未真机运行；合成 click 真机是否拉起面板回调、相册写入真机全程（权限弹窗/落盘/最近项目命中）、回退选择器真机呈现、公众号真实文件控件对回调供文件的接受度均待 Tier B（清单见案卷 §6），不得视为已验。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测；亲验后本构建取代 0336 成为唯一复测目标；验收通过前不合 main。
