@@ -1471,7 +1471,7 @@ enum TCProbeLogStore {
     /// 保持「用户自己选」语义不变。iOS 18.4 以下系统不调用本方法，
     /// 行为与 Safari 一致（系统选择器）。
     @available(iOS 18.4, *)
-    func webView(_ webView: WKWebView, runOpenPanelWithParameters parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
         if let supply = armedUploadSupply,
            let tab = tabs.first(where: { $0.webView === webView }), tab.id == supply.tabID {
             armedUploadSupply = nil
