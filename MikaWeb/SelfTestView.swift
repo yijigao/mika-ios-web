@@ -12,6 +12,7 @@ struct SelfTestView: View {
     @State private var frameProbeTestRunning = false
     @State private var stepBudgetTestRunning = false
     @State private var editorNavTestRunning = false
+    @State private var legibilityTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -116,7 +117,43 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || editorNavTestRunning)
             Text("自检十六预期（WECHAT-EDITOR-NAV）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-nav）：合成页复刻三类盲区——只有 aria-label 的 icon 按钮、只有 alt 的图标图、只有背景图的无文本封面入口、只有内联事件属性的无名入口（旧抽取整类滤掉），以及藏在内层滚动容器下方＋整页折下的编辑入口。预期：四类无文本入口都进元素清单且名源标注正确（aria-label／alt／bg／none）；编辑入口初始 inView=false、经揭示复判（逐个滚动内层容器＋窗口跟随）后在视口且中心可命中；补盲入口与编辑入口经引擎 click 都真点得动；序号标记失效后重扫能经文本锚点回退点中整卡。Tier B 真机人工（步骤见案卷 WECHAT-EDITOR-NAV-IMPL 的复测清单）：公众号编辑器原场景复测——草稿编辑入口与封面设置入口按 playbook 写死顺序找，未保存前不重载。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十七：浮层可读性") {
+                guard !legibilityTestRunning else { return }
+                legibilityTestRunning = true
+                runLegibilityTest()
+                dismiss()
+            }.disabled(!engine.active || legibilityTestRunning)
+            Text("自检十七预期（UI-LEGIBILITY）：两层。Tier A 不调用模型（本按钮）：结构断言——介入层三卡共用背景规格 OverlayStyle 的基底为最厚材质 ultraThickMaterial（强模糊）、系统底色覆盖 ≥0.5、未模糊直透比例 ≤0.25；变暗遮罩不透明度 ≥0.40 且不拦截触摸（网页弹窗照常可亲手点）；卡片种类真值表（上传＞确认＞手输互斥）保证同一时刻至多一张卡、介入文字只绘制一层。Tier B 真机人工（步骤见案卷 UI-LEGIBILITY-IMPL 的复测清单）：公众号场再遇介入卡（手动处理／确认／上传任一）时读一遍——卡内文字应清晰可读、卡后整屏变暗、无背景文字透叠；点网页弹窗按钮与「打开浏览器」照常可用。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言
+    /// （OverlayStyle 呈现规格参数＋InterventionPrompt 卡片种类真值表），
+    /// 结论以「自检十七」条目写进对话。不调用模型、不占用标签页；
+    /// 像素级可读性结论属 Tier B 真机人工（见上方说明与案卷复测清单）。
+    private func runLegibilityTest() {
+        let conversation = self.conversation
+        conversation.localFeedback("自检十七：开始——浮层可读性结构断言（不调用模型）")
+        defer { legibilityTestRunning = false }
+        var lines: [String] = []
+        func check(_ ok: Bool, _ text: String) { lines.append((ok ? "✓ " : "✗ ") + text) }
+        check(OverlayStyle.baseMaterialName == "ultraThickMaterial",
+              "卡面基底为最厚材质 ultraThickMaterial（强模糊，背景文字不成字形）")
+        check(OverlayStyle.coverTintOpacity >= 0.5,
+              "卡面系统底色覆盖不透明度 \(OverlayStyle.coverTintOpacity) ≥ 0.5（与厚材质复合后接近不透明）")
+        check(OverlayStyle.unblurredShowThrough <= 0.25,
+              "未模糊直透比例 \(String(format: "%.2f", OverlayStyle.unblurredShowThrough)) ≤ 0.25（残余部分先经厚材质模糊）")
+        check(OverlayStyle.scrimOpacity >= 0.40,
+              "变暗遮罩不透明度 \(OverlayStyle.scrimOpacity) ≥ 0.40（卡外背景整体压暗）")
+        check(OverlayStyle.scrimAllowsHitTesting == false,
+              "变暗遮罩不拦截触摸（网页弹窗与坞控件照常可亲手点按）")
+        let combos: [(Bool, Bool, Bool)] = [(true, true, true), (true, false, false), (false, true, true), (false, false, true), (false, false, false)]
+        let kinds = combos.map { InterventionPrompt.cardKind(hasPendingUpload: $0.0, isWaitingConfirm: $0.1, isWaitingManualWithInput: $0.2) }
+        check(kinds == [.upload, .upload, .confirm, .manual, .none],
+              "卡片种类真值表成立：上传＞确认＞手输互斥，任意状态组合至多一张卡（文本层唯一）")
+        for line in lines { conversation.localFeedback("自检十七：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检十七结论（Tier A）：全部通过——厚材质＋高覆盖卡面、变暗遮罩在位且不拦截触摸、单卡互斥均成立；Tier B 真机可读性按案卷清单人工复测" : "自检十七结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检十四 Tier A 编排（WECHAT-COVER-FIX Part A）：frame 探针在

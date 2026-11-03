@@ -215,6 +215,58 @@ struct ChatInputBar: View {
     }
 }
 
+/// 置顶浮层呈现规格（UI-LEGIBILITY，2026-11-03，案卷 UI-LEGIBILITY-IMPL-2026-11-03.md）：
+/// 介入层三张卡（确认／上传／手输）共用的背景与遮罩参数，单点定义、自检
+/// 十七按此断言。症状定性（Joey 2026-11-03 真机截图）：旧背景只有一层
+/// .orange.opacity(0.12~0.15)，无材质、无遮罩，卡片直接压在对话消息流与
+/// 浏览器小窗之上，背后文字几乎无衰减透出；同一介入文案又同时在场于
+/// 步骤行、标题状态行与回复条目，透过卡面以不同偏移叠在一起，看着像
+/// 文字被重复绘制（视图层级里卡只渲染一处，不是重复绘制 bug）。
+/// 修法只动呈现：卡面＝厚材质（强模糊）＋系统底色高覆盖＋橙色调（身份
+/// 色），卡后整屏另加变暗遮罩；文字仍由各卡原样单层绘制，交互、布局
+/// 顺序、文案与安全确认流程一律不动。
+enum OverlayStyle {
+    /// 卡面基底材质名（自检断言用）：ultraThickMaterial 是系统最厚一档，
+    /// 采样模糊最强、自身接近不透明——背景文字先被它糊掉，不成字形。
+    static let baseMaterialName = "ultraThickMaterial"
+    /// 系统底色覆盖层不透明度：叠在厚材质之上，把残余透字再压一轮；
+    /// 与橙色调层复合后卡面在视觉上接近不透明。
+    static let coverTintOpacity = 0.72
+    /// 橙色调层不透明度：只负责身份色，不再承担遮字（旧版 0.12~0.15
+    /// 的单层背景到此降为纯色调）。
+    static let accentTintOpacity = 0.14
+    /// 变暗遮罩不透明度（ContentView 介入层）：卡外区域整体压暗，
+    /// 背景文字不再与卡内文字争夺可读性。
+    static let scrimOpacity = 0.42
+    /// 遮罩不拦截触摸：用户照常能亲手点网页弹窗与坞控件，介入流程的
+    /// 触摸路径与旧版完全一致。
+    static let scrimAllowsHitTesting = false
+    /// 未模糊直透比例（自检断言用）：两层色调之后直透比例
+    /// (1−0.72)×(1−0.14)≈0.24，且这部分先经厚材质模糊，不成字形。
+    static var unblurredShowThrough: Double { (1 - coverTintOpacity) * (1 - accentTintOpacity) }
+}
+
+extension View {
+    /// 介入层三卡共用背景（UI-LEGIBILITY）：厚材质＋系统底色覆盖＋橙色调，
+    /// 圆角 12 与旧版一致，另加描边与投影帮卡面与被压暗的背景分离。
+    /// 只管背景呈现，不碰各卡的文字、按钮与布局。
+    func interventionCardBackground() -> some View {
+        background {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12).fill(.ultraThickMaterial)
+                RoundedRectangle(cornerRadius: 12).fill(Color(.systemBackground).opacity(OverlayStyle.coverTintOpacity))
+                RoundedRectangle(cornerRadius: 12).fill(Color.orange.opacity(OverlayStyle.accentTintOpacity))
+            }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.orange.opacity(0.45), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
+        .shadow(color: .black.opacity(0.30), radius: 16, x: 0, y: 6)
+    }
+}
+
 // 内部可见：对话区置顶介入卡专用的确认卡片（ContentView 的 InterventionPrompt 层渲染，
 // 小窗与展开态都可见；同一 engine.confirm 路径与防重复守卫，语义不变）。
 // 展示口径（INTERVENTION-PROMPT 定版）：待确认动作的全字段不删减——动作／目标序号、
@@ -257,7 +309,7 @@ struct ConfirmCard: View {
             }
         }
         .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-        .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+        .interventionCardBackground()
     }
     private func submit(_ execute: Bool) {
         guard !locked, engine.conversationTaskID == taskID else { return }
@@ -326,7 +378,7 @@ struct UploadCard: View {
             }
         }
         .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-        .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+        .interventionCardBackground()
     }
     private func lock(_ action: () -> Void) {
         guard !locked else { return }
@@ -339,26 +391,55 @@ struct InterventionPrompt: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var web: WebController
     var onOpenBrowser: () -> Void
+    /// 同一时刻只出一张卡的种类判定（纯函数，UI-LEGIBILITY 抽出供自检
+    /// 十七断言真值表）：上传优先于确认、确认优先于手输，与 body 的
+    /// 渲染优先级一致——保证介入文字只在一张卡里绘制一层，不叠印。
+    enum CardKind { case upload, confirm, manual, none }
+    static func cardKind(hasPendingUpload: Bool, isWaitingConfirm: Bool, isWaitingManualWithInput: Bool) -> CardKind {
+        if hasPendingUpload { return .upload }
+        if isWaitingConfirm { return .confirm }
+        if isWaitingManualWithInput { return .manual }
+        return .none
+    }
+    private var confirmAction: AgentAction? {
+        if case .waitingConfirm(let action) = engine.status { return action }
+        return nil
+    }
+    private var manualText: String? {
+        if case .waitingManual = engine.status, case .some(.manual(_, let text)) = engine.waitingInput { return text }
+        return nil
+    }
     var body: some View {
-        if let upload = engine.pendingUpload {
-            UploadCard(engine: engine, upload: upload, onOpenBrowser: onOpenBrowser)
-        } else if case .waitingConfirm(let action) = engine.status {
-            ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID,
-                        pageTitle: pageTitle, pageHost: pageHost, onOpenBrowser: onOpenBrowser)
-        } else if case .waitingManual = engine.status, case .some(.manual(_, let text)) = engine.waitingInput {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("需要你手动处理").font(.headline)
-                Text(text)
-                Text("完成后点击「已处理，继续」。")
-                HStack {
-                    Button("打开浏览器") { onOpenBrowser() }
-                    Spacer()
-                    Button("已处理，继续") { engine.resume() }
-                        .buttonStyle(.borderedProminent)
-                }
+        switch Self.cardKind(hasPendingUpload: engine.pendingUpload != nil,
+                             isWaitingConfirm: confirmAction != nil,
+                             isWaitingManualWithInput: manualText != nil) {
+        case .upload:
+            if let upload = engine.pendingUpload {
+                UploadCard(engine: engine, upload: upload, onOpenBrowser: onOpenBrowser)
             }
-            .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+        case .confirm:
+            if let action = confirmAction {
+                ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID,
+                            pageTitle: pageTitle, pageHost: pageHost, onOpenBrowser: onOpenBrowser)
+            }
+        case .manual:
+            if let text = manualText {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("需要你手动处理").font(.headline)
+                    Text(text)
+                    Text("完成后点击「已处理，继续」。")
+                    HStack {
+                        Button("打开浏览器") { onOpenBrowser() }
+                        Spacer()
+                        Button("已处理，继续") { engine.resume() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+                .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .interventionCardBackground()
+            }
+        case .none:
+            EmptyView()
         }
     }
     /// 确认动作作用于执行页（任务绑定的标签页），标题/域名按执行页取，不用当前页冒充。

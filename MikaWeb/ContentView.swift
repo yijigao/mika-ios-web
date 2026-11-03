@@ -48,6 +48,13 @@ struct ContentView: View {
                                 bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState,
                                 onReturnToExecution: { returnToExecution() })
                 if showsInterventionPrompt {
+                    // 变暗遮罩（UI-LEGIBILITY，2026-11-03）：介入卡出现时整屏
+                    // 压暗对话层与浏览器坞，卡面成为唯一可读层，背景文字不再
+                    // 透叠。遮罩不拦截触摸（参数 OverlayStyle.scrimAllowsHitTesting
+                    // ＝false），用户照常亲手点网页弹窗与坞控件，触摸路径不变。
+                    Color.black.opacity(OverlayStyle.scrimOpacity)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(OverlayStyle.scrimAllowsHitTesting)
                     InterventionPrompt(engine: engine, web: web,
                                        onOpenBrowser: { dockExpandRequest += 1 })
                         .padding(.horizontal, 12)
