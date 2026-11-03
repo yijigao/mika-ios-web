@@ -67,6 +67,14 @@ struct AgentChatView: View {
                 // 停止走 stopFromUser（M1）：停掉当前任务后队列自动推进；
                 // 只在任务所在会话里可点——在别的会话点停会串会话
                 Button("停止") { engine.stopFromUser() }.disabled(!engine.busy || !engine.active || !viewingRunSession)
+                // 结束任务（SELFCHECK-UNBLOCK-FIX）：暂停态的彻底终结出口。
+                // 与「停止＝暂停、可继续」相对：点了清快照、不可续跑，引擎
+                // 随之解锁（自检与新任务不再被一个暂停任务挡住）；文案带
+                // 「不可续跑」明示区别。只在暂停态、且正看任务所在会话时
+                // 呈现（同停止／继续的会话归属口径）。
+                if isPaused, viewingRunSession {
+                    Button("结束任务（不可续跑）") { engine.finishTaskFromUser() }.disabled(!engine.active)
+                }
                 // 手输等待的「已处理，继续」由置顶介入卡独占（同一时刻一个主入口，
                 // 见 InterventionPrompt）；本行「继续」只管暂停／失败的续跑。
                 Button("继续") { engine.resume() }

@@ -18,6 +18,7 @@ struct SelfTestView: View {
     @State private var trustedClickTestRunning = false
     @State private var ladderFixTestRunning = false
     @State private var coverUploadFixTestRunning = false
+    @State private var taskFinishTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -164,6 +165,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || coverUploadFixTestRunning)
             Text("自检二十二预期（COVER-UPLOAD-FIX）：不调用模型（本按钮，要求引擎空闲，会占用执行页打开本地合成页 test-upload）。纯逻辑——生成文件名规整（混合标题小写 slug、全角标点剔除且全 ASCII、纯中文标题回退时间戳名、slug 长度上限）；相册写入三态文案（成功才说已存入相册，未授权/失败如实说没存入并带原因与文件名）；附件展示排序（本任务生成置顶、其余新在前）；选文件指引文案（已存相册给「最近项目」路线，未存不给相册路线、只指附件中心置顶项，待供武装时加「点上传按钮自动带上」）；环境门（不支持文件面板回调时武装恒失败不留武装态）。回路（iOS 18.4+）——在 test-upload 上武装一份临时文件、合成触发文件控件：回调被拉起且页面回读持有该文件记回路成立；合成触发未拉起面板记「未触发」（属环境结论，真机生产路径为用户真点上传按钮时供文件，Tier B 复测为准）；系统低于 iOS 18.4 时回路记环境结论（只能手动选文件）。相册真实写入（权限弹窗与落盘）不在本按钮内，属 Tier B 真机人工。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十三：结束任务解锁（SELFCHECK-UNBLOCK-FIX）") {
+                guard !taskFinishTestRunning else { return }
+                taskFinishTestRunning = true
+                runTaskFinishTest()
+                dismiss()
+            }.disabled(!engine.active || taskFinishTestRunning)
+            Text("自检二十三预期（SELFCHECK-UNBLOCK-FIX）：不调用模型、不占用标签页（本按钮，要求引擎空闲）。程序化合成一个已暂停任务（目标与等待输入在位、快照落盘、busy 为真——同 0625 真机「停止后仍被自检挡下」的现场）：断言未结束时引擎保持锁定；调引擎 finishTask（即「结束任务」按钮的动作）后——busy 转假、状态落终结态、会话快照文件已删（重启 App 不会再恢复）、等待输入与目标已清、resume() 调之不复活、执行页绑定解除且待供文件未武装；演练毕引擎现场完整还原。真机人工部分（暂停态出现「结束任务（不可续跑）」按钮、点后自检二十二能跑、结束后重启不恢复、暂停后点继续仍能续跑、跑动中点停止仍是暂停）见案卷 Tier B 清单。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -223,6 +231,23 @@ struct SelfTestView: View {
             for line in loopLines { conversation.localFeedback("自检二十二：\(line)") }
             let failed = (logicLines + loopLines).filter { $0.hasPrefix("✗") }.count
             conversation.localFeedback(failed == 0 ? "自检二十二结论：全部通过——命名规整、相册三态文案、附件置顶排序、选文件指引与自动供文件回路均有实证" : "自检二十二结论：\(failed) 项未通过，见上方逐条记录（回路「未触发／环境结论」同样计未通过以便醒目，不代表代码失败）")
+        }
+    }
+
+    /// 自检二十三编排（SELFCHECK-UNBLOCK-FIX）：引擎侧合成暂停任务→
+    /// finishTask→逐项断言解锁/清快照/封续跑，结论以「自检二十三」
+    /// 条目写进对话。不调用模型、不起任务、不占用标签页；要求引擎
+    /// 空闲，演练毕引擎现场完整还原。
+    private func runTaskFinishTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十三：开始——结束任务解锁核查（不调用模型）")
+        Task { @MainActor in
+            defer { taskFinishTestRunning = false }
+            let lines = await engine.verifyTaskFinishUnlock()
+            for line in lines { conversation.localFeedback("自检二十三：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检二十三结论：全部通过——暂停态锁定、结束任务后解锁/清快照/封续跑/释放绑定均有实证，引擎现场已还原" : "自检二十三结论：\(failed) 项未通过，见上方逐条记录")
         }
     }
 

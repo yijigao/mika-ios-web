@@ -3,7 +3,7 @@ import UIKit
 import BackgroundTasks
 import Combine
 enum AgentStatus {
-    case idle, running, paused(String), waitingConfirm(AgentAction), waitingManual(String), done(String), failed(String)
+    case idle, running, paused(String), waitingConfirm(AgentAction), waitingManual(String), done(String), failed(String), ended(String)
     var label: String {
         switch self {
         case .idle: return "待命"
@@ -13,6 +13,7 @@ enum AgentStatus {
         case .waitingManual(let s): return "等待手动输入：\(s)"
         case .done(let s): return "完成：\(s)"
         case .failed(let s): return "失败：\(s)"
+        case .ended(let s): return "已结束：\(s)"
         }
     }
 }
@@ -734,6 +735,33 @@ struct OpenStall {
             clearSnapshot()
         }
     }
+    /// 彻底终结当前任务（SELFCHECK-UNBLOCK-FIX）：与 stop() 的「暂停可
+    /// 续跑」相对，这是用户显式丢弃任务的出口——0625 真机现场：中断恢
+    /// 复的旧任务被「停止」后仍是 .paused（busy 含暂停态），快照还在，
+    /// 引擎永不解锁，自检全被「引擎忙碌中」挡下、UI 又没有丢弃入口。
+    /// 本函数：取消 worker／换代次（迟到回复一律作废）、作废待决上传
+    /// （SP-01 凭据与待供文件武装一并解除，见 discardPendingUpload）、
+    /// 释放执行页绑定与后台／持续处理句柄、清等待输入与恢复现场、清
+    /// 目标（resume 无目标可续）、状态落终结态 .ended 并在步流留一条
+    /// 记录、最后清该会话快照——重启 App 不得再恢复这个已结束任务。
+    /// 此后 busy == false，自检可跑、「新任务」可正常开。仅在 busy 时
+    /// 有意义（UI 只在暂停态呈现按钮）；空闲／已终结时调用无操作。
+    func finishTask() {
+        guard busy else { return }
+        generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        discardPendingUpload()
+        runStartedAt = nil; activeRunContext = nil
+        sessionActive = false; applyIdleTimerPolicy()
+        endBackgroundGrace()
+        completeContinuedProcessing(success: false)
+        web.endExecution()
+        waitingInput = nil; stepLimitPaused = false
+        pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        goal = ""
+        status = .ended("用户已结束任务")
+        appendStep("ended", "任务已结束：用户手动终结本任务——快照已清除、不可续跑（点「继续」也不会再跑这个任务）；引擎已解锁，可运行自检或开始新任务")
+        clearSnapshot()
+    }
     func setForeground(_ foreground: Bool) {
         active = foreground
         if foreground {
@@ -855,7 +883,8 @@ struct OpenStall {
 
     /// 队列推进（M1 执行权语义）：仅从终结点调用——任务完成（worker 的
     /// done 分支）、任务失败落定（worker 外层 catch）、用户手动停止
-    /// （stopFromUser，此时状态为已暂停、靠 afterUserStop 放行）。等待
+    /// （stopFromUser，此时状态为已暂停、靠 afterUserStop 放行）、用户
+    /// 结束任务（finishTaskFromUser，此时状态为终结态 .ended）。等待
     /// 确认／等待人工／步数暂停／循环熔断都不算终结，执行权不转移；
     /// 执行超时更不触发推进——本函数没有任何按时长的调用点（超时只走
     /// executionAnomaly 标记）。模型未就绪时不推进：队首留在队里，
@@ -863,7 +892,7 @@ struct OpenStall {
     private func advanceQueue(afterUserStop: Bool = false) {
         guard active, let next = queuedTasks.first else { return }
         switch status {
-        case .done, .failed, .idle: break
+        case .done, .failed, .idle, .ended: break
         case .paused: guard afterUserStop else { return }
         default: return
         }
@@ -882,6 +911,14 @@ struct OpenStall {
     func stopFromUser() {
         stop()
         advanceQueue(afterUserStop: true)
+    }
+
+    /// 用户点「结束任务」（SELFCHECK-UNBLOCK-FIX）：在 finishTask 之外
+    /// 推进队列——任务已落终结态，执行权真正空出，排队任务按序启动
+    /// （与 stopFromUser 的用户终止口径一致）。
+    func finishTaskFromUser() {
+        finishTask()
+        advanceQueue()
     }
 
     /// 执行异常标记（M1 执行权语义）：任务连续执行超过 30 分钟只标
@@ -974,7 +1011,7 @@ struct OpenStall {
     /// 存储换源（测试期间对话停留在原会话，报告条目也记在原会话）；
     /// 结束时指针切回原会话，指针／对话／标签三方重新一致。
     func verifyMultiSessionShell() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，Tier A 未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines: [String] = []
         let store = SessionStore.shared
         let originalID = store.currentSessionID
@@ -1852,7 +1889,7 @@ struct OpenStall {
     /// 委托 WebController 在合成页 test-frames 上实测（同源/跨源 frame
     /// 各一弹窗：枚举定位＋框内序列/Escape 关闭＋元素消失回读判定）。
     func verifyFrameProbe() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyFrameProbeAndClick()
     }
 
@@ -1861,7 +1898,7 @@ struct OpenStall {
     /// 三类无文本入口进快照且名源正确、内层滚动容器下方入口经揭示
     /// 复判可达、补盲入口真点得动、文本锚点回退点中整卡）。
     func verifyEditorNav() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检十六 Tier A 未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检十六 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyEditorNavReveal()
     }
 
@@ -1871,12 +1908,12 @@ struct OpenStall {
     /// E1 真机金标准（真实弹窗上 Joey 真点一次）由阿仁另行约，不在
     /// 本入口内；E3 受 E1 真机结果门控、不做。
     func verifyTrustedClick() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检二十未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyTrustedClickExp()
     }
 
     func verifyCoverAndModal() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检十一 Tier A 未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检十一 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines = CoverGenerator.verifyCoverGeneration()
         lines += await web.verifyModalClickEscalation()
         let probe = MikaError("\(WebController.modalUnresponsivePrefix)：合成样本")
@@ -2275,7 +2312,7 @@ struct OpenStall {
     /// 链接农场 harvest、弹窗在场基线与弹窗导航绕行（非编辑页重载
     /// 分支），并断言全程未进入停车态。不调用模型；要求引擎空闲。
     func verifyAutonomy() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检十八未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检十八未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines = Self.verifyAutonomyGate()
         func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
         // 合成页用 window.name 模拟「重载即消失」的会话级弹窗：重复跑
@@ -2315,7 +2352,7 @@ struct OpenStall {
     /// 武装→触发→回读），由 SelfTestView 编排在纯逻辑之后。不调用
     /// 模型；要求引擎空闲。
     func verifyCoverUploadFix() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检二十二未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十二未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines: [String] = []
         func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
         // —— 命名规整（B）——
@@ -2369,8 +2406,54 @@ struct OpenStall {
     /// 回路在 WebController 侧（verifyUploadPanelSupply），SelfTestView
     /// 经引擎转发调用，保持自检视图不直持 WebController 的既有形态。
     func verifyUploadPanelSupply() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检二十二回路未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十二回路未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyUploadPanelSupply()
+    }
+
+    /// 自检二十三（SELFCHECK-UNBLOCK-FIX）：「结束任务」解锁口的纯逻辑
+    /// 核查。0625 真机现场的同型复刻——程序化合成一个已暂停任务（目
+    /// 标在位、等待输入在位、快照落盘、busy 为真），断言：未结束时引
+    /// 擎保持锁定；finishTask 后 busy 转假、status 落终结态 .ended、
+    /// 会话快照文件已删（冷启动恢复只读此文件，删了即不会再恢复）、
+    /// 等待输入与目标已清、resume() 不得把终结态复活、执行页绑定已
+    /// 解除且待供文件未武装。演练全程保存/还原引擎现场（状态、目标、
+    /// 步流、等待输入、段限标记、对话任务标识——演练期间暂置 nil 使
+    /// 合成步流不路由进真实对话），结束不留痕迹。不调用模型、不占用
+    /// 标签页；要求引擎空闲（入口 guard 与其余自检同口径）。
+    func verifyTaskFinishUnlock() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十三未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        func isEnded() -> Bool { if case .ended = status { return true }; return false }
+        // —— 保存现场 ——
+        let savedStatus = status, savedGoal = goal, savedSteps = steps, savedStepSeq = stepSeq
+        let savedWaiting = waitingInput, savedStepLimitPaused = stepLimitPaused, savedTaskID = conversationTaskID
+        let savedStateCard = stateCard
+        let snapshotURL = SessionStore.shared.snapshotURL(for: runSessionID)
+        let fm = FileManager.default
+        // —— 合成暂停态（中断恢复后点过「停止」的同型现场）——
+        conversationTaskID = nil
+        goal = "自检二十三合成目标"
+        status = .paused("自检二十三合成暂停")
+        waitingInput = .question(id: UUID(), text: "自检二十三合成等待")
+        persistSnapshot()
+        let snapshotWritten = fm.fileExists(atPath: snapshotURL.path)
+        lines.append("\(fmt(busy && snapshotWritten)) 暂停态基线：合成已暂停任务后 busy 为 true、快照已落盘（未结束时引擎保持锁定——与 0625 真机现场同型）")
+        // —— 结束任务 ——
+        finishTask()
+        lines.append("\(fmt(!busy && isEnded())) 结束任务后解锁：busy 为 false、status 落终结态（已结束）")
+        lines.append("\(fmt(!fm.fileExists(atPath: snapshotURL.path))) 快照已清：会话快照文件已删除（重启 App 只认此文件恢复，删后不会再恢复这个已结束任务）")
+        lines.append("\(fmt(waitingInput == nil && goal.isEmpty)) 续跑口已封：等待输入已清、目标已清（resume 无目标可续）")
+        resume()
+        lines.append("\(fmt(isEnded() && !busy)) 续跑实证：终结后调用 resume() 状态不变（仍为终结态、引擎不忙碌，任务不复活）")
+        lines.append("\(fmt(web.executionTabID == nil && !web.uploadSupplyArmed)) 绑定释放：执行页绑定已解除、待供文件未武装")
+        // —— 还原现场 ——
+        status = savedStatus; goal = savedGoal; steps = savedSteps; stepSeq = savedStepSeq
+        waitingInput = savedWaiting; stepLimitPaused = savedStepLimitPaused; conversationTaskID = savedTaskID
+        stateCard = savedStateCard
+        clearSnapshot()
+        lines.append("\(fmt(!busy)) 现场还原：引擎回到演练前的空闲状态（演练快照已一并清除）")
+        return lines
     }
 
     /// 自检二十一（LADDER-FIX）：绕行梯引擎驱动的回路级核查。诊断 D5
@@ -2384,7 +2467,7 @@ struct OpenStall {
     /// 前后保存/恢复引擎的梯账、卡点、步流、目标与预算，结束不留现
     /// 场。不调用模型；要求引擎空闲（驱动会占用执行页打开合成页）。
     func verifyLadderFix() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检二十一未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十一未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines: [String] = []
         func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
         func el(_ href: String) -> PageElement {
@@ -2759,7 +2842,7 @@ struct OpenStall {
     /// 不污染正式 shadow 数据）。不调用模型；要求引擎空闲（驱动会占
     /// 用当前标签页打开合成页）。
     func verifyActionVerificationContract() async -> [String] {
-        guard !busy else { return ["✗ 引擎忙碌中，自检十三 Tier A 未执行（先等当前任务终结或停止）"] }
+        guard !busy else { return ["✗ 引擎忙碌中，自检十三 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         var lines: [String] = []
         let (webLines, records) = await web.verifyActionVerificationContract()
         lines += webLines

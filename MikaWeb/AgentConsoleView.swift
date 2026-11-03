@@ -12,7 +12,7 @@ struct AgentConsoleView: View {
         case .done: return .green
         case .failed: return .red
         case .paused, .waitingConfirm, .waitingManual: return .orange
-        case .idle: return .secondary
+        case .idle, .ended: return .secondary
         }
     }
     var body: some View {
