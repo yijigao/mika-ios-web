@@ -1677,7 +1677,8 @@ enum DirectTargetHarvest {
             lines.append("✗ 合成测试页 test-autonomy 加载失败：\(error.localizedDescription)")
             return lines
         }
-        try? await Task.sleep(for: .milliseconds(1000))        if let harvest = await web.harvestDirectTargets() {
+        try? await Task.sleep(for: .milliseconds(1000))
+        if let harvest = await web.harvestDirectTargets() {
             lines.append("\(fmt(harvest.appmsgid == "100000001" && harvest.url.contains("appmsg_edit"))) 直达提取实测：合成页链接农场提取到 appmsgid=\(harvest.appmsgid)、URL 含 appmsg_edit=\(harvest.url.contains("appmsg_edit"))（期望 100000001/true，模板与 ID 均来自页面真实链接）")
         } else {
             lines.append("✗ 直达提取实测：合成页链接农场未提取到候选")
