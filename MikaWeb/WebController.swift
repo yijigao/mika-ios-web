@@ -943,6 +943,18 @@ enum TCProbeLogStore {
     func goBack() { activeTab.goBack() }
     func goForward() { activeTab.goForward() }
 
+    /// L1 display snapshot. Failure deliberately returns nil so the card falls
+    /// back to its title/status gradient instead of exposing a blank surface.
+    func floatingCardSnapshot() async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            let configuration = WKSnapshotConfiguration()
+            configuration.afterScreenUpdates = false
+            activeTab.webView.takeSnapshot(with: configuration) { image, _ in
+                continuation.resume(returning: image)
+            }
+        }
+    }
+
     // MARK: - 标签管理
 
     /// 新建标签并切换过去（归属查看会话）；urlString 非空时在新页打开该地址。

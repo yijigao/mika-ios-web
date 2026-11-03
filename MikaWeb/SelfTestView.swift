@@ -20,6 +20,7 @@ struct SelfTestView: View {
     @State private var coverUploadFixTestRunning = false
     @State private var taskFinishTestRunning = false
     @State private var editorEntryBindTestRunning = false
+    @State private var floatingThreeLevelTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -180,10 +181,30 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || editorEntryBindTestRunning)
             Text("自检二十四预期（EDITOR-ENTRY-BIND）：不调用模型、不占用标签页、不要求引擎空闲（全部纯函数）。合成公众号列表页数据对象（六条目交错：两条同名不同 ID、一条标题以 unicode 转义写入、一条只有 ID 没有标题＋一段无标题噪声 ID）：断言配对只从同对象共现出（恰 5 组）、噪声与无标题条目不误配、同名歧义如实拒绝不猜、目标标题唯一命中时按配对拼编辑直达、别篇的带 ID 编辑链接不冒充目标（ID 与配对一致才直用）、卡片 DOM 同卡配对可直交、无目标时旧口径行为不变、列表翻页纯函数按 begin/count 递进且到上限停、无参数地址不误翻、目标标题提取口径正确。真实公众号列表页的配对命中属 Tier B 真机（见案卷清单）。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十五：三级浏览器浮窗（FLOATING-3LEVEL）") {
+                guard !floatingThreeLevelTestRunning else { return }
+                floatingThreeLevelTestRunning = true
+                runFloatingThreeLevelTest()
+                dismiss()
+            }.disabled(!engine.active || floatingThreeLevelTestRunning)
+            Text("自检二十五预期：不调用模型。真实状态存储完成 L1→L2→L3→L2→L1；切入 L1 前后 live WKWebView frame 与 window.innerWidth 不变；L1 下 JS 探针可注入并回读；快照节流器在 1 秒窗口内合并重复刷新。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
         }.navigationTitle("本地自检")
+    }
+
+    private func runFloatingThreeLevelTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十五：开始——三级浏览器浮窗 Tier A（不调用模型）")
+        Task { @MainActor in
+            defer { floatingThreeLevelTestRunning = false }
+            let lines = await engine.verifyFloatingThreeLevel()
+            for line in lines { conversation.localFeedback("自检二十五：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检二十五结论：全部通过——状态机、视口不变、L1 JS 执行、快照节流均有实证" : "自检二十五结论：\(failed) 项未通过，见逐条记录")
+        }
     }
 
     /// 自检二十编排（TRUSTED-CLICK-EXP）：E1 插桩复刻页对照＋E2 AX

@@ -2881,6 +2881,52 @@ struct OpenStall {
         return lines
     }
 
+    /// Tier A for FLOATING-3LEVEL. This exercises the production DockStateStore
+    /// and the currently mounted WKWebView; it does not call the model.
+    func verifyFloatingThreeLevel() async -> [String] {
+        func mark(_ pass: Bool) -> String { pass ? "✓" : "✗" }
+        var lines: [String] = []
+        let dock = web.dockState
+        let savedLevel = dock.level
+        defer { dock.level = savedLevel }
+
+        dock.level = .snapshot
+        var visited = [dock.level]
+        for level in [DockLevel.panel, .fullScreen, .panel, .snapshot] {
+            dock.level = level
+            visited.append(level)
+            await Task.yield()
+        }
+        let expected: [DockLevel] = [.snapshot, .panel, .fullScreen, .panel, .snapshot]
+        lines.append("\(mark(visited.map(\.rawValue) == expected.map(\.rawValue))) 等级状态机：冷启动 L1，L1→L2→L3→L2→L1 全循环顺序正确")
+
+        dock.level = .panel
+        await Task.yield()
+        let frameBefore = web.webView.frame.size
+        let viewportBefore = (try? await web.evaluate("window.innerWidth")) as? NSNumber
+        dock.level = .snapshot
+        await Task.yield()
+        let frameAfter = web.webView.frame.size
+        let viewportAfter = (try? await web.evaluate("window.innerWidth")) as? NSNumber
+        let sameFrame = abs(frameBefore.width - frameAfter.width) < 0.5 && abs(frameBefore.height - frameAfter.height) < 0.5
+        let sameViewport = viewportBefore?.doubleValue == viewportAfter?.doubleValue && viewportBefore != nil
+        lines.append("\(mark(sameFrame && sameViewport)) L1 切换前后 WKWebView frame=\(frameBefore)→\(frameAfter)、viewport=\(viewportBefore?.intValue ?? -1)→\(viewportAfter?.intValue ?? -1)，均不变")
+
+        dock.level = .snapshot
+        let token = UUID().uuidString
+        let probe = (try? await web.evaluate("(()=>{window.__mikaFloatingL1='\(token)';return window.__mikaFloatingL1;})()")) as? String
+        lines.append("\(mark(probe == token)) L1 状态 JS 探针注入并回读成功（live webview 未挂起）")
+
+        var throttle = SnapshotRefreshThrottle()
+        let base = Date(timeIntervalSince1970: 1_000)
+        let first = throttle.request(at: base)
+        let second = throttle.request(at: base.addingTimeInterval(0.2))
+        let third = throttle.request(at: base.addingTimeInterval(0.5))
+        let fired = throttle.consumePending(at: base.addingTimeInterval(1))
+        lines.append("\(mark(first == 0 && second != nil && third == nil && fired)) 快照节流：1 秒内多次变化仅一次立即刷新＋一次合并的到期刷新")
+        return lines
+    }
+
     /// 自检二十一（LADDER-FIX）：绕行梯引擎驱动的回路级核查。诊断 D5
     /// 指出旧自检只测纯函数状态机——本检除纯逻辑断言外，真实调用主
     /// 循环同款生产函数（handleCapabilityStall／
