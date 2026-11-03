@@ -399,6 +399,12 @@ struct OpenStall {
     mutating func markNA(_ means: StallMeans, reason: String) {
         if !verified.contains(means), notApplicable[means] == nil { notApplicable[means] = reason }
     }
+    /// 弹窗点按无响应信号（执行层 frame 感知关闭连败）：记「已真实
+    /// 出手」并同时构成 frameClose 项的验收实证。
+    mutating func noteFrameCloseSignal() {
+        frameCloseTried = true
+        verify(.frameClose)
+    }
     mutating func noteClickTarget(_ key: String) {
         clickExecuted = true
         clickedTargets.insert(key)
@@ -1703,8 +1709,7 @@ struct OpenStall {
                 // 用既有直达弹窗导航绕行口径，绕行失败 → 失败结案。
                 if Self.modalInterventionText(for: error) != nil {
                     if var stall = openStall {
-                        stall.frameCloseTried = true
-                        stall.verify(.frameClose)
+                        stall.noteFrameCloseSignal()
                         openStall = stall
                         appendStep("click", "弹窗点按无响应（能力卡点）：frame 感知关闭连败已计入在开卡点的证据（第 1 级 frame 感知关闭项验收），引擎将按绕行梯继续推进（直达 URL／弹窗导航绕行），不停车等用户代劳")
                         persistSnapshot()
@@ -2061,8 +2066,7 @@ struct OpenStall {
         // 卡点在开时（LADDER-FIX）：frame 感知关闭连败先记入卡点账
         // （第 1 级 frameClose 项的实证），绕行成功即关卡点
         if var stall = openStall {
-            stall.frameCloseTried = true
-            stall.verify(.frameClose)
+            stall.noteFrameCloseSignal()
             openStall = stall
         }
         if !bypassLadder.attempted.contains(.existingMeans) {
