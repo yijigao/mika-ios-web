@@ -76,6 +76,127 @@ struct StepBudget: Equatable {
     }
 }
 
+/// 介入分类（AUTONOMY-FIX）：一切「停车等用户」的触发点先分类——
+/// · safety（安全类）：命中 SafetyPolicy 既有类别（付款/授权确认、密码、
+///   验证码、扫码、人脸实名、发表确认）与 SP-01 上传确认。停车照旧。
+///   分类只读引用 SafetyPolicy 的判定（check／uploadDecision 的返回
+///   值），SafetyPolicy 本身零改动；安全类触发点在调用处直接认定，
+///   不经文本启发式。
+/// · capability（能力类）：入口点不开、弹窗关不掉一类 agent 能力卡点
+///   （Joey 2026-11-03 10:06 亲令：「发文章不该让我出面，任务是让他
+///   自己完成的」）——禁止停车等用户代劳，改走绕行梯（BypassLadder），
+///   梯尽走失败结案出口。
+/// · clarify（澄清类）：ask_user 的任务歧义问答（要信息／要选择），
+///   停车等待照旧，不在收紧范围。
+enum InterventionKind: String, Equatable { case safety, capability, clarify }
+
+/// 介入分类门（AUTONOMY-FIX）：纯函数，可程序化自检（自检十八）。
+enum InterventionGate {
+    /// ask_user 的分类：模型声明优先（manual／capability＝请用户亲手
+    /// 操作网页→能力类）；声明 clarify 但问题文本明显是请用户操作
+    /// 网页时以文本为准（防声明绕门）；未声明时纯按文本兜底；其余
+    /// 一律澄清——收紧只针对「等你亲手操作网页」这一类，不误伤问答。
+    static func classifyAskUser(declared: String, question: String) -> InterventionKind {
+        let d = declared.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if d == "manual" || d == "capability" { return .capability }
+        if asksUserToOperatePage(question) { return .capability }
+        return .clarify
+    }
+
+    /// 「请用户亲手操作网页」的措辞标记（能力类的文本兜底判定）。
+    static func asksUserToOperatePage(_ text: String) -> Bool {
+        let markers = ["亲手", "手动点", "手动打开", "手动关闭", "手动操作",
+                       "请在网页", "请在页面", "请你点", "请您点", "你来点",
+                       "帮我点", "帮我打开", "帮忙点", "帮忙打开",
+                       "点一下弹窗", "打开编辑页", "打开这个页面", "关闭弹窗",
+                       "在网页上点", "在页面上点"]
+        return markers.contains { text.contains($0) }
+    }
+
+    /// 失败结案文案（梯尽出口）：卡点＋已试路径＋页面证据。自检十八
+    /// 对措辞做负断言——不得出现请用户代劳的话（亲手／手动／请用户）。
+    static func failureSummary(stuck: String, ladder: BypassLadder, evidence: String) -> String {
+        let tried = ladder.summary.isEmpty ? "（无可用绕行梯级）" : ladder.summary
+        return "任务未能自主完成：\(stuck)。已试路径：\(tried)。页面证据：\(evidence)。本任务按失败结案处理，未完成的步骤与原因已如实记录如上。"
+    }
+}
+
+/// 绕行梯（AUTONOMY-FIX）：能力类卡点的分级绕行状态——尝试记录与
+/// 梯级推进是纯逻辑（可程序化自检），驱动在 AgentEngine。梯级只升
+/// 不降、每级只试一轮（与循环熔断 3/5/7 的口径不冲突、不重置它）：
+/// ①existingMeans 既有手段轮试（frame 感知关闭、揭示复判、站点模式、
+/// 替代入口、坐标点击）；②directURL 直达 URL（模板与 ID 均从页面已
+/// 有链接实证提取）；③dialogNavBypass 弹窗导航绕行（非编辑页重载；
+/// 编辑页先保存回读落定→离开→直达返回）。全部试过＝梯尽。
+struct BypassLadder: Equatable {
+    enum Rung: String, CaseIterable {
+        case existingMeans, directURL, dialogNavBypass
+        var label: String {
+            switch self {
+            case .existingMeans: return "既有手段轮试"
+            case .directURL: return "直达 URL"
+            case .dialogNavBypass: return "弹窗导航绕行"
+            }
+        }
+    }
+    private(set) var attempted: [Rung] = []
+    private(set) var notes: [String] = []
+
+    /// 下一级未试梯级（按声明顺序）；nil＝梯尽。
+    var nextRung: Rung? { Rung.allCases.first { !attempted.contains($0) } }
+    var exhausted: Bool { nextRung == nil }
+
+    mutating func markAttempted(_ rung: Rung, note: String) {
+        if !attempted.contains(rung) { attempted.append(rung) }
+        notes.append("\(rung.label)：\(note)")
+    }
+
+    /// 已试路径的人读汇总（进失败结案文案与步流）。
+    var summary: String { notes.joined(separator: "；") }
+
+    init() {}
+    /// 快照往返构造：梯级以 rawValue 数组落盘（旧快照无此二键时梯账为空）。
+    init(attemptedRaw: [String], notes: [String]) {
+        attempted = attemptedRaw.compactMap { Rung(rawValue: $0) }
+        self.notes = notes
+    }
+    var attemptedRaw: [String] { attempted.map { $0.rawValue } }
+}
+
+/// 直达 URL 的实证提取（AUTONOMY-FIX 梯级②，纯函数）：模板只从页面
+/// 已有链接提取，绝不凭记忆编造——收集到的 href 里：
+/// ①已有带 appmsgid 的编辑链接（appmsg_edit）→ 直接用它（模板与 ID
+/// 同源实证）；②只有不带 ID 的编辑链接模板、且别处链接带 appmsgid
+/// → 以实证 ID 拼到模板上；③无 ID 或无模板 → nil（此级失败）。
+enum DirectTargetHarvest {
+    struct Result: Equatable { let url: String; let appmsgid: String; let viaTemplate: Bool }
+
+    static func build(hrefs: [String]) -> Result? {
+        var knownIDs: [String] = []
+        var directEdit: (url: String, id: String)?
+        var editTemplate: String?
+        for href in hrefs {
+            let id = firstMatch(href, pattern: "appmsgid=(\\d+)")
+            if let id, !knownIDs.contains(id) { knownIDs.append(id) }
+            if href.contains("appmsg_edit"), href.contains("://") {
+                if let id { if directEdit == nil { directEdit = (href, id) } }
+                else if editTemplate == nil { editTemplate = href }
+            }
+        }
+        if let directEdit { return Result(url: directEdit.url, appmsgid: directEdit.id, viaTemplate: false) }
+        guard let template = editTemplate, let id = knownIDs.first else { return nil }
+        let separator = template.contains("?") ? "&" : "?"
+        return Result(url: template + separator + "appmsgid=" + id, appmsgid: id, viaTemplate: true)
+    }
+
+    private static func firstMatch(_ text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+}
+
 @MainActor final class AgentEngine: ObservableObject {
     @Published var taskText = ""
     @Published private(set) var status: AgentStatus = .idle
@@ -158,6 +279,9 @@ struct StepBudget: Equatable {
     /// 「loop」步留在历史里，模型与用户都看得见）。
     private var loopDetector = LoopDetector()
     private var pendingLoopHint: String?
+    /// 绕行梯现场（AUTONOMY-FIX）：能力类卡点的已试梯级与逐级留痕，
+    /// 随任务存活、随快照落盘（恢复后已试梯级不重走）。
+    private var bypassLadder = BypassLadder()
     /// 本任务已加载的 playbook（ADOPTION-TOP3 第 3 条）：名称防重复加载，正文
     /// 随每次模型调用注入任务上下文；playbook 只是提示层，安全判定不读它。
     private var loadedSkillNames: [String] = []
@@ -314,6 +438,8 @@ struct StepBudget: Equatable {
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
+        // 绕行梯随新任务重置（AUTONOMY-FIX）：每个任务从梯级①重新开始
+        bypassLadder = BypassLadder()
         // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
@@ -764,9 +890,20 @@ struct StepBudget: Equatable {
                             return
                         }
                         if action.action == "ask_user" {
-                            record(action); waitingInput = .question(id: UUID(), text: action.question)
-                            status = .waitingManual(action.question); persistSnapshot()
-                            return
+                            record(action)
+                            // 介入分类门（AUTONOMY-FIX）：ask_user 先分类——
+                            // 澄清类（任务歧义问答）照旧停车等待，不收紧；
+                            // 能力类（请用户亲手操作网页）拒绝停车，改走
+                            // 绕行梯：驱动成功则本轮继续循环，梯尽由
+                            // handleCapabilityStall 抛失败结案错误。
+                            switch InterventionGate.classifyAskUser(declared: action.askKind, question: action.question) {
+                            case .capability:
+                                try await handleCapabilityStall(stuck: "模型请求用户亲手操作网页：\(action.question)", token: token)
+                            case .safety, .clarify:
+                                waitingInput = .question(id: UUID(), text: action.question)
+                                status = .waitingManual(action.question); persistSnapshot()
+                                return
+                            }
                         }
                         // 本轮的循环检测指纹（动作＋目标＋结果），分支内赋值、分支后统一裁决
                         var loopFingerprint: String?
@@ -881,11 +1018,11 @@ struct StepBudget: Equatable {
                                 persistSnapshot()
                                 return
                             case .severe:
-                                appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已下达最后换路指令（无路可换时须按求助口径交代已试路径），再重复将自动停下")
-                                pendingLoopHint = "严重警告（最后一次换路机会）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果始终没有变化。若下一步仍原样重复，任务将自动停下交用户决定。必须换路：换入口／换目标，或用 set_site_mode 换站点模式，或按页面规则／说明里写明的官方路径 navigate 到同功能的电脑版站点／官方后台。若确实已无替代路径，才可以 ask_user 求助——并且必须先交代已试过的每条路径与各自的卡点，再提出需要用户做的那一步。求助是最后手段，不是默认出口。"
+                                appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已下达最后换路指令（无路可换时在 ask_user 里如实交代卡点与已试路径，引擎走绕行梯/失败结案），再重复将自动停下")
+                                pendingLoopHint = "严重警告（最后一次换路机会）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果始终没有变化。若下一步仍原样重复，任务将自动停下交用户决定。必须换路：换入口／换目标，或用 set_site_mode 换站点模式，或按页面规则／说明里写明的官方路径 navigate 到同功能的电脑版站点／官方后台。若确实已无替代路径，可以用 ask_user 如实交代卡点——先写清已试过的每条路径与各自的卡点；不要请用户亲手操作网页（能力类卡点引擎不停车，会走绕行梯、梯尽按失败结案）。求助只许用于任务歧义澄清。"
                             case .warning:
                                 appendStep("loop", "循环提醒：同一动作已重复 \(verdict.count) 次且结果未变，下一步提示已升级为必须换路指令（禁止原样重试）")
-                                pendingLoopHint = "警告（必须换路）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果没有变化。下一步禁止原样重试，必须换一种做法：换入口／换目标，或用 set_site_mode 换站点模式，或先读页面规则／说明、按其中写明的官方路径 navigate 到同功能的电脑版站点／官方后台。还没试过至少两条替代路径之前，不要 ask_user 求助。"
+                                pendingLoopHint = "警告（必须换路）：你已对同一目标重复执行同一动作 \(verdict.count) 次，页面结果没有变化。下一步禁止原样重试，必须换一种做法：换入口／换目标，或用 set_site_mode 换站点模式，或先读页面规则／说明、按其中写明的官方路径 navigate 到同功能的电脑版站点／官方后台。不要用 ask_user 请用户代劳（能力类卡点不停车）；ask_user 只许用于任务歧义澄清。"
                             case .none:
                                 break
                             }
@@ -992,15 +1129,22 @@ struct StepBudget: Equatable {
         } catch {
             guard token == generation else { throw CancellationError() }
             if error is CancellationError { throw error }
-            // 弹窗点按无响应（COVER-CONSENT）：已确认动作同样过不去时不判
-            // 失败、不把 pending 放回重确认（再确认只会再连败一次）——转
-            // 人工介入，用户亲手点完弹窗、点继续后由主循环按现状续跑。
-            if let intervention = Self.modalInterventionText(for: error) {
-                appendStep("click", "弹窗点按转人工：\(intervention)")
-                waitingInput = .manual(id: UUID(), text: intervention)
-                status = .waitingManual(intervention)
-                persistSnapshot()
-                return .halted
+            // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改）：这是
+            // 能力类卡点——不判失败、不停车等用户代劳，也不再把 pending
+            // 放回原样重确认（弹窗还在，再确认只会再连败一次）。改走
+            // 绕行梯弹窗导航绕行：成功（弹窗已消失）→ 已确认动作原样
+            // 放回等待确认，用户在干净页面上重新确认（确认本身属安全
+            // 类、仍由用户点，引擎不代行）；绕行失败 → 失败结案。
+            if Self.modalInterventionText(for: error) != nil {
+                appendStep("click", "弹窗点按无响应（能力卡点）：不停车等用户代劳，改走绕行梯（弹窗导航绕行）")
+                if await driveDialogBypass(token: token) {
+                    pending = saved
+                    appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，已确认动作放回等待确认——请在干净页面上重新确认（确认属安全类，仍由用户点）")
+                    status = .waitingConfirm(saved.0)
+                    persistSnapshot()
+                    return .halted
+                }
+                throw await capabilityFailureError(stuck: "已确认动作被无响应弹窗挡住：\(saved.0.reason)")
             }
             guard let kind = Self.transientKind(of: error) else { throw error }
             writeTransientDiagnostic(kind: kind, error: error, streak: 0)
@@ -1244,13 +1388,17 @@ struct StepBudget: Equatable {
                 }
                 return .executed
             } catch {
-                // 弹窗点按无响应（COVER-CONSENT）：不是失效类错误，重找
-                // 重试只会再连败——直接转人工介入等用户亲手点弹窗。
-                if let intervention = Self.modalInterventionText(for: error) {
-                    appendStep("click", "弹窗点按转人工：\(intervention)")
-                    waitingInput = .manual(id: UUID(), text: intervention)
-                    status = .waitingManual(intervention)
-                    return .waiting
+                // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改）：
+                // 能力类卡点，不是失效类错误，重找重试只会再连败——不
+                // 停车等用户代劳，改走绕行梯：弹窗导航绕行成功 → 按
+                // 策略切换交模型按新快照重新判断；绕行失败 → 失败结案。
+                if Self.modalInterventionText(for: error) != nil {
+                    appendStep("click", "弹窗点按无响应（能力卡点）：不停车等用户代劳，改走绕行梯（弹窗导航绕行）")
+                    if await driveDialogBypass(token: token) {
+                        appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，请按最新页面重新判断")
+                        return .strategySwitch
+                    }
+                    throw await capabilityFailureError(stuck: "弹窗点按无响应，目标「\(label)」被弹窗挡住")
                 }
                 guard Self.isStaleTargetError(error), refinds < 2 else { throw error }
                 refinds += 1
@@ -1276,21 +1424,22 @@ struct StepBudget: Equatable {
         return .strategySwitch
     }
 
-    /// 弹窗点按无响应的转介入判定（COVER-CONSENT，缺陷 A）：执行层以
-    /// WebController.modalUnresponsivePrefix 抛错＝弹窗内的按钮经完整点按
-    /// 序列连败 2 次仍在——合成点按（isTrusted=false）过不去，只能请用户
-    /// 亲手点按。命中返回给用户的介入文案：runTargeted 自主路径与
-    /// runConfirmed 确认路径共用同一判定，两处都转 .manual 等待（用户点
-    /// 完弹窗后点继续，主循环按页面现状续跑），不判失败、不静默重试、
-    /// 不假装已同意。不命中返回 nil，错误照原有分类处理。
+    /// 弹窗点按无响应的分类门信号判定（COVER-CONSENT 立、AUTONOMY-FIX
+    /// 改定位）：执行层以 WebController.modalUnresponsivePrefix 抛错＝
+    /// 弹窗内按钮经完整点按序列与 frame 感知关闭连败、弹窗仍在——这是
+    /// 能力类卡点（合成点按过不去），不是安全类。命中返回非 nil 作为
+    /// 触发信号：runTargeted 自主路径与 runConfirmed 确认路径共用同一
+    /// 判定，两处都不再停车等用户代劳——改走绕行梯（弹窗导航绕行），
+    /// 梯尽走失败结案。返回值本身不再作为给用户的介入文案展示。
+    /// 不命中返回 nil，错误照原有分类处理。
     static func modalInterventionText(for error: Error) -> String? {
         guard let mika = error as? MikaError, mika.message.hasPrefix(WebController.modalUnresponsivePrefix) else { return nil }
-        return "页面上的弹窗没有响应自动点按（已升级为完整点按序列仍无效——合成点按不是真实点按，部分网页只认真实点按）。请在网页上亲手点一下弹窗里的按钮（例如「同意」），弹窗关闭后点「继续」；在此之前不要声称已经取得同意。"
+        return "弹窗点按无响应（能力类卡点信号，AUTONOMY-FIX）"
     }
 
     /// 自检十一 Tier A 组合（COVER-CONSENT）：封面自产核查（CoverGenerator
-    /// 程序化）＋弹窗点按核查（WebController 在合成页真实驱动）＋转介入
-    /// 判定函数双向核对（弹窗错误命中介入文案、普通错误不误触发）。
+    /// 程序化）＋弹窗点按核查（WebController 在合成页真实驱动）＋分类门
+    /// 信号判定双向核对（弹窗错误命中能力类信号、普通错误不误触发）。
     /// 不调用模型；要求引擎空闲（弹窗核查会占用当前标签页打开合成页）。
     /// 自检十四·Tier A（WECHAT-COVER-FIX Part A）：弹窗 frame 探针——
     /// 委托 WebController 在合成页 test-frames 上实测（同源/跨源 frame
@@ -1315,8 +1464,234 @@ struct StepBudget: Equatable {
         lines += await web.verifyModalClickEscalation()
         let probe = MikaError("\(WebController.modalUnresponsivePrefix)：合成样本")
         lines.append(Self.modalInterventionText(for: probe) != nil && Self.modalInterventionText(for: MikaError("其它错误样本")) == nil
-            ? "✓ 转介入判定：弹窗无响应错误命中介入文案、普通错误不误触发（自主/确认两条执行路径共用同一判定）"
-            : "✗ 转介入判定异常")
+            ? "✓ 分类门信号判定：弹窗无响应错误命中能力类信号、普通错误不误触发（自主/确认两条执行路径共用同一判定，命中后走绕行梯不停车）"
+            : "✗ 分类门信号判定异常")
+        return lines
+    }
+
+    // MARK: - 绕行梯驱动（AUTONOMY-FIX）
+
+    /// 合成 click 动作构造（自检与绕行梯共用；AgentAction 只有
+    /// Decodable 初始化，走 JSON 解码构造）。
+    private static func clickAction(index: Int, reason: String) -> AgentAction? {
+        let dict: [String: Any] = ["action": "click", "index": index, "reason": reason]
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(AgentAction.self, from: data)
+    }
+
+    /// 失败结案的页面证据：当前页地址/标题＋可见文本摘要（只作证据，
+    /// 不含凭据类内容——页面文本本就是模型每轮可见的快照同源数据）。
+    private func currentPageEvidence() async -> String {
+        if let page = try? await web.state() {
+            return "当前页 \(page.url)（标题：\(page.title)），可见文本摘要：\(String(page.text.prefix(120)))"
+        }
+        return "当前页状态读取失败"
+    }
+
+    /// 梯尽失败结案错误：文案由分类门组装（卡点＋已试路径＋页面证据，
+    /// 不出现请用户代劳的措辞），由 launch 外层 catch 置 .failed 收口。
+    private func capabilityFailureError(stuck: String) async -> MikaError {
+        MikaError(InterventionGate.failureSummary(stuck: stuck, ladder: bypassLadder, evidence: await currentPageEvidence()))
+    }
+
+    /// 能力类卡点处理（AUTONOMY-FIX）：分类门拒绝停车后调用——按绕行
+    /// 梯逐级尝试（每级只试一轮、逐级留痕进梯账与步流），任一级驱动
+    /// 成功即返回（主循环在本轮继续）；梯尽抛失败结案错误。
+    private func handleCapabilityStall(stuck: String, token: UUID) async throws {
+        while let rung = bypassLadder.nextRung {
+            try await checkpoint(token)
+            switch rung {
+            case .existingMeans:
+                // 梯级①：既有手段由模型在后续轮次逐项轮试（引擎的揭示
+                // 复判/frame 感知关闭在点击路径内自动在场），本级以指令
+                // 注入＋留痕完成，模型试完仍卡住会再发 ask_user 推进梯级
+                bypassLadder.markAttempted(.existingMeans, note: "已下达既有手段轮试指令（揭示复判／站点模式／替代入口／坐标点击／frame 感知关闭各一轮）")
+                appendStep("bypass", "能力卡点不停车（自主完成口径）：\(stuck)。绕行梯第 1 级「既有手段轮试」——模型接下来逐项试：入口先揭示复判再点、换站点模式、找同功能替代入口、坐标点击、弹窗走 frame 感知关闭；每项只试一轮，仍卡住再发 ask_user 只说明卡点，引擎将推进到直达 URL 一级")
+                pendingLoopHint = "【能力卡点·绕行梯进行中】刚才的卡点属于能力类，按自主完成口径不许停下等用户亲手操作。现在逐项试既有手段（每项一轮）：①入口先 scroll 揭示再点（引擎点前会自动揭示复判）；②set_site_mode 换站点模式；③站内同功能替代入口；④坐标点击；⑤弹窗照常 click（引擎有 frame 感知关闭）。都试过仍卡住时，再用 ask_user 只说明卡点与已试路径（不要请用户代劳），引擎会推进绕行梯下一级。"
+                persistSnapshot()
+                return
+            case .directURL:
+                if let harvest = await web.harvestDirectTargets() {
+                    do {
+                        executionSerial += 1
+                        try await web.loadOnExecutionTab(harvest.url)
+                    } catch {
+                        // 候选地址导航失败：记为此级失败、推进下一级，
+                        // 不让一个坏候选杀掉整个任务
+                        bypassLadder.markAttempted(.directURL, note: "实证提取到 appmsgid=\(harvest.appmsgid) 的候选，但导航失败：\(error.localizedDescription)")
+                        appendStep("bypass", "绕行梯第 2 级「直达 URL」导航失败（appmsgid=\(harvest.appmsgid)）：\(error.localizedDescription)，推进下一级")
+                        continue
+                    }
+                    bypassLadder.markAttempted(.directURL, note: "从页面已有链接实证提取 appmsgid=\(harvest.appmsgid)（\(harvest.viaTemplate ? "以页面内编辑链接模板拼出" : "页面内已有带 ID 的编辑链接")），已导航直达")
+                    appendStep("bypass", "绕行梯第 2 级「直达 URL」：已从当前页链接实证提取目标（appmsgid=\(harvest.appmsgid)），直接导航到编辑页：\(harvest.url)")
+                    try await checkpoint(token)
+                    _ = await web.settledCapture()
+                    pendingLoopHint = "【能力卡点·绕行梯进行中】引擎已用直达 URL 打开目标页（模板与 ID 均取自页面已有链接实证）。请按最新页面快照继续完成任务；若仍被弹窗等卡住，再用 ask_user 只说明卡点，引擎将推进到弹窗导航绕行一级。"
+                    persistSnapshot()
+                    return
+                }
+                bypassLadder.markAttempted(.directURL, note: "当前页链接中提取不到目标 ID 或编辑链接模板，此级无候选（不凭记忆编造 URL）")
+                appendStep("bypass", "绕行梯第 2 级「直达 URL」无候选：当前页链接里提取不到目标 ID 与编辑链接模板（不凭记忆编造 URL），推进下一级")
+            case .dialogNavBypass:
+                let outcome = await attemptDialogNavBypass(token: token)
+                bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
+                appendStep("bypass", "绕行梯第 3 级「弹窗导航绕行」：\(outcome.note)")
+                persistSnapshot()
+                if outcome.success { return }
+            }
+        }
+        throw await capabilityFailureError(stuck: stuck)
+    }
+
+    /// 弹窗能力卡点的绕行驱动（AUTONOMY-FIX，runTargeted／runConfirmed
+    /// 共用）：执行层自身的 frame 感知关闭即梯级①的实证（已在抛错前
+    /// 试过并连败），此处补记后走梯级③弹窗导航绕行。返回 true＝弹窗
+    /// 已消失、页面可继续；false＝可用梯级已尽（梯账已记全，调用方
+    /// 走失败结案）。
+    private func driveDialogBypass(token: UUID) async -> Bool {
+        if !bypassLadder.attempted.contains(.existingMeans) {
+            bypassLadder.markAttempted(.existingMeans, note: "执行层 frame 感知关闭（框内五阶段）已在抛错前试过并连败")
+        }
+        if bypassLadder.attempted.contains(.dialogNavBypass) { return false }
+        let outcome = await attemptDialogNavBypass(token: token)
+        bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
+        appendStep("bypass", "弹窗导航绕行：\(outcome.note)")
+        persistSnapshot()
+        return outcome.success
+    }
+
+    /// 绕行梯第 3 级（AUTONOMY-FIX）：弹窗导航绕行——
+    /// · 非编辑页：直接重载执行页（无未保存状态可丢），复查 frame 普查；
+    /// · 编辑页：先点「保存／存草稿」（过 SafetyPolicy 须 .allow 才点，
+    ///   点后 settle 回读落定才许离开），再导航到同源根、经原地址返回，
+    ///   复查普查。找不到保存入口或保存证据未稳 → 此级失败并记原因
+    ///   （不赌未存内容）。成功只认「绕行前弹窗签名在复查中全部消失」。
+    /// · 正文往返不丢稿的最终判据在页面回读（模型下一轮快照），本函数
+    ///   只保证「离开前保存已落定」这一前提；真编辑器往返属 Tier B
+    ///   真机验证项（见案卷未证项），不得据本函数声称已验不丢稿。
+    private func attemptDialogNavBypass(token: UUID) async -> (success: Bool, note: String) {
+        let before = await web.dialogCensus()
+        guard !before.hits.isEmpty else { return (false, "绕行前 frame 普查未发现弹窗，此级不适用") }
+        let sigsBefore = Set(before.hits.map { $0.sig })
+        guard let page = try? await web.state() else { return (false, "页面状态读取失败") }
+        let originalURL = page.url
+        let isEditor = originalURL.contains("appmsg_edit") || page.elements.contains { $0.editable }
+        if !isEditor {
+            web.reloadExecutionTab()
+            try? await Task.sleep(for: .milliseconds(800))
+            _ = await web.settledCapture()
+            let after = await web.dialogCensus()
+            let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+            return gone
+                ? (true, "成功（非编辑页重载绕行）：重载前弹窗 \(sigsBefore.count) 个，重载后原弹窗签名全部消失")
+                : (false, "非编辑页重载后弹窗仍在（普查：\(after.summary)）")
+        }
+        guard let saveElement = page.elements.first(where: { element in
+            (element.text.contains("保存") || element.text.contains("存草稿")) && !element.disabled
+        }) else { return (false, "编辑页未找到可点的保存/存草稿入口，不赌未保存内容，此级失败") }
+        guard let saveAction = Self.clickAction(index: saveElement.index, reason: "弹窗导航绕行前先存草稿") else {
+            return (false, "保存动作构造失败，此级失败")
+        }
+        guard SafetyPolicy.check(saveAction, saveElement) == .allow else {
+            return (false, "保存入口未过安全策略（非 .allow），不代点，此级失败")
+        }
+        do { try await web.execute(saveAction, expected: saveElement) } catch {
+            return (false, "保存点击抛错：\(error.localizedDescription)")
+        }
+        let settled = await web.settledCapture()
+        guard settled.settled else { return (false, "保存后页面证据未稳（settle 超时），不赌未落定状态，此级失败") }
+        guard let url = URL(string: originalURL), let scheme = url.scheme, let host = url.host else {
+            return (false, "原页地址不可解析，此级失败")
+        }
+        do {
+            try await web.loadOnExecutionTab("\(scheme)://\(host)/")
+            try? await Task.sleep(for: .milliseconds(500))
+            try await web.loadOnExecutionTab(originalURL)
+        } catch { return (false, "导航往返抛错：\(error.localizedDescription)") }
+        _ = await web.settledCapture()
+        let after = await web.dialogCensus()
+        let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+        return gone
+            ? (true, "成功（编辑页往返绕行）：先保存并 settle 回读落定→离开→直达返回后，原弹窗签名全部消失；正文完整以模型下一轮回读为准")
+            : (false, "编辑页往返后弹窗仍在（普查：\(after.summary)）")
+    }
+
+    /// 自检十八（AUTONOMY-FIX）：自主完成逻辑核查——纯函数部分
+    /// （分类门／安全类回归／绕行梯状态机／结案文案措辞／直达提取）
+    /// 在此程序化断言；合成页驱动部分（链接农场 harvest 实测＋弹窗
+    /// 导航绕行实测＋全程无停车态）在 verifyAutonomy 里接续。
+    static func verifyAutonomyGate() -> [String] {
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        // —— 分类门：ask_user 分流 ——
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "", question: "请在网页上亲手点一下弹窗里的「取消」按钮") == .capability)) 分类门·能力类甲：请用户亲手点弹窗（现场原例）→ capability（拒绝停车）")
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "", question: "草稿列表入口点不开，请你手动打开编辑页继续") == .capability)) 分类门·能力类乙：请用户手动打开编辑页（现场原例）→ capability（拒绝停车）")
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "manual", question: "这一步需要处理一下") == .capability)) 分类门·声明优先：askKind=manual → capability（不看文本）")
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "clarify", question: "请帮我打开编辑页") == .capability)) 分类门·防绕门：声明 clarify 但文本是请用户操作网页 → capability（以文本为准）")
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "clarify", question: "这篇文章的目标读者是学生还是职场人？") == .clarify)) 分类门·澄清类：任务歧义问答 → clarify（照旧停车等待，不收紧）")
+        lines.append("\(fmt(InterventionGate.classifyAskUser(declared: "", question: "封面用深色版式还是浅色版式？") == .clarify)) 分类门·未声明兜底：无操作网页措辞的选择题 → clarify")
+        // —— 安全类回归：分类门放行停车的依据（只读引用 SafetyPolicy）——
+        func element(text: String, inputType: String = "", sensitive: Bool = false) -> PageElement {
+            PageElement(index: 0, tag: "button", type: "", text: text, placeholder: "", href: "", name: "", inputType: inputType, ariaLabel: "", nameSource: "text", inView: true, sensitive: sensitive, disabled: false, editable: false)
+        }
+        let clickPay = Self.clickAction(index: 0, reason: "自检十八")
+        lines.append("\(fmt(clickPay != nil && SafetyPolicy.check(clickPay!, element(text: "确认付款")) == .confirm)) 安全类回归·付款确认：SafetyPolicy 对「确认付款」→ .confirm（照常停车等用户确认）")
+        let typeAction = (try? JSONSerialization.data(withJSONObject: ["action": "type", "index": 0, "text": "x"])).flatMap { try? JSONDecoder().decode(AgentAction.self, from: $0) }
+        lines.append("\(fmt(typeAction != nil && SafetyPolicy.check(typeAction!, element(text: "", inputType: "password")) == .manual)) 安全类回归·密码字段：type 进 password 字段 → .manual（照常停车手输）")
+        lines.append("\(fmt(SafetyPolicy.uploadDecision(isTaskGenerated: false) == .confirm && SafetyPolicy.uploadDecision(isTaskGenerated: true) == .allow)) 安全类回归·SP-01：非本任务生成文件上传 → .confirm（确认卡照旧）；本任务生成 → .allow")
+        // —— 绕行梯状态机 ——
+        var ladder = BypassLadder()
+        let orderOK = ladder.nextRung == .existingMeans && !ladder.exhausted
+        ladder.markAttempted(.existingMeans, note: "样本一")
+        let midOK = ladder.nextRung == .directURL
+        ladder.markAttempted(.directURL, note: "样本二")
+        ladder.markAttempted(.dialogNavBypass, note: "样本三")
+        lines.append("\(fmt(orderOK && midOK && ladder.exhausted && ladder.nextRung == nil)) 绕行梯状态机：梯级按 既有手段→直达 URL→弹窗导航绕行 逐级推进，三级试完梯尽（exhausted）")
+        let restored = BypassLadder(attemptedRaw: ladder.attemptedRaw, notes: ladder.notes)
+        lines.append("\(fmt(restored == ladder && restored.summary.contains("样本二"))) 绕行梯快照往返：已试梯级与留痕经 rawValue 数组往返后不变（恢复后不重走已试梯级）")
+        // —— 失败结案文案：要素齐全＋无请用户代劳措辞 ——
+        let summary = InterventionGate.failureSummary(stuck: "弹窗关不掉", ladder: ladder, evidence: "当前页 https://example.com/（合成）")
+        let banned = ["亲手", "请用户", "手动点", "手动打开", "请你点"].filter { summary.contains($0) }
+        lines.append("\(fmt(summary.contains("弹窗关不掉") && summary.contains("样本一") && summary.contains("example.com") && banned.isEmpty)) 失败结案文案：含卡点＋已试路径＋页面证据，且无请用户代劳措辞（命中禁用词：\(banned.joined(separator: "、"))）")
+        // —— 直达提取三路 ——
+        let direct = DirectTargetHarvest.build(hrefs: ["https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&appmsgid=100000001&token=1"])
+        lines.append("\(fmt(direct?.appmsgid == "100000001" && direct?.viaTemplate == false && direct?.url.contains("appmsg_edit") == true)) 直达提取·直用：带 ID 的编辑链接直接采用（模板与 ID 同源实证）")
+        let templated = DirectTargetHarvest.build(hrefs: ["https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit", "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_list&appmsgid=100000002"])
+        lines.append("\(fmt(templated?.appmsgid == "100000002" && templated?.viaTemplate == true && templated?.url.contains("appmsgid=100000002") == true)) 直达提取·模板拼装：无 ID 模板＋别处实证 ID → 拼出候选")
+        let none = DirectTargetHarvest.build(hrefs: ["https://example.com/about", "https://example.com/list"])
+        lines.append("\(fmt(none == nil)) 直达提取·无候选：无 ID 无模板 → nil（此级失败，不凭记忆编造 URL）")
+        return lines
+    }
+
+    /// 自检十八·合成页驱动（AUTONOMY-FIX）：在 test-autonomy 上实测
+    /// 链接农场 harvest、弹窗在场基线与弹窗导航绕行（非编辑页重载
+    /// 分支），并断言全程未进入停车态。不调用模型；要求引擎空闲。
+    func verifyAutonomy() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检十八未执行（先等当前任务终结或停止）"] }
+        var lines = Self.verifyAutonomyGate()
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        // 合成页用 window.name 模拟「重载即消失」的会话级弹窗：重复跑
+        // 自检时先清掉该标记，保证每次都从弹窗在场的基线开始
+        _ = try? await web.evaluate("(()=>{window.name='';return 'reset';})()")
+        do { try web.loadLocalOnExecutionTab("test-autonomy") } catch {
+            lines.append("✗ 合成测试页 test-autonomy 加载失败：\(error.localizedDescription)")
+            return lines
+        }
+        try? await Task.sleep(for: .milliseconds(1000))        if let harvest = await web.harvestDirectTargets() {
+            lines.append("\(fmt(harvest.appmsgid == "100000001" && harvest.url.contains("appmsg_edit"))) 直达提取实测：合成页链接农场提取到 appmsgid=\(harvest.appmsgid)、URL 含 appmsg_edit=\(harvest.url.contains("appmsg_edit"))（期望 100000001/true，模板与 ID 均来自页面真实链接）")
+        } else {
+            lines.append("✗ 直达提取实测：合成页链接农场未提取到候选")
+        }
+        let censusBefore = await web.dialogCensus()
+        lines.append("\(fmt(!censusBefore.hits.isEmpty)) 弹窗基线：绕行前 frame 普查命中弹窗 \(censusBefore.hits.count) 个（合成条款弹窗在场，按钮无行为、点按不关）")
+        let outcome = await attemptDialogNavBypass(token: generation)
+        lines.append("\(fmt(outcome.success)) 弹窗导航绕行实测（非编辑页重载分支）：\(outcome.note)")
+        switch status {
+        case .waitingManual(_), .waitingConfirm(_):
+            lines.append("✗ 全程无停车态：绕行驱动后引擎处于停车态，与自主完成口径不符")
+        default:
+            lines.append("✓ 全程无停车态：分类门与绕行梯驱动期间引擎未进入等待确认/等待手输状态")
+        }
         return lines
     }
 
@@ -1944,6 +2319,11 @@ struct StepBudget: Equatable {
         var budgetSegment: Int? = nil
         var totalModelSteps: Int? = nil
         var stepLimitPaused: Bool? = nil
+        // AUTONOMY-FIX 起：绕行梯现场（已试梯级 rawValue 数组＋逐级
+        // 留痕）。可选字段，此前快照无此二键照常解码（恢复时梯账为空、
+        // 从梯级①重新开始）。
+        var ladderAttempted: [String]? = nil
+        var ladderNotes: [String]? = nil
     }
     /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
     /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
@@ -2029,7 +2409,8 @@ struct StepBudget: Equatable {
                                                                      wasPickStage: upload.stage == .pickFile)
                                        },
                                        modelStepsUsed: stepBudget.segmentUsed, budgetSegment: stepBudget.segment,
-                                       totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused)
+                                       totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused,
+                                       ladderAttempted: bypassLadder.attemptedRaw, ladderNotes: bypassLadder.notes)
         if let data = try? JSONEncoder().encode(snapshot) {
             // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
             // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
@@ -2087,6 +2468,13 @@ struct StepBudget: Equatable {
         } else {
             stepBudget = StepBudget(limit: snapshot.limit, segmentUsed: 0, segment: 1, totalUsed: snapshot.steps.count)
             stepLimitPaused = false
+        }
+        // 绕行梯恢复（AUTONOMY-FIX）：带梯账的快照原样恢复（已试梯级
+        // 不重走）；旧快照无此二键则梯账为空
+        if let attemptedRaw = snapshot.ladderAttempted {
+            bypassLadder = BypassLadder(attemptedRaw: attemptedRaw, notes: snapshot.ladderNotes ?? [])
+        } else {
+            bypassLadder = BypassLadder()
         }
         // 状态卡恢复（H1）：快照带卡则原样恢复（关键事实跨进程不丢）；旧
         // 快照无卡时按已恢复的步流派生一张（目标＋步流里程碑），关键事实

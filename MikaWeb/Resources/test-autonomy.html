@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自检十八合成页：自主完成与绕行梯</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  #result { border: 1px solid #999; padding: 8px; min-height: 24px; margin-bottom: 16px; }
+  a { display: block; margin: 8px 0; }
+  /* 条款弹窗（合成）：按钮无任何行为——合成点按点它也不会关，
+     用来验证引擎走「弹窗导航绕行」而不是停车等用户代劳 */
+  #termsDlg { position: fixed; left: 40px; right: 40px; top: 140px; background: #fff;
+              border: 2px solid #c00; padding: 16px; z-index: 99; }
+</style>
+</head>
+<body>
+<div id="result">合成页已加载</div>
+
+<h3>草稿列表（链接农场：直达提取的实证来源）</h3>
+<!-- 直达候选：带 appmsgid 的编辑链接（模板与 ID 同源实证） -->
+<a id="editDirect" href="https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=100000001&token=123456">编辑《合成草稿甲》</a>
+<!-- 另一个 ID 的普通链接（不应盖过编辑链接的直用候选） -->
+<a id="detailLink" href="https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_list&appmsgid=100000002">草稿乙详情</a>
+<a id="plainLink" href="https://example.com/about">无关链接</a>
+
+<!-- 条款弹窗：只在本次标签会话首次加载时出现——window.name 跨重载
+     保留，模拟「重载即消失」的会话级弹窗；重载后普查应为零命中 -->
+<div id="termsDlg" role="dialog" aria-modal="true">
+  <p>AI 配图功能使用条款（合成样本）：本弹窗的按钮没有任何行为，点按不会关闭它。</p>
+  <button type="button" id="dlgCancel">取消</button>
+  <button type="button" id="dlgAgree">同意</button>
+</div>
+<script>
+  if (window.name === 'mikaAutonomyDlgSeen') {
+    document.getElementById('termsDlg').style.display = 'none';
+  } else {
+    window.name = 'mikaAutonomyDlgSeen';
+  }
+</script>
+</body>
+</html>

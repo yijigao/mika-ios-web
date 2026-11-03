@@ -933,6 +933,30 @@ enum SiteMode: String {
     /// 在非查看会话启动时不能借道当前页，走这里按执行绑定加载。
     func loadLocalOnExecutionTab(_ name: String) throws { try executionTab.loadLocal(name) }
 
+    // MARK: - 绕行梯接缝（AUTONOMY-FIX）
+
+    /// 在执行页导航到指定地址（绕行梯直达/往返用）：走 BrowserTab.load
+    /// 的既有校验（http/https），作用于执行页而非当前页。
+    func loadOnExecutionTab(_ urlString: String) throws { try executionTab.load(urlString) }
+
+    /// 执行页的 frame 弹窗普查（绕行梯弹窗导航绕行的证据口）：对
+    /// probeFrames 的执行页包装，签名/摘要口径与 frame 探针一致。
+    func dialogCensus() async -> FrameCensus { await probeFrames(on: executionTab) }
+
+    /// 直达目标 harvest（AUTONOMY-FIX 梯级②）：收集执行页主 frame 内
+    /// 全部 a[href] 原始属性值，交 DirectTargetHarvest.build 做纯函数
+    /// 提取——模板与目标 ID 只从页面已有链接实证，不凭记忆编造。
+    /// 页面读取失败或无候选返回 nil。
+    func harvestDirectTargets() async -> DirectTargetHarvest.Result? {
+        let tab = executionTab
+        let result = try? await evaluate("""
+        (()=>{const out=[];for(const a of document.querySelectorAll('a[href]')){const h=a.getAttribute('href');if(h)out.push(h);if(out.length>=400)break;}return JSON.stringify(out);})()
+        """, on: tab)
+        guard let raw = result as? String, let data = raw.data(using: .utf8),
+              let hrefs = try? JSONDecoder().decode([String].self, from: data) else { return nil }
+        return DirectTargetHarvest.build(hrefs: hrefs)
+    }
+
     /// agent 的 open_new_tab 动作：在执行会话里新开标签并把执行绑定移过去，
     /// 后续动作作用于新页；执行会话正是查看会话时同时切换过去（单会话时代
     /// 的既有行为），执行会话被隐藏时不抢用户的当前页。地址先校验后建页，
@@ -1572,12 +1596,13 @@ enum SiteMode: String {
     // 目标位于弹窗内、或普通点击后观察到同一弹窗仍在 → 改用完整事件
     // 序列（先滚动入视口，再按元素中心坐标带间隔依次派发 pointerover→
     // pointerdown→mousedown→focus→pointerup→mouseup→click）；升级后弹窗
-    // 仍在、连败 2 次 → 抛 modalUnresponsivePrefix 错误，引擎据此转对话
-    // 内介入请用户亲手点按（见 AgentEngine.modalInterventionText）。
-    // 诚实边界：合成事件 isTrusted=false 无法伪造——过不去时如实转人工，
-    // 绝不静默循环、绝不假装已同意。
+    // 仍在、连败 2 次 → 抛 modalUnresponsivePrefix 错误，引擎据此判定
+    // 为能力类卡点、走绕行梯（弹窗导航绕行），不停车等用户代劳
+    // （AUTONOMY-FIX；信号判定见 AgentEngine.modalInterventionText）。
+    // 诚实边界：合成事件 isTrusted=false 无法伪造——过不去时如实进
+    // 绕行梯/失败结案，绝不静默循环、绝不假装已同意。
 
-    /// 弹窗点按无响应的错误前缀（引擎转介入判定的唯一依据，两处共用同一常量）。
+    /// 弹窗点按无响应的错误前缀（引擎分类门信号判定的唯一依据，两处共用同一常量）。
     static let modalUnresponsivePrefix = "弹窗点按无响应"
 
     /// 弹窗判定 JS 片段（注入各探针脚本共用）：dialogOf(x) 沿祖先链找
@@ -1677,7 +1702,7 @@ enum SiteMode: String {
     }
 
     /// 弹窗升级点击：完整序列→等 600ms→存续探针；仍在则再来一轮；
-    /// 连败 2 次抛「弹窗点按无响应」转人工（不静默循环、不假装已同意）。
+    /// 连败 2 次抛「弹窗点按无响应」（引擎判能力类卡点走绕行梯；不静默循环、不假装已同意）。
     private func performModalClick(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
         for _ in 1...2 {
             try await performPointerSequence(action: action, approved: approved, tab: tab)
@@ -1702,7 +1727,7 @@ enum SiteMode: String {
     //   关闭判定只认重新探查时该弹窗不再被任何 frame 报出（元素消失
     //   的回讀证据），不认任何一方的口头成功；③探针在所有 frame 都没
     //   找到弹窗时回落 1830 既有路径，不回退旧行为；④两轮仍不关 →
-    //   沿用 modalUnresponsivePrefix 转人工，错误原文附探针实测事实。
+    //   沿用 modalUnresponsivePrefix（引擎判能力类卡点走绕行梯），错误原文附探针实测事实。
 
     /// 一次 frame 普查里命中的一个弹窗（探针回報的原始事实）。
     struct FrameDialogHit {
@@ -1829,7 +1854,7 @@ enum SiteMode: String {
     }
 
     /// 弹窗关闭编排（frame 感知版）：探针定位→框内分阶段关闭→回讀
-    /// 复核；两轮不关抛 modalUnresponsivePrefix（附探针实测）转人工；
+    /// 复核；两轮不关抛 modalUnresponsivePrefix（附探针实测），引擎判能力类卡点走绕行梯；
     /// 探针处处无获时回落 1830 的 performModalClick。
     private func performModalClose(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
@@ -2055,7 +2080,7 @@ enum SiteMode: String {
             lines.append("✗ 顽固弹窗：升级序列后没有抛错（无响应判定未触发）")
         } catch {
             lines.append((error as? MikaError)?.message.hasPrefix(Self.modalUnresponsivePrefix) == true
-                ? "✓ 顽固弹窗：完整序列连败 2 次后按口径抛出「\(Self.modalUnresponsivePrefix)」——引擎据此转对话内介入，不静默循环"
+                ? "✓ 顽固弹窗：完整序列连败 2 次后按口径抛出「\(Self.modalUnresponsivePrefix)」——引擎据此判能力类卡点走绕行梯，不静默循环、不停车等用户代劳"
                 : "✗ 顽固弹窗抛错口径不对：\(error.localizedDescription)")
         }
         return lines

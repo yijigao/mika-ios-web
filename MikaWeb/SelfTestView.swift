@@ -13,6 +13,7 @@ struct SelfTestView: View {
     @State private var stepBudgetTestRunning = false
     @State private var editorNavTestRunning = false
     @State private var legibilityTestRunning = false
+    @State private var autonomyTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -124,6 +125,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || legibilityTestRunning)
             Text("自检十七预期（UI-LEGIBILITY）：两层。Tier A 不调用模型（本按钮）：结构断言——介入层三卡共用背景规格 OverlayStyle 的基底为最厚材质 ultraThickMaterial（强模糊）、系统底色覆盖 ≥0.5、未模糊直透比例 ≤0.25；变暗遮罩不透明度 ≥0.40 且不拦截触摸（网页弹窗照常可亲手点）；卡片种类真值表（上传＞确认＞手输互斥）保证同一时刻至多一张卡、介入文字只绘制一层。Tier B 真机人工（步骤见案卷 UI-LEGIBILITY-IMPL 的复测清单）：公众号场再遇介入卡（手动处理／确认／上传任一）时读一遍——卡内文字应清晰可读、卡后整屏变暗、无背景文字透叠；点网页弹窗按钮与「打开浏览器」照常可用。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十八：自主完成分类门与绕行梯") {
+                guard !autonomyTestRunning else { return }
+                autonomyTestRunning = true
+                runAutonomyTest()
+                dismiss()
+            }.disabled(!engine.active || autonomyTestRunning)
+            Text("自检十八预期（AUTONOMY-FIX）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-autonomy）：①分类门——「请用户亲手点弹窗」「请用户手动打开编辑页」两条现场原例与 askKind=manual 声明均判 capability（拒绝停车），声明 clarify 但文本是请用户操作网页同样判 capability（防绕门），任务歧义问答判 clarify（照旧等待、不收紧）；②安全类回归——SafetyPolicy 对「确认付款」判 .confirm、type 进 password 字段判 .manual、SP-01 非任务生成文件判 .confirm（停车依据只读引用、安全策略零改动）；③绕行梯状态机逐级推进、三级试完梯尽、梯账快照往返不变；④失败结案文案含卡点＋已试路径＋页面证据且无请用户代劳措辞；⑤直达提取三路（带 ID 编辑链接直用、无 ID 模板＋实证 ID 拼装、无候选返回 nil）与合成页链接农场 harvest 实测；⑥合成页条款弹窗（按钮无行为、点按不关）经弹窗导航绕行（非编辑页重载分支）消失，且全程引擎未进入等待确认/等待手输停车态。Tier B 真机人工（步骤见案卷 AUTONOMY-FIX-IMPL 的复测清单）：公众号编辑器弹窗场走保存→离开→直达返回往返不丢稿、草稿入口全败时直达 URL 打开编辑页、安全类（发表确认）仍停车。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 
@@ -154,6 +162,25 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检十七：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检十七结论（Tier A）：全部通过——厚材质＋高覆盖卡面、变暗遮罩在位且不拦截触摸、单卡互斥均成立；Tier B 真机可读性按案卷清单人工复测" : "自检十七结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
+    }
+
+    /// 自检十八编排（AUTONOMY-FIX）：分类门/安全类回归/绕行梯/结案
+    /// 文案/直达提取的纯函数断言＋合成页 test-autonomy 驱动（harvest
+    /// 实测、弹窗导航绕行实测、全程无停车态断言），结论以「自检十八」
+    /// 条目写进对话。不调用模型、不起任务；要求引擎空闲（会占用当前
+    /// 标签页打开合成页）。Tier B（公众号真机往返不丢稿等）步骤与
+    /// 预期见上方说明与案卷复测清单，不在本按钮内自动执行。
+    private func runAutonomyTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检十八：开始——自主完成分类门与绕行梯核查（不调用模型）")
+        Task { @MainActor in
+            defer { autonomyTestRunning = false }
+            let lines = await engine.verifyAutonomy()
+            for line in lines { conversation.localFeedback("自检十八：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检十八结论（Tier A）：全部通过——分类门分流、安全类回归、绕行梯状态机、结案文案措辞、直达提取与弹窗导航绕行实测均成立，全程无停车态；Tier B 公众号真机场景按案卷清单人工复测" : "自检十八结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
+        }
     }
 
     /// 自检十四 Tier A 编排（WECHAT-COVER-FIX Part A）：frame 探针在
