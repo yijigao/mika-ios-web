@@ -8,6 +8,36 @@ extension Notification.Name {
     static let mikaWebAuthnBlocked = Notification.Name("MikaWeb.WebAuthnBlocked")
 }
 
+/// 弹窗 frame 探针的消息中枢（WECHAT-COVER-FIX）：探针脚本注入在每个
+/// frame 里，各 frame 的回報（probe-report／click-report）经消息处理器
+/// 到达这里；按（webView 身份＋本次探查 token）匹配正在等待的收集者，
+/// 不匹配的一律丢弃——页面自己 postMessage 伪造同名消息也进不来
+/// （token 每次探查随机生成、只在 App 内存里）。收集者由 WebController
+/// 的 probeFrames／dispatchFrameClick 注册、超时后注销。
+@MainActor final class FrameProbeHub {
+    static let shared = FrameProbeHub()
+    private struct Pending {
+        let webViewID: ObjectIdentifier
+        let handler: ([String: Any]) -> Void
+    }
+    private var pendings: [String: Pending] = [:]
+
+    func register(webView: WKWebView, token: String, handler: @escaping ([String: Any]) -> Void) {
+        pendings[token] = Pending(webViewID: ObjectIdentifier(webView), handler: handler)
+    }
+
+    func unregister(token: String) { pendings[token] = nil }
+
+    func deliver(_ message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let token = body["token"] as? String,
+              let pending = pendings[token],
+              let webView = message.webView,
+              ObjectIdentifier(webView) == pending.webViewID else { return }
+        pending.handler(body)
+    }
+}
+
 /// 通行密钥探针的多路复用器（CRASH-1031-FIX）：全局唯一的消息处理器，按
 /// WKScriptMessage.webView 把消息路由回所属标签页处理。
 ///
@@ -32,11 +62,18 @@ extension Notification.Name {
 
     /// 给配置装探针：同一 controller 只装一次（脚本同理只注入一次；
     /// 探针脚本自身另有页面级防重入标记，属第三重保险）。
+    /// WECHAT-COVER-FIX 起同一装配点一并装弹窗 frame 探针（handler 与
+    /// 脚本）：两者共用「每 controller 只装一次」的守卫——在共享
+    /// controller 上重复注册同名 handler 同样会抛异常致 abort，绝不能
+    /// 另起一套逐标签注册。
     func equip(_ controller: WKUserContentController) {
         guard !equippedControllers.contains(controller) else { return }
         controller.removeScriptMessageHandler(forName: BrowserTab.webAuthnHandlerName, contentWorld: .page)
         controller.add(self, contentWorld: .page, name: BrowserTab.webAuthnHandlerName)
         controller.addUserScript(WKUserScript(source: BrowserTab.webAuthnProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        controller.removeScriptMessageHandler(forName: BrowserTab.frameProbeHandlerName, contentWorld: .page)
+        controller.add(self, contentWorld: .page, name: BrowserTab.frameProbeHandlerName)
+        controller.addUserScript(WKUserScript(source: BrowserTab.frameProbeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         equippedControllers.add(controller)
     }
 
@@ -45,6 +82,11 @@ extension Notification.Name {
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        // frame 探针消息不归标签页处理：按 token 交给探针中枢的收集者
+        if message.name == BrowserTab.frameProbeHandlerName {
+            FrameProbeHub.shared.deliver(message)
+            return
+        }
         tabsByWebView = tabsByWebView.filter { $0.value.tab != nil }
         if let webView = message.webView, let tab = tabsByWebView[ObjectIdentifier(webView)]?.tab {
             tab.userContentController(userContentController, didReceive: message)
@@ -183,6 +225,205 @@ enum SiteMode: String {
       wrap('get'); wrap('create');
     })();
     """
+
+    static let frameProbeHandlerName = "mikaFrameProbe"
+
+    /// 弹窗 frame 探针脚本（WECHAT-COVER-FIX）：注入每个 frame（含跨源
+    /// iframe——evaluateJavaScript 只能进主 frame，跨源 frame 的 DOM 从
+    /// 主 frame 读不到，唯有预先注入各 frame 的脚本能自查自报）。职责：
+    /// ①收到 probe 指令（主 frame 经 window.postMessage 洪泛、每层 frame
+    /// 自行向下转发，保证整棵 frame 树都被问到）后，枚举本 frame 内的
+    /// 弹窗容器与其按钮特征并回報（含本 frame 的路径、地址、子 frame 数）；
+    /// ②收到 click 指令时，只有真正持有「带目标文案按钮的弹窗」的 frame
+    /// 出手：在本 frame 内按阶段尝试关闭（完整 pointer 序列→触摸序列→
+    /// Escape→关闭叉号→遮罩点击），每阶段后以弹窗元素消失为唯一成功
+    /// 判据轮询回讀；出手前重跑与主 frame 同口径的安全词检查。探针只做
+    /// 证据与受控点按，不改页面其他语义。
+    static let frameProbeScript = #"""
+    (function(){
+      if (window.__mikaFrameProbe) return;
+      window.__mikaFrameProbe = true;
+      var post = function(payload){ try { window.webkit.messageHandlers.mikaFrameProbe.postMessage(payload); } catch (e) {} };
+      var vis = function(x){ if(!x || !x.getBoundingClientRect) return false; var r=x.getBoundingClientRect(), s=getComputedStyle(x); return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none'; };
+      var lab = function(x){ return ((x.innerText||x.value||x.getAttribute('aria-label')||'')+'').replace(/\s+/g,' ').trim(); };
+      var norm = function(s){ return (s||'').replace(/\s+/g,' ').trim().toLowerCase(); };
+      var clsOf = function(x){ return ((typeof x.className==='string') ? x.className : '') + ''; };
+      var dlgKey = /dialog|modal|popup|pop-|layer|mask|overlay|alert|confirm/;
+      var isDialog = function(n){
+        if (!n || n===document.body || n===document.documentElement) return false;
+        if (n.tagName==='DIALOG' && n.open) return true;
+        var role = n.getAttribute ? n.getAttribute('role') : null;
+        if (role==='dialog' || role==='alertdialog') return true;
+        if (n.getAttribute && n.getAttribute('aria-modal')==='true') return true;
+        var s; try { s = getComputedStyle(n); } catch (e) { return false; }
+        if (s.position==='fixed' || s.position==='absolute'){
+          if (dlgKey.test((clsOf(n)+' '+(n.id||'')).toLowerCase())) return true;
+        }
+        return false;
+      };
+      var dialogElements = function(){
+        var out = [], seen = [];
+        var all = document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"],div,section,aside');
+        for (var i=0;i<all.length;i++){
+          var d = all[i];
+          if (!vis(d) || !isDialog(d) || seen.indexOf(d)>=0) continue;
+          seen.push(d); out.push(d);
+        }
+        return out;
+      };
+      var dialogSig = function(d){ return (d.id ? '#'+d.id : d.tagName.toLowerCase()) + '|' + clsOf(d).slice(0,60) + '|' + lab(d).slice(0,30); };
+      var describeDialog = function(d){
+        var btns = [], cands = d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');
+        for (var j=0;j<cands.length && btns.length<8;j++){
+          var c = cands[j]; if (!vis(c)) continue;
+          btns.push({ label: lab(c).slice(0,40), tag: c.tagName.toLowerCase(), cls: clsOf(c).slice(0,60) });
+        }
+        var r = d.getBoundingClientRect();
+        return { sig: dialogSig(d), tag: d.tagName.toLowerCase(), role: d.getAttribute('role') || '', cls: clsOf(d).slice(0,80), text: lab(d).slice(0,80), rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], buttons: btns };
+      };
+      var framePath = function(){
+        var path = [], w = window;
+        try {
+          while (w !== w.parent){
+            var p = w.parent, idx = -1;
+            for (var i=0;i<p.frames.length;i++){ if (p.frames[i]===w){ idx = i; break; } }
+            if (idx < 0) return 'partial';
+            path.unshift(idx); w = p;
+          }
+        } catch (e) { return 'unknown'; }
+        return path.length ? path.join('.') : 'top';
+      };
+      var hrefSafe = function(){ try { return location.href; } catch (e) { return ''; } };
+      var dispatchAt = function(el, step, x, y){
+        var down = step==='pointerdown' || step==='mousedown';
+        var opts = { bubbles:true, composed:true, cancelable:true, clientX:x, clientY:y, button:0, buttons:down?1:0, view:window };
+        var ev = null;
+        if (step.indexOf('pointer')===0){
+          try { ev = new PointerEvent(step, Object.assign({}, opts, { pointerId:1, pointerType:'mouse', isPrimary:true })); } catch (e) {}
+          if (!ev){ try { ev = new MouseEvent(step, opts); } catch (e2) {} }
+        } else {
+          try { ev = new MouseEvent(step, opts); } catch (e) {}
+        }
+        if (ev) el.dispatchEvent(ev);
+      };
+      var seqOn = function(el, kind, done, point){
+        var steps = kind==='touch' ? ['touchstart','touchend','click']
+                                   : ['pointerover','pointerdown','mousedown','focus','pointerup','mouseup','click'];
+        var i = 0;
+        var next = function(){
+          if (i >= steps.length){ done(); return; }
+          var step = steps[i++];
+          try {
+            var r = el.getBoundingClientRect();
+            var x = point ? point.x : r.left + r.width/2;
+            var y = point ? point.y : r.top + r.height/2;
+            if (!point){ try { el.scrollIntoView({ block:'center' }); } catch (e) {} }
+            if (step==='focus'){ try { el.focus(); } catch (e) {} }
+            else if (step==='click'){ el.click(); }
+            else if (step.indexOf('touch')===0){
+              var t = null;
+              try { t = new Touch({ identifier:1, target:el, clientX:x, clientY:y }); } catch (e) {}
+              var topts = { bubbles:true, composed:true, cancelable:true, touches: step==='touchend' ? [] : (t ? [t] : []), changedTouches: t ? [t] : [] };
+              el.dispatchEvent(new TouchEvent(step, topts));
+            }
+            else { dispatchAt(el, step, x, y); }
+          } catch (e) {}
+          setTimeout(next, 70);
+        };
+        next();
+      };
+      var dialogGone = function(dlg){ return !dlg.isConnected || !vis(dlg); };
+      var pollGone = function(dlg, ms, cb){
+        var end = Date.now() + ms;
+        var chk = function(){
+          if (dialogGone(dlg)){ cb(true); return; }
+          if (Date.now() > end){ cb(false); return; }
+          setTimeout(chk, 150);
+        };
+        chk();
+      };
+      var findCloser = function(dlg, mainBtn){
+        var cands = dlg.querySelectorAll('button,[role="button"],a,span,i');
+        for (var i=0;i<cands.length;i++){
+          var c = cands[i];
+          if (c===mainBtn || !vis(c)) continue;
+          var t = norm(lab(c)), a = norm(c.getAttribute('aria-label') || ''), cl = clsOf(c).toLowerCase();
+          if (t==='×' || t==='✕' || t==='关闭' || a.indexOf('关闭')>=0 || a.indexOf('close')>=0 || /close|dismiss/.test(cl)) return c;
+        }
+        return null;
+      };
+      var maskClick = function(dlg, cb){
+        var node = dlg, target = null;
+        while (node && node !== document.body){
+          var r = node.getBoundingClientRect();
+          if (r.width >= window.innerWidth*0.9 && r.height >= window.innerHeight*0.9){ target = node; break; }
+          node = node.parentElement;
+        }
+        if (!target){ cb(); return; }
+        var el = target;
+        try { el = document.elementFromPoint(10, 10) || target; } catch (e) {}
+        seqOn(el, 'pointer', cb, { x: 10, y: 10 });
+      };
+      var handleClick = function(d){
+        var want = norm(d.label);
+        var dlg = null, btn = null, elements = dialogElements();
+        for (var i=0;i<elements.length;i++){
+          var cands = elements[i].querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');
+          for (var j=0;j<cands.length;j++){
+            if (vis(cands[j]) && norm(lab(cands[j]))===want){ dlg = elements[i]; btn = cands[j]; break; }
+          }
+          if (dlg) break;
+        }
+        if (!dlg || !btn) return;
+        var labelText = norm(lab(btn));
+        var keywords = d.keywords || [];
+        for (var k=0;k<keywords.length;k++){
+          if (!d.approved && labelText.indexOf(keywords[k])>=0){
+            post({ kind:'click-report', token:d.token, path:framePath(), href:hrefSafe(), clicked:false, gone:false, stage:'refused-sensitive', stages:[] });
+            return;
+          }
+        }
+        var stages = [];
+        var finish = function(gone, stage){
+          post({ kind:'click-report', token:d.token, path:framePath(), href:hrefSafe(), clicked:true, gone:gone, stage:stage, stages:stages, sig:dialogSig(dlg) });
+        };
+        var plan = [
+          function(cb){ stages.push('pointer-sequence'); seqOn(btn, 'pointer', function(){ pollGone(dlg, 900, cb); }); },
+          function(cb){ if (dialogGone(dlg)) return cb(true); stages.push('touch-sequence'); seqOn(btn, 'touch', function(){ pollGone(dlg, 900, cb); }); },
+          function(cb){ if (dialogGone(dlg)) return cb(true); stages.push('escape');
+            try {
+              var opts = { bubbles:true, composed:true, cancelable:true, key:'Escape', code:'Escape', keyCode:27, which:27 };
+              document.dispatchEvent(new KeyboardEvent('keydown', opts));
+              if (document.activeElement) document.activeElement.dispatchEvent(new KeyboardEvent('keydown', opts));
+              dlg.dispatchEvent(new KeyboardEvent('keydown', opts));
+              document.dispatchEvent(new KeyboardEvent('keyup', opts));
+            } catch (e) {}
+            pollGone(dlg, 700, cb); },
+          function(cb){ if (dialogGone(dlg)) return cb(true); var closer = findCloser(dlg, btn); if (!closer) return cb(false); stages.push('close-affordance'); seqOn(closer, 'pointer', function(){ pollGone(dlg, 900, cb); }); },
+          function(cb){ if (dialogGone(dlg)) return cb(true); stages.push('mask-click'); maskClick(dlg, function(){ pollGone(dlg, 900, cb); }); }
+        ];
+        var run = function(i){
+          if (i >= plan.length){ finish(false, 'none'); return; }
+          plan[i](function(gone){
+            if (gone){ finish(true, stages[stages.length-1]); }
+            else { run(i+1); }
+          });
+        };
+        run(0);
+      };
+      window.addEventListener('message', function(ev){
+        var d = ev.data;
+        if (!d || d.__mikaFrame !== 1) return;
+        for (var i=0;i<window.frames.length;i++){ try { window.frames[i].postMessage(d, '*'); } catch (e) {} }
+        if (d.kind === 'probe'){
+          var dialogs = dialogElements().map(describeDialog);
+          post({ kind:'probe-report', token:d.token, path:framePath(), href:hrefSafe(), isTop: window===window.top, children: window.frames.length, dialogs:dialogs });
+        } else if (d.kind === 'click'){
+          handleClick(d);
+        }
+      });
+    })();
+    """#
 
     /// 探针消息处理（由 WebAuthnProbeMultiplexer 按 webView 路由调用）：
     /// 全量记诊断；仅「模态调用被拒／同步抛错」才通知对话区提示
@@ -657,6 +898,24 @@ enum SiteMode: String {
         guard let raw = result as? String, let data = raw.data(using: .utf8),
               let names = try? JSONDecoder().decode([String].self, from: data) else { return [] }
         return names
+    }
+
+    /// 页面图像清单回读（WECHAT-COVER-FIX Part B，上传双回读的第二项）：
+    /// 收集执行页主 frame 内全部 <img> 的当前源（currentSrc 优先）与
+    /// CSS 背景图 URL——上传前后各取一次，差集即「页面新增图像」的
+    /// 客观证据（封面缩略图、预览图都以这两种形态出现）。只读元数据，
+    /// 不读图像内容；上限 300 条防极端页面。
+    func probePageImages() async -> [String] {
+        let tab = executionTab
+        let result = try? await evaluate("""
+        (()=>{const out=new Set();
+        for(const img of document.querySelectorAll('img')){const s=img.currentSrc||img.src;if(s)out.add(s);if(out.size>=300)break;}
+        if(out.size<300){for(const e of document.querySelectorAll('*')){const bg=getComputedStyle(e).backgroundImage;if(bg&&bg!=='none'){const m=bg.match(/url\\(["']?(.*?)["']?\\)/);if(m&&m[1])out.add(m[1]);}if(out.size>=300)break;}}
+        return JSON.stringify([...out]);})()
+        """, on: tab)
+        guard let raw = result as? String, let data = raw.data(using: .utf8),
+              let srcs = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return srcs
     }
 
     /// 某标签页的当前截图 JPEG（附件中心「保存当前页截图」用，与失败
@@ -1405,6 +1664,176 @@ enum SiteMode: String {
         throw MikaError("\(Self.modalUnresponsivePrefix)：弹窗内的按钮经完整点按序列（真实坐标的 pointer/mouse 事件）两次尝试后仍未关闭——合成点按不是真实点按（isTrusted=false），这类网页只认真实点按")
     }
 
+    // MARK: - 弹窗 frame 探针与框内感知关闭（WECHAT-COVER-FIX，Part A）
+    //
+    // 现场（Joey 2026-11-03 08:25，构建 1932）：微信「AI 配图功能使用
+    // 条款」弹窗在 1830 的主 frame 完整点按序列下仍无响应。1830 路径的
+    // 结构盲区：evaluateJavaScript 与元素抽取都只作用于主 frame——弹窗
+    // 若住在 iframe 里（尤其跨源），主 frame 既看不见它、也摸不到它，
+    // dialogPersists 还会误报「已关闭」。本节先证据后修法：
+    // ①probeFrames 洪泛询问整棵 frame 树（探针脚本预注入每个 frame），
+    //   把「弹窗住在哪个 frame、按钮是什么元素」变成实测记录（诊断信封
+    //   留档＋失败时随错误原文带出）；②关闭在弹窗所在 frame 内执行分
+    //   阶段尝试（pointer 序列→触摸序列→Escape→关闭叉号→遮罩点击），
+    //   关闭判定只认重新探查时该弹窗不再被任何 frame 报出（元素消失
+    //   的回讀证据），不认任何一方的口头成功；③探针在所有 frame 都没
+    //   找到弹窗时回落 1830 既有路径，不回退旧行为；④两轮仍不关 →
+    //   沿用 modalUnresponsivePrefix 转人工，错误原文附探针实测事实。
+
+    /// 一次 frame 普查里命中的一个弹窗（探针回報的原始事实）。
+    struct FrameDialogHit {
+        let framePath: String
+        let frameHref: String
+        let isTop: Bool
+        let sig: String
+        let text: String
+        let buttons: [(label: String, tag: String)]
+    }
+
+    struct FrameCensus {
+        let frameCount: Int
+        let hits: [FrameDialogHit]
+        /// 人话摘要（进诊断与失败原文）：frame 总数＋每个命中弹窗的位置与按钮。
+        var summary: String {
+            guard !hits.isEmpty else { return "共 \(frameCount) 个 frame，未发现弹窗" }
+            let parts = hits.map { hit in
+                let whereabouts = hit.isTop ? "主 frame" : "frame \(hit.framePath)（\(hit.frameHref.prefix(60))）"
+                let labels = hit.buttons.map { $0.label }.joined(separator: "／")
+                return "\(whereabouts) 内弹窗「\(hit.text.prefix(30))」按钮 [\(labels)]"
+            }
+            return "共 \(frameCount) 个 frame；" + parts.joined(separator: "；")
+        }
+    }
+
+    private final class FrameMessageBox {
+        var messages: [[String: Any]] = []
+    }
+
+    /// frame 普查：向主 frame 发起洪泛询问，收集各 frame 的 probe-report
+    /// （900ms 窗口）。探针未覆盖的页面（注入缺失）返回空普查，调用方
+    /// 据此回落旧路径。
+    func probeFrames(on tab: BrowserTab) async -> FrameCensus {
+        let token = UUID().uuidString
+        let box = FrameMessageBox()
+        FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
+            if (body["kind"] as? String) == "probe-report" { box.messages.append(body) }
+        }
+        defer { FrameProbeHub.shared.unregister(token: token) }
+        let flood = "(()=>{const d={__mikaFrame:1,kind:'probe',token:'\(token)'};window.postMessage(d,'*');return 'flooded';})()"
+        _ = try? await evaluate(flood, on: tab)
+        try? await Task.sleep(for: .milliseconds(900))
+        var hits: [FrameDialogHit] = []
+        for message in box.messages {
+            let isTop = (message["isTop"] as? Bool) ?? false
+            let path = (message["path"] as? String) ?? "?"
+            let href = (message["href"] as? String) ?? ""
+            for case let dialog as [String: Any] in (message["dialogs"] as? [[String: Any]] ?? []) {
+                let buttons = ((dialog["buttons"] as? [[String: Any]]) ?? []).map {
+                    (label: ($0["label"] as? String) ?? "", tag: ($0["tag"] as? String) ?? "")
+                }
+                hits.append(FrameDialogHit(framePath: path, frameHref: href, isTop: isTop,
+                                           sig: (dialog["sig"] as? String) ?? "",
+                                           text: (dialog["text"] as? String) ?? "", buttons: buttons))
+            }
+        }
+        return FrameCensus(frameCount: box.messages.count, hits: hits)
+    }
+
+    struct FrameClickReport {
+        let path: String
+        let clicked: Bool
+        let gone: Bool
+        let stage: String
+        let stages: [String]
+    }
+
+    /// 向弹窗所在 frame 下达点按指令并等第一份 click-report（只有持有
+    /// 目标按钮的 frame 会回報；其余 frame 静默）。阶段尝试在 frame 内
+    /// 完成，最长约 8 秒，等待上限 10 秒；无回報（探针未覆盖／没有
+    /// frame 持有该按钮）返回 nil。
+    func dispatchFrameClick(on tab: BrowserTab, label: String, approved: Bool) async -> FrameClickReport? {
+        let token = UUID().uuidString
+        let box = FrameMessageBox()
+        FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
+            if (body["kind"] as? String) == "click-report", box.messages.isEmpty { box.messages.append(body) }
+        }
+        defer { FrameProbeHub.shared.unregister(token: token) }
+        let payload: [String: Any] = ["__mikaFrame": 1, "kind": "click", "token": token, "label": label, "approved": approved, "keywords": SafetyPolicy.keywords]
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+        let flood = "(()=>{const d=\(String(decoding: payloadData, as: UTF8.self));window.postMessage(d,'*');return 'flooded';})()"
+        _ = try? await evaluate(flood, on: tab)
+        for _ in 0..<50 {
+            if let first = box.messages.first {
+                return FrameClickReport(path: (first["path"] as? String) ?? "?",
+                                        clicked: (first["clicked"] as? Bool) ?? false,
+                                        gone: (first["gone"] as? Bool) ?? false,
+                                        stage: (first["stage"] as? String) ?? "",
+                                        stages: (first["stages"] as? [String]) ?? [])
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return nil
+    }
+
+    /// 探针实测留档：与失败快照同目录、同信封格式（诊断页可见）。
+    private func recordFrameProbeDiagnostic(census: FrameCensus, tab: BrowserTab, label: String) {
+        let payload: [String: Any] = [
+            "kind": "frame-probe",
+            "url": tab.webView.url?.absoluteString ?? "",
+            "targetLabel": label,
+            "frameCount": census.frameCount,
+            "summary": census.summary,
+            "hits": census.hits.map { hit in
+                ["framePath": hit.framePath, "frameHref": hit.frameHref, "isTop": hit.isTop,
+                 "sig": hit.sig, "text": hit.text,
+                 "buttons": hit.buttons.map { ["label": $0.label, "tag": $0.tag] }] as [String: Any]
+            },
+        ]
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = UUID(), now = Date(), formatter = ISO8601DateFormatter()
+        let envelope: [String: Any] = ["schemaVersion": 1, "id": id.uuidString, "receivedAt": formatter.string(from: now), "types": ["弹窗Frame探针"], "payload": payload]
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]) else { return }
+        let name = formatter.string(from: now).replacingOccurrences(of: ":", with: "-") + "-" + id.uuidString + ".json"
+        try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
+    }
+
+    private static func frameLabelMatch(_ a: String, _ b: String) -> Bool {
+        a.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == b.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// 弹窗关闭编排（frame 感知版）：探针定位→框内分阶段关闭→回讀
+    /// 复核；两轮不关抛 modalUnresponsivePrefix（附探针实测）转人工；
+    /// 探针处处无获时回落 1830 的 performModalClick。
+    private func performModalClose(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
+        let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
+        var lastCensus: FrameCensus?
+        var sawDialog = false
+        for round in 1...2 {
+            let census = await probeFrames(on: tab)
+            lastCensus = census
+            if round == 1 { recordFrameProbeDiagnostic(census: census, tab: tab, label: label) }
+            let hit = census.hits.first(where: { hit in hit.buttons.contains { Self.frameLabelMatch($0.label, label) } })
+                ?? census.hits.first(where: { !$0.isTop })
+                ?? census.hits.first
+            guard let hit else { break }
+            sawDialog = true
+            if let report = await dispatchFrameClick(on: tab, label: label, approved: approved), report.gone {
+                let after = await probeFrames(on: tab)
+                if !after.hits.contains(where: { $0.sig == hit.sig }) { return }
+            }
+            if round < 2 { try? await Task.sleep(for: .milliseconds(400)) }
+        }
+        if !sawDialog {
+            try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+            return
+        }
+        await captureFailureSnapshot(context: "弹窗点按无响应（frame 感知）：\(action.reason)", tab: tab)
+        throw MikaError("\(Self.modalUnresponsivePrefix)：frame 探针实测——\(lastCensus?.summary ?? "无探针数据")。已在弹窗所在 frame 内依次尝试完整点按序列、触摸序列、Escape、关闭按钮与遮罩点击，两轮后弹窗仍在——合成事件 isTrusted=false 的边界未变，这类网页只认真实点按")
+    }
+
     /// click 总流程：先探针分流——目标在弹窗内直接走升级序列；普通目标
     /// 先按已校验元素点（旧口径），点后若观察到同一弹窗仍在再升级；
     /// 禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后按钮常
@@ -1414,7 +1843,7 @@ enum SiteMode: String {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
         let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
         if probe == "ready-dialog" {
-            try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+            try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
             return
         }
         var status = probe
@@ -1424,7 +1853,7 @@ enum SiteMode: String {
             if first == "clicked" {
                 try await Task.sleep(for: .milliseconds(500))
                 if await dialogPersists(action: action, expected: expected, tab: tab) {
-                    try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
                 }
                 return
             }
@@ -1435,7 +1864,7 @@ enum SiteMode: String {
             if status == "clicked" {
                 try await Task.sleep(for: .milliseconds(500))
                 if await dialogPersists(action: action, expected: expected, tab: tab) {
-                    try await performModalClick(action: action, expected: expected, approved: approved, tab: tab)
+                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
                 }
                 return
             }
@@ -1523,6 +1952,72 @@ enum SiteMode: String {
                 ? "✓ 顽固弹窗：完整序列连败 2 次后按口径抛出「\(Self.modalUnresponsivePrefix)」——引擎据此转对话内介入，不静默循环"
                 : "✗ 顽固弹窗抛错口径不对：\(error.localizedDescription)")
         }
+        return lines
+    }
+
+    /// 自检十四·Tier A（WECHAT-COVER-FIX Part A）：合成页 test-frames
+    /// 把同型弹窗放进两种 frame——甲＝同源 srcdoc frame（顶层可直接读
+    /// DOM，弹窗只认完整 pointer 序列）；乙＝沙箱 srcdoc frame（不透
+    /// 明源、顶层读不到 DOM，弹窗按钮对点按不响应、只认 Escape）。
+    /// 断言：①主 frame 可达性事实与预期一致（甲可读、乙不可读）；
+    /// ②frame 普查枚举到 ≥3 个 frame，且甲乙弹窗与按钮特征齐全；
+    /// ③框内点按关闭甲（阶段应为 pointer-sequence）且消失经复查与
+    /// 页面状态双证；④框内点按关闭乙（阶段应为 escape——点按阶段
+    /// 无效后的兜底被真实走到）且消失双证；⑤终局普查无任何弹窗。
+    /// 已知未证前提：WKUserScript 是否注入沙箱 iframe 需真机实证——
+    /// 若乙 frame 无回報，本检查如实失败，不放水通过。
+    func verifyFrameProbeAndClick() async -> [String] {
+        var lines: [String] = []
+        let tab = activeTab
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        func framesState() async -> (aOpen: Bool?, aReadable: Bool, bOpen: Bool?, bReadable: Bool) {
+            guard let raw = try? await evaluate("(() => window.__framesState())()", on: tab) as? String,
+                  let data = raw.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return (nil, false, nil, false)
+            }
+            return (obj["aOpen"] as? Bool, (obj["aReadable"] as? Bool) ?? false,
+                    obj["bOpen"] as? Bool, (obj["bReadable"] as? Bool) ?? false)
+        }
+        do {
+            try tab.loadLocal("test-frames")
+        } catch {
+            return ["✗ 合成测试页 test-frames 加载失败：\(error.localizedDescription)"]
+        }
+        try? await Task.sleep(for: .milliseconds(1800))
+        let before = await framesState()
+        lines.append("\(fmt(before.aReadable && !before.bReadable && before.aOpen == true && before.bOpen == true)) 可达性事实：同源 frame 甲可直读其 DOM=\(before.aReadable)、沙箱 frame 乙不可直读=\(!before.bReadable)；甲乙弹窗初始在场=\(before.aOpen == true && before.bOpen == true)")
+        let census = await probeFrames(on: tab)
+        let hitA = census.hits.first(where: { hit in hit.buttons.contains { $0.label == "同意并继续" } })
+        let hitB = census.hits.first(where: { hit in hit.buttons.contains { $0.label == "取消并退出" } })
+        let fieldsOK = !census.hits.isEmpty && census.hits.allSatisfy { !$0.framePath.isEmpty && !$0.buttons.isEmpty && !$0.sig.isEmpty }
+        lines.append("\(fmt(census.frameCount >= 3 && hitA != nil && hitB != nil && fieldsOK)) frame 普查：共回報 \(census.frameCount) 个 frame；甲弹窗命中=\(hitA != nil)（frame \(hitA?.framePath ?? "-")）、乙弹窗命中=\(hitB != nil)（frame \(hitB?.framePath ?? "-")、乙在主 frame=\(hitB?.isTop == true)）；探针字段完整（路径/按钮/签名齐全）=\(fieldsOK)")
+        lines.append("· 普查摘要：\(census.summary)")
+        if let hitA {
+            let report = await dispatchFrameClick(on: tab, label: "同意并继续", approved: true)
+            try? await Task.sleep(for: .milliseconds(400))
+            let state = await framesState()
+            let recheck = await probeFrames(on: tab)
+            let goneOK = report?.gone == true && state.aOpen == false && !recheck.hits.contains(where: { $0.sig == hitA.sig })
+            lines.append("\(fmt(goneOK && report?.stage == "pointer-sequence")) 关闭甲：回報阶段=\(report?.stage ?? "无回報")（应为 pointer-sequence）、回報称消失=\(report?.gone == true)、页面状态称已关=\(state.aOpen == false)、复查普查中该弹窗消失=\(!recheck.hits.contains(where: { $0.sig == hitA.sig }))")
+        } else {
+            lines.append("✗ 关闭甲：普查未命中甲弹窗，跳过")
+        }
+        if let hitB {
+            let report = await dispatchFrameClick(on: tab, label: "取消并退出", approved: true)
+            var state = await framesState()
+            for _ in 0..<8 where state.bOpen != false {
+                try? await Task.sleep(for: .milliseconds(300))
+                state = await framesState()
+            }
+            let recheck = await probeFrames(on: tab)
+            let goneOK = report?.gone == true && state.bOpen == false && !recheck.hits.contains(where: { $0.sig == hitB.sig })
+            lines.append("\(fmt(goneOK && report?.stage == "escape")) 关闭乙：回報阶段=\(report?.stage ?? "无回報")（应为 escape）、回報称消失=\(report?.gone == true)、页面状态称已关=\(state.bOpen == false)、复查普查中该弹窗消失=\(!recheck.hits.contains(where: { $0.sig == hitB.sig }))")
+        } else {
+            lines.append("✗ 关闭乙：普查未命中乙弹窗（若探针未注入沙箱 frame 则此处无回報——真机如实记录，不放水）")
+        }
+        let finalCensus = await probeFrames(on: tab)
+        lines.append("\(fmt(finalCensus.hits.isEmpty)) 终局普查：全部 frame 内弹窗数=\(finalCensus.hits.count)（应为 0）")
         return lines
     }
 

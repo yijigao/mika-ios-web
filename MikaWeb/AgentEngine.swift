@@ -30,6 +30,52 @@ struct AgentStep: Identifiable {
     let id: Int
     let action, reason: String
 }
+/// 模型决策步预算（WECHAT-COVER-FIX Part C）：计数的唯一对象是
+/// 「模型返回一个动作」这一事件（引擎在两个模型通道与确认后通道的
+/// 动作取得点各调一次 consumeDecision）。以下一律不计数：引擎注记
+/// 步（appendStep 的核验/重试/技能/预算注记）、record 写入的执行
+/// 结果本身、settled 采样与核验回读、同次 type 的内部分块、快照
+/// 落盘。分段：每段上限 = 用户设置的步数上限（5–50）；段限到 →
+/// 检查点暂停、resume 开下一段；全任务硬顶 = 段数上限 × 每段上限
+/// （段数上限 4：单段 42 已被实证不够跑完一条完整发表链（本场约需
+/// 50–60 个模型决策），4 段即 168 次决策，远超任何已见合法单任务，
+/// 又能封住失控的模型调用成本；非决策 churn 另有瞬时重试 ≤3、循环
+/// 熔断 3/5/7、同目标连败 ≤2 三重封顶，不靠步数兜底）。
+struct StepBudget: Equatable {
+    static let maxSegments = 4
+    let limit: Int
+    private(set) var segmentUsed = 0
+    private(set) var segment = 1
+    private(set) var totalUsed = 0
+
+    init(limit: Int) { self.limit = limit }
+    init(limit: Int, segmentUsed: Int, segment: Int, totalUsed: Int) {
+        self.limit = limit
+        self.segmentUsed = segmentUsed
+        self.segment = segment
+        self.totalUsed = totalUsed
+    }
+
+    var hardTop: Int { limit * Self.maxSegments }
+    var segmentExhausted: Bool { segmentUsed >= limit }
+    var hardTopReached: Bool { totalUsed >= hardTop }
+    var canDecide: Bool { !segmentExhausted && !hardTopReached }
+
+    mutating func consumeDecision() {
+        segmentUsed += 1
+        totalUsed += 1
+    }
+
+    /// 开下一段：仅当本段确已用完且未达硬顶时成功。
+    @discardableResult
+    mutating func openNextSegment() -> Bool {
+        guard segmentExhausted, !hardTopReached, segment < Self.maxSegments else { return false }
+        segment += 1
+        segmentUsed = 0
+        return true
+    }
+}
+
 @MainActor final class AgentEngine: ObservableObject {
     @Published var taskText = ""
     @Published private(set) var status: AgentStatus = .idle
@@ -83,6 +129,17 @@ struct AgentStep: Identifiable {
     }
     private var goal = ""
     private var limit = 25
+    /// 模型决策步预算（WECHAT-COVER-FIX Part C）：只计模型决策步——
+    /// 每次「模型返回一个动作」计 1，与历史条目数解耦。旧口径按历史
+    /// 条目计数，引擎自己的注记步（核验提示、重试注记、封面结果注记
+    /// 等）与内部子步的提示步都在偷预算，长任务（如完整公众号发表
+    /// 链）在 42 条目上限前被自己的记账耗死（2026-11-03 现场实证）。
+    /// 撞段限不再是死路：状态本就全量落盘（检查点），resume 开新段
+    /// 续跑；全任务硬顶（段数 × 每段上限）封住失控成本。
+    private var stepBudget = StepBudget(limit: 25)
+    /// 当前暂停是否由「本段步数用完」引起（决定 resume 是否开新段；
+    /// 随快照落盘，进程重启后口径不变）。
+    private var stepLimitPaused = false
     private var stepSeq = 0
     private var pending: (AgentAction, PageElement, String, Int)?
     private var answerContext: [QuestionAnswer] = []
@@ -160,6 +217,10 @@ struct AgentStep: Identifiable {
         var elementLabel: String
         var stage: Stage
         var confirmationToken: UUID?
+        /// 上传前页面图像清单基线（WECHAT-COVER-FIX Part B）：选文件
+        /// 阶段开始前采集，收口时与上传后的清单作差——「页面新增图像」
+        /// 是封面缩略图/预览图出现的客观第二回读。仅存源串（元数据）。
+        var preUploadImages: [String] = []
         enum Stage { case confirmUpload, pickFile }
     }
     @Published private(set) var pendingUpload: PendingUpload?
@@ -249,7 +310,7 @@ struct AgentStep: Identifiable {
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
-        goal = taskText; limit = min(50, max(5, settings.maxSteps)); steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); stepLimitPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
@@ -308,6 +369,20 @@ struct AgentStep: Identifiable {
     func resume() {
         guard active, !goal.isEmpty else { return }
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
+        // 步数检查点恢复（Part C）：因段限暂停的，点「继续」＝开新段
+        // 续跑同一任务（检查点即当前全量状态：目标/台账/页面/历史都
+        // 在，不重跑已完成部分）；已达硬顶的继续无意义，留在硬顶
+        // 暂停文案、不启动循环。其它暂停（熔断/确认/手输）不走此路。
+        if stepLimitPaused {
+            if stepBudget.hardTopReached {
+                status = .paused("已达全任务步数硬顶（共 \(stepBudget.hardTop) 步模型决策）——请检查结果，或换个说法重新开始新任务")
+                persistSnapshot()
+                return
+            }
+            guard stepBudget.openNextSegment() else { return }
+            stepLimitPaused = false
+            appendStep("budget", "已开启第 \(stepBudget.segment) 段步数预算（每段 \(stepBudget.limit) 步模型决策，全任务硬顶 \(stepBudget.hardTop) 步）：从检查点继续同一任务，成果台账、页面与历史都保留，不重跑已完成部分")
+        }
         // 中断恢复的会话：先把浏览器现场带回中断时（重建标签＋导航回原页面），
         // 再启动主循环——循环第一轮的 state() 会等页面加载稳定后才抽状态，
         // 模型拿到的就是原页面＋原目标＋完整历史，而不是起始页＋一句「继续」。
@@ -644,7 +719,7 @@ struct AgentStep: Identifiable {
                     // 已确认动作只走 runConfirmed：瞬时错误不自动重做该动作本身（安全口径）
                     if try await runConfirmed(saved, token: token) == .halted { return }
                 }
-                while steps.count < limit {
+                while stepBudget.canDecide {
                     // 单轮迭代包在内层 do/catch 里：瞬时错误（页面脚本异常／网页进程
                     // 中断／加载不稳／模型网络抖动）只记一条人话「自动重试」并续跑，
                     // 连续 maxTransientStreak 次才升级为失败；其余错误照旧上抛判失败。
@@ -669,6 +744,11 @@ struct AgentStep: Identifiable {
                         } else {
                             action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
                         }
+                        // 预算计数点（Part C）：模型返回一个动作＝一次决策，
+                        // 全引擎只在此一处计数（runConfirmed 执行的是已计数的
+                        // 已确认动作，后续动作回到主循环同一计数点取得）；
+                        // 引擎注记步与内部子步永不计数
+                        stepBudget.consumeDecision()
                         try await checkpoint(token)
                         if action.action == "done" {
                             // 完成总结是模型回读页面后写下的核实结论：钉进台账
@@ -845,7 +925,17 @@ struct AgentStep: Identifiable {
                         }
                     }
                 }
-                status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
+                // 步数收口（Part C）：段限到＝检查点暂停（状态已全量落盘，
+                // resume 开新段续跑同一任务）；硬顶到＝真上限，须重新开始
+                if stepBudget.hardTopReached {
+                    stepLimitPaused = false
+                    status = .paused("已达全任务步数硬顶（共 \(stepBudget.hardTop) 步模型决策）——请检查结果，或换个说法重新开始新任务")
+                } else if stepBudget.segmentExhausted {
+                    stepLimitPaused = true
+                    status = .paused("本段步数已用完（第 \(stepBudget.segment)/\(StepBudget.maxSegments) 段，累计模型步 \(stepBudget.totalUsed)/硬顶 \(stepBudget.hardTop)）——进度已存检查点（目标、成果台账、页面与历史都在），点「继续」开启下一段接着跑，不会重跑已完成部分")
+                } else {
+                    status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
+                }
                 persistSnapshot()
             } catch {
                 guard token == generation else { return }
@@ -990,6 +1080,9 @@ struct AgentStep: Identifiable {
     private func beginUploadPickStage() async {
         guard var upload = pendingUpload else { return }
         upload.stage = .pickFile
+        // 双回读基线（Part B）：触发控件前先存页面图像清单——收口时
+        // 只有「上传后新增的图像」才算封面/预览出现的第二回读证据
+        upload.preUploadImages = await web.probePageImages()
         pendingUpload = upload
         _ = await web.triggerFileInput(index: upload.elementIndex)
         let text = "请选择要上传的文件（目标：\(upload.attachmentName)）"
@@ -1043,14 +1136,24 @@ struct AgentStep: Identifiable {
         }
         let index = upload.elementIndex
         let host = upload.pageHost
+        let baseline = Set(upload.preUploadImages)
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // 双回读（Part B）：①文件控件持有状态 ②页面新增图像（封面
+            // 缩略图/预览图）。双过才算「封面已设上」写里程碑；单过按
+            // VERIFY-1 的 unknown 口径如实记步、不写里程碑、不声称设上
             let names = await web.probeFileInput(index: index)
             if names.isEmpty {
                 appendStep("upload", "上传回读核验：页面文件控件里未读到已选文件——可能还没选完或页面未持有该文件，不要声称已上传成功；确需上传时重新发起 upload_file")
             } else {
-                appendStep("upload", "上传回读核验：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)）——这是页面侧持有状态，是否已提交到服务器以下一轮页面反馈为准")
-                stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))")
+                let afterImages = await web.probePageImages()
+                let newImages = afterImages.filter { !baseline.contains($0) }
+                if newImages.isEmpty {
+                    appendStep("upload", "上传回读核验（unknown）：文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），但页面上未见新增的封面/预览图像——封面可能尚未设上或预览未渲染，不要声称封面已设好；下一轮看页面现状再判断（可稍等预览出现或核对封面区）")
+                } else {
+                    appendStep("upload", "上传回读核验（双回读通过）：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），且页面新增了 \(newImages.count) 处图像（封面缩略图/预览已出现）——两项回读相互印证，封面已设上；是否已提交到服务器以下一轮页面反馈为准")
+                    stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
+                }
             }
             launch()
         }
@@ -1189,6 +1292,14 @@ struct AgentStep: Identifiable {
     /// 程序化）＋弹窗点按核查（WebController 在合成页真实驱动）＋转介入
     /// 判定函数双向核对（弹窗错误命中介入文案、普通错误不误触发）。
     /// 不调用模型；要求引擎空闲（弹窗核查会占用当前标签页打开合成页）。
+    /// 自检十四·Tier A（WECHAT-COVER-FIX Part A）：弹窗 frame 探针——
+    /// 委托 WebController 在合成页 test-frames 上实测（同源/跨源 frame
+    /// 各一弹窗：枚举定位＋框内序列/Escape 关闭＋元素消失回读判定）。
+    func verifyFrameProbe() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（先等当前任务终结或停止）"] }
+        return await web.verifyFrameProbeAndClick()
+    }
+
     func verifyCoverAndModal() async -> [String] {
         guard !busy else { return ["✗ 引擎忙碌中，自检十一 Tier A 未执行（先等当前任务终结或停止）"] }
         var lines = CoverGenerator.verifyCoverGeneration()
@@ -1446,6 +1557,46 @@ struct AgentStep: Identifiable {
             : "✗ 分歧统计异常（total \(stats.total)、verified \(stats.verified)、contradicted \(stats.contradicted)、unknown \(stats.unknown)、diverged \(stats.diverged)）")
         try? FileManager.default.removeItem(at: tempURL)
         lines.append("· 正式核验日志（verification-log.jsonl）当前累计 \(VerificationLogStore.shared.loadAll().count) 条 shadow 记录（只由真机任务流产生，自检合成记录不入此账）")
+        return lines
+    }
+
+    /// 自检十五（WECHAT-COVER-FIX Part C）：步数账与检查点恢复的
+    /// 程序化模拟（纯结构断言，不触碰引擎运行态）——①预算只随模型
+    /// 决策 consume 增长；②引擎注记/内部子步类事件不计数（计数点
+    /// 唯一在主循环动作取得处，此处以「不调 consume 则计数不变」
+    /// 断言其结构性）；③段限到后开新段可续、累计不清零（不重跑
+    /// 已完成部分的账面保证）；④硬顶（段数×每段）封顶后 openNextSegment
+    /// 拒绝、canDecide 恒假；⑤同指纹失败重试被循环熔断 3/5/7 分级
+    /// 封顶（换说辞不进指纹、不重置计数）；⑥快照预算四字段编解码
+    /// 往返不变、旧格式快照（无四键）解码成功且走迁移口径。
+    func verifyStepBudget() -> [String] {
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        var budget = StepBudget(limit: 5)
+        for _ in 0..<5 { budget.consumeDecision() }
+        lines.append("\(fmt(budget.segmentExhausted && !budget.canDecide && budget.segmentUsed == 5 && budget.totalUsed == 5 && budget.segment == 1)) 只计模型决策：连 consume 5 次后段限到（段内 5/5、累计 5、仍在第 1 段、canDecide=false）")
+        for _ in 0..<12 { _ = "引擎注记/采样/回读/分块事件（不经计数点）" }
+        lines.append("\(fmt(budget.segmentUsed == 5 && budget.totalUsed == 5)) 内部子步不计数：模拟 12 次注记类事件后计数不变（计数点唯一、注记步与子步永不入账）")
+        let opened = budget.openNextSegment()
+        lines.append("\(fmt(opened && budget.segment == 2 && budget.segmentUsed == 0 && budget.totalUsed == 5 && budget.canDecide)) 检查点开新段：段限暂停后开第 2 段成功，段内清零可续跑、累计 5 保留（已完成部分不重跑的账面对应物）")
+        while budget.canDecide { budget.consumeDecision() }
+        lines.append("\(fmt(budget.totalUsed == budget.hardTop && budget.hardTopReached && !budget.openNextSegment() && !budget.canDecide)) 硬顶封顶：累计达硬顶 \(budget.hardTop)（4 段×5）后开段被拒、canDecide 恒假——失控成本有顶")
+        var detector = LoopDetector()
+        let fp = LoopDetector.fingerprint(action: "click", target: "同一按钮", outcome: "executed")
+        var levels: [LoopDetector.Level] = []
+        for _ in 0..<7 { levels.append(detector.record(fingerprint: fp).level) }
+        lines.append("\(fmt(levels[2] == .warning && levels[4] == .severe && levels[6] == .tripped)) 熔断封顶：同指纹（动作＋目标＋结果，不含说辞）连记 7 次依次跨提醒（3）/严重（5）/熔断（7）——变换说辞不重置计数")
+        let snap = SessionSnapshot(savedAt: Date(), goal: "自检十五", limit: 5, stepSeq: 0, steps: [],
+                                   statusKind: "paused", statusText: "", pendingActionJSON: nil, pendingElement: nil,
+                                   pendingURL: nil, waiting: nil, answersJSON: "[]", skillNames: nil, taskID: nil,
+                                   tabURLs: nil, activeTabIndex: nil, executionTabIndex: nil, outcomes: nil,
+                                   stateCard: nil, sessionID: nil,
+                                   modelStepsUsed: 3, budgetSegment: 2, totalModelSteps: 8, stepLimitPaused: true)
+        let roundtrip = (try? JSONEncoder().encode(snap)).flatMap { try? JSONDecoder().decode(SessionSnapshot.self, from: $0) }
+        lines.append("\(fmt(roundtrip?.modelStepsUsed == 3 && roundtrip?.budgetSegment == 2 && roundtrip?.totalModelSteps == 8 && roundtrip?.stepLimitPaused == true)) 快照往返：预算四字段（段内 3/第 2 段/累计 8/段限暂停）编解码后原样——检查点跨进程不丢")
+        let legacyJSON = "{\"version\":2,\"savedAt\":\(Date().timeIntervalSinceReferenceDate),\"goal\":\"旧快照\",\"limit\":5,\"stepSeq\":0,\"steps\":[],\"statusKind\":\"paused\",\"statusText\":\"\",\"answersJSON\":\"[]\"}"
+        let legacy = try? JSONDecoder().decode(SessionSnapshot.self, from: Data(legacyJSON.utf8))
+        lines.append("\(fmt(legacy != nil && legacy?.modelStepsUsed == nil && legacy?.stepLimitPaused == nil)) 旧快照兼容：无预算四键的旧格式解码成功、四键为 nil——恢复时走迁移口径（新段＋累计按条目数计入硬顶）")
         return lines
     }
 
@@ -1775,6 +1926,15 @@ struct AgentStep: Identifiable {
             var wasPickStage: Bool
         }
         var upload: UploadDTO? = nil
+        // WECHAT-COVER-FIX Part C 起：模型步预算现场（段内已用/当前段/
+        // 全任务累计/是否因段限暂停）。可选字段，此前快照无此四键照常
+        // 解码；恢复时无此四键按迁移口径：给一个新段（segmentUsed=0、
+        // segment=1），累计按历史条目数保守计入硬顶（旧口径条目数 ≥
+        // 决策数，只会更早触顶、不会放宽）。
+        var modelStepsUsed: Int? = nil
+        var budgetSegment: Int? = nil
+        var totalModelSteps: Int? = nil
+        var stepLimitPaused: Bool? = nil
     }
     /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
     /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
@@ -1858,7 +2018,9 @@ struct AgentStep: Identifiable {
                                                                      isTaskGenerated: upload.isTaskGenerated, pageURL: upload.pageURL,
                                                                      elementIndex: upload.elementIndex, elementLabel: upload.elementLabel,
                                                                      wasPickStage: upload.stage == .pickFile)
-                                       })
+                                       },
+                                       modelStepsUsed: stepBudget.segmentUsed, budgetSegment: stepBudget.segment,
+                                       totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused)
         if let data = try? JSONEncoder().encode(snapshot) {
             // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
             // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
@@ -1907,6 +2069,16 @@ struct AgentStep: Identifiable {
         limit = snapshot.limit
         stepSeq = snapshot.stepSeq
         steps = snapshot.steps.map { AgentStep(id: $0.id, action: $0.action, reason: $0.reason) }
+        // 步预算恢复（Part C）：带预算四键的快照原样恢复（含段限暂停
+        // 标记——恢复后点「继续」照常开新段）；旧快照无此四键按迁移
+        // 口径：给一个新段，累计按历史条目数保守计入硬顶
+        if let used = snapshot.modelStepsUsed, let segment = snapshot.budgetSegment, let total = snapshot.totalModelSteps {
+            stepBudget = StepBudget(limit: snapshot.limit, segmentUsed: used, segment: segment, totalUsed: total)
+            stepLimitPaused = snapshot.stepLimitPaused ?? false
+        } else {
+            stepBudget = StepBudget(limit: snapshot.limit, segmentUsed: 0, segment: 1, totalUsed: snapshot.steps.count)
+            stepLimitPaused = false
+        }
         // 状态卡恢复（H1）：快照带卡则原样恢复（关键事实跨进程不丢）；旧
         // 快照无卡时按已恢复的步流派生一张（目标＋步流里程碑），关键事实
         // 无从派生则留空——不编造

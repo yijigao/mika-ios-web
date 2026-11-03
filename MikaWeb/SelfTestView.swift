@@ -9,6 +9,8 @@ struct SelfTestView: View {
     @State private var multiSessionTestRunning = false
     @State private var coverModalTestRunning = false
     @State private var verifyContractTestRunning = false
+    @State private var frameProbeTestRunning = false
+    @State private var stepBudgetTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -92,7 +94,55 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || verifyContractTestRunning)
             Text("自检十三预期（VERIFY-1）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-verify）：四场景真实驱动「点击→settle 采样→独立判定」——甲发布后条目进列表应凭回读证据判 verified；乙只有短暂提示（toast）应判 unknown（toast 只记弱证据）；丙被页面明确拒绝应判 contradicted 且记录与自报分歧（diverged）；丁页面持续变化、settle 有界超时应记「证据未稳」判 unknown（超时不算成功）。四条记录写临时日志做落盘往返与分歧统计核对后删净，不污染正式 shadow 账。Tier B 真机人工（步骤见案卷 VERIFY-1-IMPL 的复测清单）：知乎专栏改长文原场景与公众号存草稿场景各跑一遍，看步流出现「动作后核验（影子记录）」步、正式日志新增对应记录、判定与页面实况一致。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十四：弹窗 frame 探针与框内关闭") {
+                guard !frameProbeTestRunning else { return }
+                frameProbeTestRunning = true
+                runFrameProbeTest()
+                dismiss()
+            }.disabled(!engine.active || frameProbeTestRunning)
+            Text("自检十四预期（WECHAT-COVER-FIX Part A）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-frames）：合成页两个 iframe 各放一个同型弹窗——甲为同源 srcdoc frame（顶层可直读 DOM，按钮只认完整点按序列），乙为沙箱 srcdoc frame（不透明源、顶层读不到 DOM，按钮对点按不响应、只认 Escape）。预期：主 frame 可达性事实与预期一致；frame 普查枚举到至少 3 个 frame 且甲乙弹窗与按钮特征齐全；框内点按以 pointer 序列关闭甲、以 Escape 阶段关闭乙，两者的消失都要经复查普查与页面状态双证；终局普查无弹窗。若探针未注入沙箱 frame，乙会如实失败——不放水。Tier B 真机人工（步骤见案卷 WECHAT-COVER-FIX-IMPL 的复测清单）：公众号编辑器原场景复测——封面只走本地上传、双回读确认；误入条款弹窗时先关再继续、关不掉转人工。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十五：步数账与检查点恢复") {
+                guard !stepBudgetTestRunning else { return }
+                stepBudgetTestRunning = true
+                runStepBudgetTest()
+                dismiss()
+            }.disabled(!engine.active || stepBudgetTestRunning)
+            Text("自检十五预期（WECHAT-COVER-FIX Part C）：纯程序化模拟，不调用模型、不占用标签页：①步数预算只随模型决策 consume 增长，段限（每段上限）到后 canDecide 转假；②引擎注记/内部子步类事件不计数（计数点唯一）；③段限暂停后开新段可续跑、累计不清零（不重跑已完成部分的账面保证）；④全任务硬顶（段数上限 4×每段上限）封顶后开段被拒；⑤同指纹失败被循环熔断 3/5/7 分级封顶（指纹不含说辞，换说法不重置）；⑥快照预算四字段编解码往返不变、旧格式快照解码走迁移口径。Tier B 真机人工：长任务跑到段限暂停，点「继续」应开新段续跑同一任务（台账/页面/历史都在），反复继续到硬顶后应停在硬顶文案。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
+    }
+
+    /// 自检十四 Tier A 编排（WECHAT-COVER-FIX Part A）：frame 探针在
+    /// 合成页 test-frames 上实测（枚举定位＋框内关闭＋消失回读），
+    /// 结论以「自检十四」条目写进对话。不调用模型、不起任务；要求
+    /// 引擎空闲（会占用当前标签页打开合成页）。
+    private func runFrameProbeTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检十四：开始——Tier A frame 探针与框内关闭程序化核查（不调用模型）")
+        Task { @MainActor in
+            defer { frameProbeTestRunning = false }
+            let lines = await engine.verifyFrameProbe()
+            for line in lines { conversation.localFeedback("自检十四：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检十四结论（Tier A）：全部通过——frame 枚举定位、甲 pointer 序列关闭、乙 Escape 关闭、消失双证与终局零弹窗均成立；Tier B 真机场景按案卷清单人工复测" : "自检十四结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
+        }
+    }
+
+    /// 自检十五编排（WECHAT-COVER-FIX Part C）：步数账与检查点恢复
+    /// 的纯程序化模拟（StepBudget 计数/开段/硬顶、熔断分级、快照
+    /// 往返与旧格式迁移），结论以「自检十五」条目写进对话。不调用
+    /// 模型、不占用标签页、不触碰引擎运行态。
+    private func runStepBudgetTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检十五：开始——步数账与检查点恢复程序化模拟（不调用模型）")
+        Task { @MainActor in
+            defer { stepBudgetTestRunning = false }
+            let lines = engine.verifyStepBudget()
+            for line in lines { conversation.localFeedback("自检十五：\(line)") }
+            let failed = lines.filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检十五结论：全部通过——只计模型决策、子步不计数、检查点开新段续跑不清零、硬顶封顶、熔断分级、快照往返与旧格式迁移均成立；Tier B 真机长任务按案卷清单人工复测" : "自检十五结论：\(failed) 项未通过，见上方逐条记录")
+        }
     }
 
     /// 自检十三 Tier A 编排（VERIFY-1）：核验合约全链程序化核查

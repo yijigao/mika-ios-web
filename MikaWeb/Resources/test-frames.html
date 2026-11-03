@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>弹窗 frame 探针自检页（test-frames）</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 24px; color: #222; }
+  iframe { width: 340px; height: 240px; border: 1px dashed #999; display: block; margin: 12px 0; background: #fafafa; }
+  p { font-size: 13px; color: #555; max-width: 340px; }
+</style>
+</head>
+<body>
+<h1>弹窗 frame 探针自检页</h1>
+<p>自检十四 Tier A 专用合成页（非真实网页）：下方两个 iframe 各放一个条款型
+弹窗，模拟微信 AI 配图条款弹窗的两种可能居住形态——</p>
+<p>甲（同源 srcdoc frame）：弹窗按钮只认完整 pointer 序列；顶层页面能直接
+读到它的 DOM（同源）。</p>
+<iframe id="frame-a" title="同源 frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;head&gt;&lt;meta charset='utf-8'&gt;&lt;style&gt;.dlg{position:fixed;top:16px;left:50%;transform:translateX(-50%);width:260px;background:#fff;border:1px solid #bbb;border-radius:10px;padding:12px;z-index:10}button{font-size:15px;padding:8px 16px}&lt;/style&gt;&lt;/head&gt;&lt;body&gt;&lt;div class='dlg' id='dlg-a' role='dialog' aria-modal='true' aria-label='框内严格弹窗'&gt;&lt;h3&gt;服务条款（同源 frame）&lt;/h3&gt;&lt;p&gt;只认完整点按序列。&lt;/p&gt;&lt;button id='btn-a' type='button'&gt;同意并继续&lt;/button&gt;&lt;/div&gt;&lt;script&gt;var seq=[];var btn=document.getElementById('btn-a');['pointerdown','mousedown','pointerup'].forEach(function(t){btn.addEventListener(t,function(){seq.push(t);});});btn.addEventListener('click',function(){if(seq.indexOf('pointerdown')&gt;=0){if(seq.indexOf('mousedown')&gt;=0){if(seq.indexOf('pointerup')&gt;=0){document.getElementById('dlg-a').style.display='none';}}}seq=[];});&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
+<p>乙（沙箱 srcdoc frame，不透明源、跨源等效）：顶层页面读不到它的 DOM；
+弹窗按钮对一切点按不响应，只认 Escape 键关闭——模拟「事件路径不同、
+点按序列无效」的弹窗。它的开关状态经 postMessage 向顶层汇报。</p>
+<iframe id="frame-b" title="跨源 frame" sandbox="allow-scripts" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;head&gt;&lt;meta charset='utf-8'&gt;&lt;style&gt;.dlg{position:fixed;top:16px;left:50%;transform:translateX(-50%);width:260px;background:#fff;border:1px solid #bbb;border-radius:10px;padding:12px;z-index:10}button{font-size:15px;padding:8px 16px}&lt;/style&gt;&lt;/head&gt;&lt;body&gt;&lt;div class='dlg' id='dlg-b' role='dialog' aria-modal='true' aria-label='跨源框内弹窗'&gt;&lt;h3&gt;配图条款（跨源 frame）&lt;/h3&gt;&lt;p&gt;按钮对点按不响应，只认 Escape。&lt;/p&gt;&lt;button id='btn-b' type='button'&gt;取消并退出&lt;/button&gt;&lt;/div&gt;&lt;script&gt;function notify(){try{parent.postMessage({__bDlg:document.getElementById('dlg-b').style.display!=='none'},'*');}catch(e){}}document.addEventListener('keydown',function(ev){if(ev.key==='Escape'||ev.keyCode===27){document.getElementById('dlg-b').style.display='none';notify();}});notify();setInterval(notify,800);&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
+
+<script>
+(function () {
+  var bOpen = null;
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (d && typeof d.__bDlg === 'boolean') { bOpen = d.__bDlg; }
+  });
+  window.__framesState = function () {
+    var aOpen = null, aReadable = false, bReadable = false;
+    try {
+      var ad = document.getElementById('frame-a').contentDocument;
+      if (ad) {
+        aReadable = true;
+        var dlg = ad.getElementById('dlg-a');
+        aOpen = !!dlg && dlg.style.display !== 'none';
+      }
+    } catch (e) {}
+    try {
+      var bd = document.getElementById('frame-b').contentDocument;
+      if (bd && bd.getElementById) { bReadable = true; }
+    } catch (e) {}
+    return JSON.stringify({ aOpen: aOpen, aReadable: aReadable, bOpen: bOpen, bReadable: bReadable });
+  };
+})();
+</script>
+</body>
+</html>
