@@ -256,3 +256,11 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy、AgentEngine 及全部引擎/感知文件对基线 a45afc4 的 git diff 均 0 行（只动 ContentView/AgentChatView/SelfTestView 三个呈现层文件）；无新依赖；未合 main；新增文案无「并行执行」；凭据不落盘；父级 SPEC 文件未动未提交。
 - 未证项：自检十九 Tier A 未真机运行（待真机点按回读）；真机层级观感（浏览器是否真浮顶、网页弹窗是否真可点、小条是否挡具体页面操作区）与 zIndex 换位下 WKWebView 不重载/不丢状态，均待 Tier B 实测，不得视为已验；小条与坞收起按钮几何邻接为静态推算。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测；亲验后本构建取代 0227 成为唯一复测目标；验收通过前不合 main。
+
+## 增补（2026-11-03）：TRUSTED-CLICK-EXP（可信点按实验构建：E1 只读插桩＋复刻页对照／E2 AX 激活探针），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030252**（0.1.0）：分支 `feat/trusted-click-exp`（基线＝feat/zorder-fix tip 1581e63，含构建 0239，未合 main），功能提交 `cd81e0e`；CI Run 41568542516 success（日志原文双核对：70 条 SwiftCompile、WebController/SelfTestView/AgentEngine 均在编译列、test-trusted 资源打包在位、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41568712854 success（agvtool 置号 202611030252、Archive Succeeded、Successfully uploaded package ×1、dSYM artifact dsym-41568712854 5,087,420 字节实存未过期）；validate_project.py 全 PASS（31 源、13 项 HTML 资源集）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 TRUSTED-CLICK-EXP-IMPL-2026-11-03.md）：E1 只读插桩——新脚本经既有复用器同一装配点注入每个 frame（handler mikaTCProbe、与 frame 探针共用 FrameProbeHub 按 token 收集），默认未武装零记录，arm/dump/disarm 三令经 postMessage 洪泛下达；捕获阶段＋passive 只读监听记事件元数据（type／target 形态／isTrusted／changedTouches 与 touches 长度／pointerId／pressure／timeStamp）＋MutationObserver 记 DOM 变化计数，表单控件只记 tag/type 绝不记值（凭据安全），事件 1000／变化 300 双上限；宿主三 API＋TCProbeLogStore 结构化 JSON 落盘（Application Support/MikaWeb/TrustedClick/），自检页带最近一份导出入口。复刻页 test-trusted（新资源）——条款弹窗由触摸状态机驱动（只有带坐标的合法触摸序列能关、合成 click 与空 touches 只记不收），页面自有事件账与插桩互为第二观察者，Touch 构造器实测在位；同页含 E2 探针按钮（aria-label 定位、记 click 与 isTrusted）。E2 宿主路径——自检二十内递归枚举自家 WKWebView 无障碍树（去重＋深度/总量双封顶）、按 label 命中后调公开 accessibilityActivate()、回读页面计数与 isTrusted 按规格判据出结论（通＝isTrusted=true 或动作生效；不通写明卡点层），本单只记实验结论不产品化。自检二十续排（E1 双账逐类型计数对照＋touches 恒空双证；E2 判定行）。复刻页逻辑已过 Node 最小 DOM 桩冒烟（合成 click/空 touches 关不掉、带坐标合法触摸能关、普通按钮与 AX 页账正常；只验页面逻辑、不冒充 WebKit 实测）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 1581e63 实查均 0 行）；插桩只读不改页面行为、不落盘凭据；无新依赖；GPL 只借备忘手法描述未抄码；未合 main；父级 SPEC 文件未动未提交。
+- 未证项：自检二十 Tier A 未真机运行（本机无 Swift 工具链）；E2 三种结局（树够不到／激活无事件／通）均待真机字段证据，本单不预判；E1 真机金标准（真实条款弹窗上 Joey 真点一次＋合成重放 diff）不在本单内——插桩与导出通道已做到装上即可采，采集步骤在案卷 §4，阿仁另行约 Joey；E3 受 E1 真机结果门控、未解锁未实施。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后本构建取代 0239 成为唯一复测目标；验收通过前不合 main。
