@@ -264,3 +264,12 @@
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 1581e63 实查均 0 行）；插桩只读不改页面行为、不落盘凭据；无新依赖；GPL 只借备忘手法描述未抄码；未合 main；父级 SPEC 文件未动未提交。
 - 未证项：自检二十 Tier A 未真机运行（本机无 Swift 工具链）；E2 三种结局（树够不到／激活无事件／通）均待真机字段证据，本单不预判；E1 真机金标准（真实条款弹窗上 Joey 真点一次＋合成重放 diff）不在本单内——插桩与导出通道已做到装上即可采，采集步骤在案卷 §4，阿仁另行约 Joey；E3 受 E1 真机结果门控、未解锁未实施。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后本构建取代 0239 成为唯一复测目标；验收通过前不合 main。
+
+## 增补（2026-11-03）：LADDER-FIX（绕行梯引擎驱动修复 F1–F6），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030336**（0.1.0）：分支 `feat/ladder-fix`（基线＝feat/trusted-click-exp tip aee0241，含构建 0252，未合 main），功能提交 `2e8686d`＋编译修复 `4889fa0`；CI Run 41572944643 success（日志原文双核对：70 条 SwiftCompile、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声，test-ladder/test-ladder-zero 资源打包在位）；Release Run 41573124585 success（agvtool 置号 202611030336、Archive Succeeded、Successfully uploaded package、dSYM artifact dsym-41573124585 5,344,001 字节实存未过期）；validate_project.py 全 PASS（31 源、资源集 15 项 HTML）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 LADDER-FIX-IMPL-2026-11-03.md）：针对诊断定案（梯级推进权在模型手里、梯子永停第 1 级）＋本单回路级成因确认（能力类 ask_user 处理后落入执行链尾 else、被 execute 以「不可执行动作」硬终结且旧 else 先执行后记账无留痕——与现场截图逐项吻合）。F1 梯级推进全程步流可见＋else 分支先记账后分发；F2 在开卡点账 OpenStall＋第 1 级逐项验收（真实执行证据，揭示复判/坐标点击同源口径明示）＋引擎三路自动推进（每轮动作后钩子、第二次信号、done 梯门拦截未尽梯的 done）＋澄清不吞卡点（快照跨停车存续）；F3 harvest 全 frame 多来源采集（href/data-*/onclick/内嵌数据）＋跨页模板记忆，预览链接排除计数，严禁 mid＝appmsgid 类映射假定；F4 词表外动作记账＋回注纠正＋计入卡点证据、不置 failed 不清快照，且 ask_user 与执行链改互斥 else-if 链根除误杀；F5 linkKind 区分预览/编辑链接＋点中预览步流标注＋入口型卡点 hover 显形探测（探不到记盲区）；F6 梯尽结案强制含 harvest 实况节。自检二十一（纯逻辑 8 条＋合成页回路四场景：单次信号自动推进到直达级、done 梯门、零候选梯尽结案含实况、澄清不吞卡点＋词表外不终结）。
+- 过程注记：CI 首跑 41572740446 为 tee 假绿（run 结论 success、日志实为 2 处编译 error、BUILD SUCCEEDED ×0——private(set) 属性跨类型赋值），日志双核对识破、修复 4889fa0 后重跑 41572944643 通过；最终 tip 验收只认 41572944643。诊断文件本身在 §3 D1 处截断（96 行），F1–F6 按父任务消息全文实施，缺口已记案卷。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 aee0241 实查均 0 行）；介入分类门语义不回退（安全类照常停车、澄清类不收紧）；无新依赖；未合 main；新增文案无「并行执行」；凭据不落盘；父级 SPEC 文件与诊断文件未动未提交。
+- 未证项：自检二十一 Tier A 未真机运行；真公众号草稿列表 harvest 实况与 hover 显形待 Tier B（详见案卷 §10），不得视为已验。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝自检二十一；第二条＝公众号场接续：《给信息做减法》草稿自主跑完＋E1 金标准真点一次）；亲验后本构建取代 0252 成为唯一复测目标；验收通过前不合 main。
