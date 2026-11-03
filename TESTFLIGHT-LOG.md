@@ -282,3 +282,11 @@
 - 红线复核：SafetyPolicy 与 MikaWebApp.swift 对基线 47ead2d 的 diff 实查均 0 行；SP-01 确认卡语义与一次性凭据规则不变（供文件只在判定之后）；无新依赖（Photos/PhotosUI/UTI 均系统框架）；新增文案无「并行」表述；未合 main；父级 SPEC 文件未动未提交。
 - 未证项：自检二十二 Tier A 未真机运行；合成 click 真机是否拉起面板回调、相册写入真机全程（权限弹窗/落盘/最近项目命中）、回退选择器真机呈现、公众号真实文件控件对回调供文件的接受度均待 Tier B（清单见案卷 §6），不得视为已验。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测；亲验后本构建取代 0336 成为唯一复测目标；验收通过前不合 main。
+
+## 增补（2026-11-03）：SELFCHECK-UNBLOCK-FIX（暂停态「结束任务」终结出口＋忙碌文案修齐），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030713**（0.1.0）：分支 `feat/selfcheck-unblock-fix`（基线＝feat/cover-upload-fix tip 38d1632，含构建 0625，未合 main），功能提交 `a986586`；CI Run 41594523715 success（日志原文双核对：70 条 SwiftCompile、本单 4 个改动文件均在编译列、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声，首跑即真绿）；Release Run 41594831597 success（agvtool 置号 202611030713、Archive Succeeded、Successfully uploaded、dSYM artifact dsym-41594831597 5,504,585 字节实存未过期）；validate_project.py 全 PASS（31 源、资源集 15 项 HTML）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 SELFCHECK-UNBLOCK-FIX-IMPL-2026-11-03.md）：针对 0625 真机现场——中断恢复的旧任务点「停止」后仍是已暂停态（stop 只置 .paused 并保留快照、busy 含暂停态），自检二十二被「引擎忙碌中」永久挡下，文案却写「先等终结或停止」、UI 又无丢弃出口。对治：①AgentStatus 新增终结态 .ended；引擎 finishTask（换代次/取消 worker、作废待决上传含 SP-01 凭据与待供武装、释放执行页绑定、清等待与恢复现场与目标、落终结态、步流留「任务已结束」记录、清该会话快照——重启不再恢复）＋finishTaskFromUser（终结后推进队列，advanceQueue 终结态集合增补 .ended）；②UI 落点＝消息区按钮行「停止」与「继续」之间，仅暂停态且正看任务所在会话时呈现「结束任务（不可续跑）」按钮，无二次确认、文案明示与「停止（可继续）」的区别；控制台状态色穷尽 switch 补 .ended 一行；③忙碌文案修齐：10 条自检 guard 的「（先等当前任务终结或停止）」统一改为「（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）」，grep 全量核对无遗漏；④自检二十三（合成暂停任务→finishTask→断言 busy 转假/终结态/快照文件删/等待与目标清/resume 不复活/绑定释放，演练前后引擎现场完整还原）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 对基线 38d1632 的 git diff 实查均 0 行；busy 判定、stop 暂停语义、中断恢复链路、多会话队列与代次语义不变（advanceQueue 仅增补 .ended 为终结态）；无新依赖；新增文案无「并行」表述；未合 main；父级 SPEC 文件未动未提交。
+- 未证项：自检二十三 Tier A 未真机运行；「结束任务」按钮真机呈现与点按全程、结束后杀进程重启不恢复，均待 Tier B（清单见案卷 §9），不得视为已验。已知化妆性副作用：自检二十三演练会向当前对话写一条「合成暂停」状态条目（对话层既有行为），已记案卷 §5。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝已暂停旧任务点「结束任务」→自检二十二能跑＋自检二十三；第二条＝结束后重启不恢复；第三条＝停止后继续仍能续跑）；亲验后本构建取代 0625 成为唯一复测目标；验收通过前不合 main。
