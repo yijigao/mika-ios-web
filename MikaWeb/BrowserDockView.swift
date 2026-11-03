@@ -83,7 +83,9 @@ enum DockGeometry {
     static func defaultCenter(level: DockLevel, area: CGSize,
                               bottomReserve: CGFloat = DockGeometry.bottomReserve) -> CGPoint {
         let size = visualSize(level: level, area: area)
-        return clampedCenter(CGPoint(x: area.width - size.width / 2 - edgeInset,
+        // SESSION-UX coordination point: L1 defaults left so the chat's
+        // trailing scroll-to-bottom button remains unobstructed above the composer.
+        return clampedCenter(CGPoint(x: size.width / 2 + edgeInset,
                                      y: area.height - max(Self.bottomReserve, bottomReserve) - size.height / 2 - 4),
                              level: level, area: area, bottomReserve: bottomReserve)
     }

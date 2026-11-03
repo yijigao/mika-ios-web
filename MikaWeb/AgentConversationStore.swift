@@ -206,6 +206,9 @@ struct PersistedChatEntry: Codable {
     func acceptedAnswer(_ text: String) { append(ChatEntry(taskID: taskID, kind: .userAnswer, text: text, source: .userAnswer)) }
     private func append(_ entry: ChatEntry) {
         if batching { batchedEntries.append(entry) } else { entries.append(entry) }
+        if entry.kind == .userTask {
+            SessionStore.shared.adoptAutomaticTitleIfNeeded(id: displayedSessionID, firstUserMessage: entry.text)
+        }
         persistNow()
     }
     private func flushBatch() {
@@ -255,6 +258,9 @@ struct PersistedChatEntry: Codable {
         decoded.append(PersistedChatEntry(entry))
         guard let data = try? JSONEncoder().encode(Array(decoded.suffix(Self.sessionEntryCap))) else { return }
         try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        if entry.kind == .userTask {
+            SessionStore.shared.adoptAutomaticTitleIfNeeded(id: sessionID, firstUserMessage: entry.text)
+        }
         SessionStore.shared.touch(id: sessionID)
     }
 

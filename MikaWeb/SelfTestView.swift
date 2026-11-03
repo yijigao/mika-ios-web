@@ -21,6 +21,7 @@ struct SelfTestView: View {
     @State private var taskFinishTestRunning = false
     @State private var editorEntryBindTestRunning = false
     @State private var floatingThreeLevelTestRunning = false
+    @State private var sessionUXTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -188,10 +189,26 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || floatingThreeLevelTestRunning)
             Text("自检二十五预期：不调用模型。真实状态存储完成 L1→L2→L3→L2→L1；切入 L1 前后 live WKWebView frame 与 window.innerWidth 不变；L1 下 JS 探针可注入并回读；快照节流器在 1 秒窗口内合并重复刷新。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十六：会话抽屉与滚动（SESSION-UX）") {
+                guard !sessionUXTestRunning else { return }
+                sessionUXTestRunning = true
+                runSessionUXTest()
+                dismiss()
+            }.disabled(!engine.active || sessionUXTestRunning)
+            Text("自检二十六预期（Tier A，不调用模型）：冷启动进入与切换会话都发出回底请求；用户上滑超过一屏后流式追加不强拉且出现回底按钮，点击恢复跟随；新对话首条用户消息生成标题并约定聚焦输入框；删除先二次确认、确认后即时更新列表。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
         }.navigationTitle("本地自检")
+    }
+
+    private func runSessionUXTest() {
+        defer { sessionUXTestRunning = false }
+        conversation.localFeedback("自检二十六：开始——会话抽屉与滚动 Tier A（不调用模型）")
+        let lines = SessionUXTierA.verify()
+        for line in lines { conversation.localFeedback("自检二十六：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检二十六结论：全部通过——初始/切换回底、上滑不强跟与回底按钮、新对话标题聚焦、删除确认契约均成立" : "自检二十六结论：\(failed) 项未通过，见逐条记录")
     }
 
     private func runFloatingThreeLevelTest() {

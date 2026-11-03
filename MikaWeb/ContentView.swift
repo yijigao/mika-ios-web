@@ -1,17 +1,21 @@
 import SwiftUI
+import UIKit
 struct ContentView: View {
     @ObservedObject var web: WebController
     @ObservedObject var settings: SettingsStore
     @ObservedObject var engine: AgentEngine
     @ObservedObject var conversation: AgentConversationStore
     @ObservedObject var diagnostics: DiagnosticStore
+    @ObservedObject private var sessionStore = SessionStore.shared
     @ObservedObject private var pending = PendingTaskStore.shared
     /// 对话输入框焦点（键盘修复，案卷 CHAT-KEYBOARD-FIX-2026-11-02.md）：在此持有，
     /// 绑定下传输入栏的 TextField，FocusState Binding 再下传浏览器坞——坞展开盖住
     /// 对话层时由坞代为收起，避免键盘悬浮在全屏浏览器上且用户无从收起。
     @FocusState private var chatInputFocused: Bool
+    @Environment(\.scenePhase) private var scenePhase
     /// 跟随最新消息（发送成功后输入栏置真，消息层据此滚动到底部）。
     @State private var followLatest = true
+    @State private var scrollToBottomRequest = 0
     /// 用户主动展开坞的请求令牌（INTERVENTION-PROMPT 定版）：对话区介入卡上的
     /// 「打开浏览器查看／打开浏览器」点击时 +1，下传浏览器坞展开。坞的一切形态
     /// 变化只来自用户动作（护盾点按／收起按钮／本令牌），程序不再自动展开。
@@ -57,6 +61,7 @@ struct ContentView: View {
             ZStack(alignment: .bottom) {
                 AgentChatView(engine: engine, settings: settings, conversation: conversation,
                               inputFocus: $chatInputFocused, followLatest: $followLatest,
+                              scrollToBottomRequest: scrollToBottomRequest,
                               bottomInset: inputBarHeight)
                     .zIndex(InterventionZOrder.chat(browserRaised: interventionBrowserRaised))
                 BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused,
@@ -83,7 +88,8 @@ struct ContentView: View {
                         .zIndex(InterventionZOrder.card(browserRaised: interventionBrowserRaised))
                 }
                 ChatInputBar(engine: engine, conversation: conversation,
-                             inputFocus: $chatInputFocused, followLatest: $followLatest)
+                             inputFocus: $chatInputFocused, followLatest: $followLatest,
+                             onSendJumpToBottom: { requestBottom() })
                     .zIndex(InterventionZOrder.inputBar(browserRaised: interventionBrowserRaised))
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.size.height
@@ -91,27 +97,56 @@ struct ContentView: View {
                         inputBarHeight = newHeight
                     }
             }
-            .navigationTitle("Mika Web").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                Button { showSessions = true } label: { Text("会话") }
-                Button { showAttachments = true } label: { Text("附件") }
-                NavigationLink { SelfTestView(engine: engine, settings: settings, conversation: conversation) } label: { Text("自检") }
-                NavigationLink { SettingsView(settings: settings, diagnostics: diagnostics) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
+            .overlay {
+                if showSessions {
+                    ZStack(alignment: .leading) {
+                        Color.black.opacity(0.32).ignoresSafeArea()
+                            .onTapGesture { withAnimation { showSessions = false } }
+                        SessionListView(engine: engine, conversation: conversation, web: web,
+                                        onClose: { withAnimation { showSessions = false } },
+                                        onSessionEntered: { requestBottom() },
+                                        onNewSessionFocus: { chatInputFocused = true })
+                            .frame(width: min(UIScreen.main.bounds.width * 0.86, 360))
+                            .background(.regularMaterial)
+                            .transition(.move(edge: .leading))
+                            .simultaneousGesture(DragGesture().onEnded { value in
+                                if abs(value.translation.width) > 60 { withAnimation { showSessions = false } }
+                            })
+                    }
+                    .zIndex(10)
+                }
             }
-            .sheet(isPresented: $showSessions) {
-                SessionListView(engine: engine, conversation: conversation, web: web)
+            .navigationTitle(currentSessionTitle).navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { withAnimation { showSessions = true } } label: { Image(systemName: "line.3.horizontal") }.accessibilityLabel("打开会话列表")
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { showAttachments = true } label: { Text("附件") }
+                    NavigationLink { SelfTestView(engine: engine, settings: settings, conversation: conversation) } label: { Text("自检") }
+                    NavigationLink { SettingsView(settings: settings, diagnostics: diagnostics) } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
+                }
             }
             .sheet(isPresented: $showAttachments) {
                 AttachmentsView(web: web)
             }
         }
         .onAppear { consumePending() }
+        .onAppear { requestBottom() }
+        .onChange(of: scenePhase) { _, phase in if phase == .active { requestBottom() } }
         .onChange(of: pending.task) { _, _ in consumePending() }
         .onChange(of: showsInterventionPrompt) { _, shown in
             // 介入解除（已处理／已确认／已解决，含切走会话时卡片隐去）→
             // 浏览器置顶呈现自动复位，层级回到常态（ZORDER-FIX 规格 2）。
             if !shown { interventionBrowserRaised = false }
         }
+    }
+    private var currentSessionTitle: String {
+        sessionStore.meta(for: conversation.displayedSessionID)?.title ?? "新对话"
+    }
+    private func requestBottom() {
+        followLatest = true
+        scrollToBottomRequest += 1
     }
     private func consumePending() {
         if let task = pending.task { conversation.draft = task; pending.task = nil }
@@ -139,6 +174,7 @@ struct ContentView: View {
             conversation.switchDisplayedSession(to: target)
             engine.adoptDisplayedSession(target)
         }
+        requestBottom()
         web.revealExecutionTab()
         dockExpandRequest += 1
     }

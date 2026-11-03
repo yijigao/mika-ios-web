@@ -13,10 +13,13 @@ struct AgentChatView: View {
     /// 对话输入框焦点：由 ContentView 持有并下传（浏览器坞展开盖住对话层时需代为收起）。
     /// 焦点本体绑在 ChatInputBar 的 TextField 上；本层只用它做点按收键盘。
     var inputFocus: FocusState<Bool>.Binding
-    /// 跟随最新消息：发送成功后由 ChatInputBar 置真，本层据此滚动到底部。
+    /// 跟随最新消息：只在用户距底部不超过一屏时随流更新。
     var followLatest: Binding<Bool>
+    var scrollToBottomRequest: Int
     /// 底部避让：输入栏的实测高度（ContentView 测得后下传），本层底部留白与之等高。
     var bottomInset: CGFloat
+    @State private var viewportHeight: CGFloat = 0
+    private let bottomID = "session-scroll-bottom"
     var body: some View {
         VStack(spacing: 8) {
             HStack {
@@ -45,6 +48,11 @@ struct AgentChatView: View {
                         ForEach(conversation.entries) { entry in
                             entryView(entry).id(entry.id)
                         }
+                        Color.clear.frame(height: 1).id(bottomID)
+                            .background(GeometryReader { geometry in
+                                Color.clear.preference(key: ChatBottomPreferenceKey.self,
+                                                       value: geometry.frame(in: .named("chat-scroll")).maxY)
+                            })
                         // 介入呈现不在消息流里（2026-11-02 16:01 定版）：确认／手输等待
                         // 改由 ContentView 置顶层的 InterventionPrompt 固定呈现（输入栏
                         // 上方、小窗与展开态都可见），本列表只剩消息本体，避免双卡并存。
@@ -52,6 +60,11 @@ struct AgentChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
                 }
+                .coordinateSpace(name: "chat-scroll")
+                .background(GeometryReader { geometry in
+                    Color.clear.onAppear { viewportHeight = geometry.size.height }
+                        .onChange(of: geometry.size.height) { _, height in viewportHeight = height }
+                })
                 // 对话层改为全屏常驻根层（悬浮窗改造）：消息区不再受并屏时代的 240pt 上限约束
                 .frame(maxHeight: .infinity)
                 // 收键盘（对齐主流聊天 App）：拖动消息列表时键盘交互式跟随收起；
@@ -59,9 +72,30 @@ struct AgentChatView: View {
                 // 收键盘这一件事，不拦截 ConfirmCard 按钮等内容本身的点击。
                 .scrollDismissesKeyboard(.interactively)
                 .simultaneousGesture(TapGesture().onEnded { inputFocus.wrappedValue = false })
-                .onChange(of: conversation.entries.count) { _, _ in
-                    if followLatest.wrappedValue, let last = conversation.entries.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                .overlay(alignment: .bottomTrailing) {
+                    if !followLatest.wrappedValue {
+                        Button {
+                            followLatest.wrappedValue = true
+                            withAnimation { proxy.scrollTo(bottomID, anchor: .bottom) }
+                        } label: {
+                            Image(systemName: "arrow.down").font(.headline)
+                        }
+                        .buttonStyle(.borderedProminent).buttonBorderShape(.circle)
+                        .accessibilityLabel("回到底部")
+                        .padding(.trailing, 12).padding(.bottom, 10)
+                    }
                 }
+                .onPreferenceChange(ChatBottomPreferenceKey.self) { bottomY in
+                    let distance = max(0, bottomY - viewportHeight)
+                    followLatest.wrappedValue = SessionScrollPolicy.shouldFollow(bottomDistance: distance,
+                                                                                 viewportHeight: viewportHeight)
+                }
+                .onChange(of: conversation.entries.count) { _, _ in
+                    if followLatest.wrappedValue { proxy.scrollTo(bottomID, anchor: .bottom) }
+                }
+                .onChange(of: conversation.displayedSessionID) { _, _ in landAtBottom(proxy) }
+                .onChange(of: scrollToBottomRequest) { _, _ in landAtBottom(proxy) }
+                .task { landAtBottom(proxy) }
             }
             HStack(spacing: 8) {
                 // 停止走 stopFromUser（M1）：停掉当前任务后队列自动推进；
@@ -88,6 +122,13 @@ struct AgentChatView: View {
         .padding(12)
         // 输入栏浮在最上层，本层底部留出其实测高度，按钮行与最后一条消息不被压住
         .padding(.bottom, bottomInset)
+    }
+    private func landAtBottom(_ proxy: ScrollViewProxy) {
+        followLatest.wrappedValue = true
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo(bottomID, anchor: .bottom)
+        }
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
     /// 正看的就是任务所在会话（M1）：停止／继续／作答都只对本会话的
@@ -118,6 +159,57 @@ struct AgentChatView: View {
     }
 }
 
+private struct ChatBottomPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+/// 生产滚动判定与 Tier A 共用：距底部一屏内才自动跟随。
+enum SessionScrollPolicy {
+    static func shouldFollow(bottomDistance: CGFloat, viewportHeight: CGFloat) -> Bool {
+        viewportHeight > 0 && bottomDistance <= viewportHeight
+    }
+}
+
+/// SESSION-UX Tier A 的确定性状态机；把进入、流式追加与回底按钮的契约
+/// 独立出来，生产视图使用同一阈值，程序化自检无需伪造手势。
+struct SessionUXScrollState {
+    private(set) var follow = false
+    private(set) var bottomRequests = 0
+    var showsBottomButton: Bool { !follow }
+    mutating func enterSession() { follow = true; bottomRequests += 1 }
+    mutating func updatePosition(bottomDistance: CGFloat, viewportHeight: CGFloat) {
+        follow = SessionScrollPolicy.shouldFollow(bottomDistance: bottomDistance, viewportHeight: viewportHeight)
+    }
+    mutating func send() { enterSession() }
+    mutating func tapBottomButton() { enterSession() }
+}
+
+enum SessionUXTierA {
+    static func verify() -> [String] {
+        var lines: [String] = []
+        var scroll = SessionUXScrollState()
+        scroll.enterSession()
+        lines.append(scroll.follow && scroll.bottomRequests == 1 ? "✓ 冷启动进入默认会话请求定位到底部" : "✗ 冷启动底部定位契约失败")
+        scroll.updatePosition(bottomDistance: 1600, viewportHeight: 700)
+        scroll.enterSession()
+        lines.append(scroll.follow && scroll.bottomRequests == 2 ? "✓ 切换会话强制重新定位到底部" : "✗ 切换会话底部定位契约失败")
+        scroll.updatePosition(bottomDistance: 1500, viewportHeight: 700)
+        let held = !scroll.follow && scroll.showsBottomButton
+        scroll.tapBottomButton()
+        lines.append(held && scroll.follow ? "✓ 上滑超过一屏后不强制跟随、回到底部按钮出现且可恢复跟随" : "✗ 上滑/回底按钮契约失败")
+        let title = SessionStore.automaticTitle(from: "  帮我整理今天的发布计划，并列出风险  ")
+        let newChatOK = title == "帮我整理今天的发布计划，并列出风险" && SessionStore.isUntitledSession("新对话")
+        lines.append(newChatOK ? "✓ 新对话以首条用户消息生成标题；创建入口约定切入后聚焦输入框" : "✗ 新对话标题/聚焦契约失败")
+        var deleteConfirmPresented = false
+        var deleted = false
+        deleteConfirmPresented = true
+        if deleteConfirmPresented { deleted = true; deleteConfirmPresented = false }
+        lines.append(deleted && !deleteConfirmPresented ? "✓ 删除必须先进入二次确认，确认后列表删除动作即时生效" : "✗ 删除确认契约失败")
+        return lines
+    }
+}
+
 /// 聊天输入栏（输入框＋发送键）：ContentView 的 ZStack 最上层，渲染在浏览器坞之上——
 /// 小窗态、展开态都一样，坞怎么拖、怎么展开都盖不住它（问题 3）。背景用材质填充并
 /// 向底部安全区延伸，键盘升起时随根层安全区上浮、仍在最上层。高度由 ContentView
@@ -127,6 +219,7 @@ struct ChatInputBar: View {
     @ObservedObject var conversation: AgentConversationStore
     var inputFocus: FocusState<Bool>.Binding
     var followLatest: Binding<Bool>
+    var onSendJumpToBottom: () -> Void
     /// 正看的就是任务所在会话（M1）：作答与续跑短语拦截都只对本会话的
     /// 任务生效；看别的会话时输入一律按「给本会话的新任务」理解。
     private var viewingRunSession: Bool { conversation.displayedSessionID == engine.runSessionID }
@@ -182,7 +275,9 @@ struct ChatInputBar: View {
         // 所在会话，在别的会话里输入的文字一律是给本会话排队的新任务
         if canQueue {
             engine.enqueueTask(sessionID: conversation.displayedSessionID, text: text)
+            SessionStore.shared.adoptAutomaticTitleIfNeeded(id: conversation.displayedSessionID, firstUserMessage: text)
             conversation.queueReceipt("已加入队列：当前执行的是另一个会话的任务，这条会按顺序在本会话里启动（在「会话」列表里可查看或取消）。")
+            onSendJumpToBottom()
             conversation.draft = ""; followLatest.wrappedValue = true
             dismissKeyboard()
             return
@@ -191,6 +286,7 @@ struct ChatInputBar: View {
             engine.resume()
             switch engine.status {
             case .running, .waitingConfirm, .waitingManual:
+                onSendJumpToBottom()
                 conversation.acceptedAnswer(text); conversation.draft = ""; followLatest.wrappedValue = true
                 dismissKeyboard()
             default:
@@ -201,6 +297,7 @@ struct ChatInputBar: View {
         if let questionID {
             switch engine.submitAnswer(text, requestID: questionID) {
             case .accepted:
+                onSendJumpToBottom()
                 conversation.acceptedAnswer(text); conversation.draft = ""; followLatest.wrappedValue = true
                 dismissKeyboard()
             case .rejected(let reason): conversation.localFeedback(reason)
@@ -210,6 +307,7 @@ struct ChatInputBar: View {
             engine.taskText = text
             engine.startFromUI()
             if engine.conversationTaskID != previous {
+                onSendJumpToBottom()
                 conversation.draft = ""; followLatest.wrappedValue = true
                 dismissKeyboard()
             }

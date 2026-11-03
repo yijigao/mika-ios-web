@@ -1,14 +1,14 @@
 import SwiftUI
 
 /// 会话列表（M1，2026-11-02）：多会话外壳的管理入口（ContentView 工具栏
-/// 「会话」打开为 sheet）。职责：会话的新建／切换／改名／删除、排队任务
+/// 汉堡按钮打开为左抽屉）。职责：会话的新建／切换／改名／删除、排队任务
 /// 的查看与取消、执行异常标记的展示。
 ///
 /// 切换与删除都是跨对象编排，顺序是本页的核心契约：
 /// - 切换：①SessionStore 当前会话指针先行 → ②对话存储换源（旧条目落盘
 ///   收尾、新条目整表载入）→ ③引擎 adopt（空闲才换运行时与快照；执行中
 ///   只换标签显示，运行现场留原会话）。标签换组在 adopt 内部完成。
-/// - 删除：执行中的会话禁删（其标签与运行时都是任务现场）；删的若是
+/// - 删除：执行中的会话经二次确认后先 stop＋finish；删的若是
 ///   当前查看会话，先切到另一个会话再删；排队任务与标签随会话一并
 ///   回收，最后才删索引与目录（SessionStore.deleteSession）。
 /// 本页文案口径：只说多会话／排队，不承诺「并行执行」——同一时刻只有
@@ -18,22 +18,37 @@ struct SessionListView: View {
     @ObservedObject var conversation: AgentConversationStore
     @ObservedObject var web: WebController
     @ObservedObject private var store = SessionStore.shared
-    @Environment(\.dismiss) private var dismiss
+    var onClose: () -> Void
+    var onSessionEntered: () -> Void
+    var onNewSessionFocus: () -> Void
     @State private var renameTarget: UUID?
     @State private var renameText = ""
     @State private var deleteTarget: SessionMeta?
+    @State private var searchText = ""
 
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    Button { createSession() } label: {
+                        Label("新对话", systemImage: "square.and.pencil")
+                    }
+                    TextField("搜索会话", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(true)
+                        .accessibilityHint("搜索结构已预留，稍后开放")
+                }
                 if let anomaly = engine.executionAnomaly {
                     Section {
                         Text(anomaly).font(.caption).foregroundStyle(.orange)
                     }
                 }
-                Section("会话") {
-                    ForEach(store.sessions) { meta in
-                        row(meta)
+                ForEach(SessionTimeGroup.allCases, id: \.self) { group in
+                    let items = visibleSessions.filter { group.contains($0.lastActiveAt) }
+                    if !items.isEmpty {
+                        Section(group.title) {
+                            ForEach(items) { meta in row(meta) }
+                        }
                     }
                 }
                 if !engine.queuedTasks.isEmpty {
@@ -43,13 +58,7 @@ struct SessionListView: View {
                         }
                     }
                 }
-                Section {
-                    Button {
-                        createSession()
-                    } label: {
-                        Label("新建会话", systemImage: "plus.circle")
-                    }
-                } footer: {
+                Section { EmptyView() } footer: {
                     Text("同一时刻只有一个任务在执行：在其他会话里写下的任务会排队，轮到时在它自己的会话里启动。对话记录、标签页与未完成的任务都按会话分开保存。")
                         .font(.caption)
                 }
@@ -58,7 +67,7 @@ struct SessionListView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") { dismiss() }
+                    Button("完成") { onClose() }
                 }
             }
             .alert("重命名会话", isPresented: renamePresented) {
@@ -79,6 +88,10 @@ struct SessionListView: View {
                 Text("会话「\(deleteTarget?.title ?? "")」的对话记录、标签与未完成任务将一并删除，不可恢复。")
             }
         }
+    }
+
+    private var visibleSessions: [SessionMeta] {
+        store.sessions.sorted { $0.lastActiveAt > $1.lastActiveAt }
     }
 
     private var renamePresented: Binding<Bool> {
@@ -117,10 +130,9 @@ struct SessionListView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            if meta.id != store.currentSessionID {
-                switchTo(meta.id)
-                dismiss()
-            }
+            if meta.id != store.currentSessionID { switchTo(meta.id) }
+            onSessionEntered()
+            onClose()
         }
         .swipeActions(edge: .trailing) {
             if canDelete(meta) {
@@ -131,6 +143,10 @@ struct SessionListView: View {
                 renameText = meta.title
             }
             .tint(.blue)
+        }
+        .contextMenu {
+            Button("重命名") { renameTarget = meta.id; renameText = meta.title }
+            if canDelete(meta) { Button("删除", role: .destructive) { deleteTarget = meta } }
         }
     }
 
@@ -183,28 +199,34 @@ struct SessionListView: View {
     }
 
     private func createSession() {
-        // createSession 已把当前会话指针移到新会话（第 ① 步由存储完成），
-        // 补齐 ②③ 即可
-        let meta = store.createSession(title: "新会话")
+        // 新建后按与普通切换相同的 ①②③ 顺序编排。
+        let meta = store.createSession(title: "新对话")
+        store.setCurrentSession(id: meta.id)
         conversation.switchDisplayedSession(to: meta.id)
         engine.adoptDisplayedSession(meta.id)
-        dismiss()
+        onSessionEntered()
+        onClose()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onNewSessionFocus() }
     }
 
     private func canDelete(_ meta: SessionMeta) -> Bool {
         guard store.sessions.count > 1 else { return false }
-        // 执行中的会话禁删：其标签与运行时都是任务现场
-        if meta.id == engine.runSessionID, engine.busy { return false }
         return true
     }
 
     private func deleteSession(_ meta: SessionMeta) {
         let id = meta.id
         guard canDelete(meta) else { return }
+        // 规格要求：删正在执行的会话，确认后先停并彻底结束该任务，再回收会话。
+        if id == engine.runSessionID, engine.busy {
+            engine.stop()
+            engine.finishTaskFromUser()
+        }
         // 删当前查看会话：先切到另一个会话（切换编排会把对话与标签带走）
         if id == store.currentSessionID {
             guard let fallback = store.sessions.first(where: { $0.id != id }) else { return }
             switchTo(fallback.id)
+            onSessionEntered()
         }
         engine.cancelQueuedTasks(forSession: id)
         web.discardTabs(for: id)
@@ -214,5 +236,19 @@ struct SessionListView: View {
         if engine.runSessionID == id {
             engine.adoptDisplayedSession(store.currentSessionID)
         }
+    }
+}
+
+private enum SessionTimeGroup: CaseIterable {
+    case today, yesterday, lastSevenDays, earlier
+    var title: String {
+        switch self { case .today: return "今天"; case .yesterday: return "昨天"; case .lastSevenDays: return "前 7 天"; case .earlier: return "更早" }
+    }
+    func contains(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> Bool {
+        if calendar.isDateInToday(date) { return self == .today }
+        if calendar.isDateInYesterday(date) { return self == .yesterday }
+        let startToday = calendar.startOfDay(for: now)
+        let cutoff = calendar.date(byAdding: .day, value: -7, to: startToday) ?? .distantPast
+        return self == (date >= cutoff ? .lastSevenDays : .earlier)
     }
 }

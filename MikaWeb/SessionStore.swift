@@ -164,6 +164,26 @@ final class SessionStore: ObservableObject {
         persistIndex()
     }
 
+    /// 新对话第一次真正发送后，以首条用户消息生成标题；用户已经改过名的
+    /// 会话绝不覆盖。列表与顶栏共用这个索引标题，因此更新会即时反映。
+    func adoptAutomaticTitleIfNeeded(id: UUID, firstUserMessage: String) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }),
+              Self.isUntitledSession(sessions[index].title) else { return }
+        let title = Self.automaticTitle(from: firstUserMessage)
+        guard !title.isEmpty else { return }
+        sessions[index].title = title
+        persistIndex()
+    }
+
+    static func automaticTitle(from message: String) -> String {
+        let compact = message.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return String(compact.prefix(32))
+    }
+
+    static func isUntitledSession(_ title: String) -> Bool {
+        title == "新对话" || title == "新会话"
+    }
+
     @discardableResult
     func createSession(title: String) -> SessionMeta {
         let meta = SessionMeta(id: UUID(), title: title, createdAt: Date(), lastActiveAt: Date(), status: "idle")
