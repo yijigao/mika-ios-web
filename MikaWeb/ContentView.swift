@@ -17,8 +17,8 @@ struct ContentView: View {
     @State private var followLatest = true
     @State private var scrollToBottomRequest = 0
     /// 用户主动展开坞的请求令牌（INTERVENTION-PROMPT 定版）：对话区介入卡上的
-    /// 「打开浏览器查看／打开浏览器」点击时 +1，下传浏览器坞展开。坞的一切形态
-    /// 变化只来自用户动作（护盾点按／收起按钮／本令牌），程序不再自动展开。
+    /// 「打开浏览器查看／打开浏览器」点击时 +1，下传浏览器坞全屏展开。
+    /// 普通显隐由任务状态、固定开关与安全介入共同驱动。
     @State private var dockExpandRequest = 0
     /// 介入态「浏览器置顶」呈现状态（ZORDER-FIX）：用户在介入卡上点
     /// 「打开浏览器*」时与 expandRequest 同一次点击置真——根层级换位

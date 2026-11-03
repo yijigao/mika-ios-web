@@ -2881,49 +2881,61 @@ struct OpenStall {
         return lines
     }
 
-    /// Tier A for FLOATING-3LEVEL. This exercises the production DockStateStore
-    /// and the currently mounted WKWebView; it does not call the model.
-    func verifyFloatingThreeLevel() async -> [String] {
+    /// Tier A for FLOATING-VISIBILITY. Exercises the production visibility
+    /// store and currently mounted WKWebView without calling the model.
+    func verifyFloatingVisibility() async -> [String] {
         func mark(_ pass: Bool) -> String { pass ? "✓" : "✗" }
         var lines: [String] = []
+        let state = DockStateStore()
+        lines.append("\(mark(!state.isVisible && state.showsVisibilityToggle)) 冷启动静默：浮窗默认隐藏、固定开关可见")
+        state.taskStarted()
+        lines.append("\(mark(state.isVisible)) 任务开始：自动显示")
+        state.taskTerminated()
+        lines.append("\(mark(!state.isVisible)) 任务终态：自动隐藏")
+        state.toggle(); let idleOpened = state.isVisible
+        state.toggle(); let idleClosed = !state.isVisible
+        lines.append("\(mark(idleOpened && idleClosed)) 静默开关：点开显示，再点隐藏")
+        state.taskStarted(); state.toggle()
+        let hiddenDuringTask = !state.isVisible
+        let stillHiddenDuringTask = !state.isVisible
+        state.setInterventionRequired(true)
+        let forcedByIntervention = state.isVisible
+        state.toggle()
+        let cannotHideIntervention = state.isVisible
+        state.setInterventionRequired(false)
+        let restoredTaskHide = !state.isVisible
+        lines.append("\(mark(hiddenDuringTask && stillHiddenDuringTask)) 任务内手动隐藏：保持隐藏直到任务迁移")
+        lines.append("\(mark(forcedByIntervention && cannotHideIntervention && restoredTaskHide)) 安全介入：强制显示、拒绝隐藏，解除后恢复本任务手动隐藏选择")
+        state.taskTerminated()
+        lines.append("\(mark(!state.isVisible)) 介入解除后的终态：回到默认隐藏")
+
         let dock = web.dockState
-        let savedLevel = dock.level
-        defer { dock.level = savedLevel }
-
-        dock.level = .snapshot
-        var visited = [dock.level]
-        for level in [DockLevel.panel, .fullScreen, .panel, .snapshot] {
-            dock.level = level
-            visited.append(level)
-            await Task.yield()
+        let savedDesired = dock.desiredVisible
+        let savedIntervention = dock.interventionRequired
+        let savedFullScreen = dock.fullScreen
+        defer {
+            dock.setInterventionRequired(false)
+            dock.taskTerminated()
+            if savedDesired { dock.toggle() }
+            dock.setInterventionRequired(savedIntervention)
+            if savedFullScreen { dock.showFullScreen() }
         }
-        let expected: [DockLevel] = [.snapshot, .panel, .fullScreen, .panel, .snapshot]
-        lines.append("\(mark(visited.map(\.rawValue) == expected.map(\.rawValue))) 等级状态机：冷启动 L1，L1→L2→L3→L2→L1 全循环顺序正确")
-
-        dock.level = .panel
+        dock.setInterventionRequired(false)
+        dock.taskStarted()
         await Task.yield()
         let frameBefore = web.webView.frame.size
         let viewportBefore = (try? await web.evaluate("window.innerWidth")) as? NSNumber
-        dock.level = .snapshot
+        dock.toggle()
         await Task.yield()
         let frameAfter = web.webView.frame.size
         let viewportAfter = (try? await web.evaluate("window.innerWidth")) as? NSNumber
         let sameFrame = abs(frameBefore.width - frameAfter.width) < 0.5 && abs(frameBefore.height - frameAfter.height) < 0.5
         let sameViewport = viewportBefore?.doubleValue == viewportAfter?.doubleValue && viewportBefore != nil
-        lines.append("\(mark(sameFrame && sameViewport)) L1 切换前后 WKWebView frame=\(frameBefore)→\(frameAfter)、viewport=\(viewportBefore?.intValue ?? -1)→\(viewportAfter?.intValue ?? -1)，均不变")
+        lines.append("\(mark(sameFrame && sameViewport)) 显示→隐藏前后 WKWebView frame=\(frameBefore)→\(frameAfter)、viewport=\(viewportBefore?.intValue ?? -1)→\(viewportAfter?.intValue ?? -1)，均不变")
 
-        dock.level = .snapshot
         let token = UUID().uuidString
-        let probe = (try? await web.evaluate("(()=>{window.__mikaFloatingL1='\(token)';return window.__mikaFloatingL1;})()")) as? String
-        lines.append("\(mark(probe == token)) L1 状态 JS 探针注入并回读成功（live webview 未挂起）")
-
-        var throttle = SnapshotRefreshThrottle()
-        let base = Date(timeIntervalSince1970: 1_000)
-        let first = throttle.request(at: base)
-        let second = throttle.request(at: base.addingTimeInterval(0.2))
-        let third = throttle.request(at: base.addingTimeInterval(0.5))
-        let fired = throttle.consumePending(at: base.addingTimeInterval(1))
-        lines.append("\(mark(first == 0 && second != nil && third == nil && fired)) 快照节流：1 秒内多次变化仅一次立即刷新＋一次合并的到期刷新")
+        let probe = (try? await web.evaluate("(()=>{window.__mikaFloatingHidden='\(token)';return window.__mikaFloatingHidden;})()")) as? String
+        lines.append("\(mark(probe == token)) 隐藏状态 JS 探针注入并回读成功（agent 执行未挂起）")
         return lines
     }
 
