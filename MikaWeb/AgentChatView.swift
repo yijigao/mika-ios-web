@@ -160,7 +160,7 @@ struct AgentChatView: View {
             }
             .foregroundStyle(foreground)
             .padding(.horizontal, 14)
-            .frame(minWidth: 64, height: 32)
+            .frame(minWidth: 64, minHeight: 32, maxHeight: 32)
             .background(.ultraThinMaterial, in: Capsule())
             .overlay(Capsule().strokeBorder(Color(uiColor: .separator), lineWidth: 0.5))
             .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
