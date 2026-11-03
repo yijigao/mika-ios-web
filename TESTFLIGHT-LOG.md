@@ -233,3 +233,10 @@
 - 过程注记：中间构建 **202611030133**（Release Run 41560472592、dSYM 4,745,239 字节）含一处依中途 steer 所作的兜底文案对齐，Joey 纠正口径后已撤回并被 0144 取代，不作复测目标。
 - 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动（git diff 对基线 9995b46 实查均 0 行）；无新第三方依赖（两处手法为改编、已注出处许可）；未合 main；文案无「并行执行」；凭据不落盘；父级 SPEC 文件未动未提交。
 - 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝公众号编辑器原场景：入口按写死顺序找到、失败步流带揭示手段清单、未保存不重载逃生、发表记录双条件对账；真编辑器 DOM 形态未经本单证实，不得视为已验）；验收通过前不合 main。
+
+## 增补（2026-11-03）：UI-LEGIBILITY（浮层可读性：强模糊＋近不透明＋变暗遮罩），新构建已上（待阿仁 ASC 亲验）
+
+- 构建 **202611030209**（0.1.0）：分支 `feat/ui-legibility`（基线＝feat/wechat-editor-nav tip a9523b6，含构建 0144，未合 main），功能提交 `544b035`；CI Run 41563995582 success（日志原文双核对：70 条 SwiftCompile、三个改动文件均在编译列、BUILD SUCCEEDED ×1、FAILED ×0，唯一 error: 为既有 AppIntents 训练噪声）；Release Run 41564236293 success（agvtool 置号 202611030209、Archive Succeeded、Successfully uploaded package、dSYM artifact dsym-41564236293 4,790,339 字节实存未过期）；validate_project.py 全 PASS（31 源、12 项资源集）。ASC 状态：**待阿仁亲验**（未记 VALID、未挂组）。
+- 内容（案卷 UI-LEGIBILITY-IMPL-2026-11-03.md）：症状定性——(a) 过透为主因（三卡改前只有 .orange.opacity(0.12~0.15) 单层、无材质无遮罩）；(b) 非视图重复绘制（介入卡全层级只渲染一处），叠印来自同一介入文案在步骤行/状态行/回复/卡片多处在场×半透明卡叠加，呈现层修复即可消除、引擎去重不在本单（观察项）。修法：呈现规格 OverlayStyle 单点定义——卡面共用背景＝ultraThickMaterial 强模糊＋系统底色 0.72 覆盖＋橙色调 0.14（未模糊直透 ≈0.24 且先经模糊）＋描边投影；ContentView 介入层加整屏变暗遮罩（black 0.42、不拦截触摸，网页弹窗与坞控件照常可点）；InterventionPrompt 选卡逻辑抽纯函数 cardKind 互斥（上传＞确认＞手输），同一时刻至多一张卡。交互、布局顺序、文案口径、安全确认流程一律未动。自检十七（结构断言：材质/覆盖/直透/遮罩/不拦截触摸/单卡真值表；Tier B 真机第一条＝公众号场再遇介入卡读一遍是否清晰）。
+- 红线复核：MikaWebApp.swift 单持有者、SafetyPolicy 零改动、引擎/感知逻辑文件对基线 diff 均 0 行（只动 AgentChatView/ContentView/SelfTestView 三个呈现层文件）；无新依赖；未合 main；凭据不落盘；父级 SPEC 文件未动未提交。
+- 待阿仁 ASC 亲验（VALID＋Internal 组挂载）后交 Joey 按案卷 Tier B 复测（第一条＝公众号场介入卡可读性：卡内文字清晰、卡后变暗无透叠、网页弹窗照常可亲手点）；亲验后本构建取代 0144 成为唯一复测目标；验收通过前不合 main。
