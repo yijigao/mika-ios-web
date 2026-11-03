@@ -282,6 +282,13 @@ struct ConfirmCard: View {
     var pageHost: String = ""
     /// 「打开浏览器查看」：用户主动展开坞的回调；nil 时不显示该按钮。
     var onOpenBrowser: (() -> Void)? = nil
+    /// 小条形态（ZORDER-FIX）：浏览器置顶态下收成单行条（标题＋解决
+    /// 按钮＋「说明」），全字段说明不绘制；解决按钮仍走本卡的 submit
+    /// 守卫路径。紧凑渲染是 body 内分支，本卡 @State（locked）不因
+    /// 形态切换丢失。
+    var compact: Bool = false
+    /// 小条上的「说明」：回到全卡形态（ContentView 复位置顶状态）。
+    var onShowFull: (() -> Void)? = nil
     @State private var locked = false
     private var detailText: String {
         var lines = ["动作：\(action.action)，目标序号：\(action.index)"]
@@ -296,20 +303,36 @@ struct ConfirmCard: View {
         return lines.joined(separator: "\n")
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("等待确认").font(.headline)
-            Text(detailText)
-            HStack {
-                Button("确认执行", role: .destructive) { submit(true) }.disabled(locked)
+        if compact {
+            // 小条（ZORDER-FIX）：用户已从全卡读过详情、正在浏览器里
+            // 核对页面——条上只留标题与两个解决按钮（同一 submit 守卫）
+            // 及回全卡的「说明」，不挡网页操作区。
+            HStack(spacing: 10) {
+                Text("等待确认").font(.subheadline.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 4)
+                if let onShowFull { Button("说明") { onShowFull() } }
                 Button("拒绝") { submit(false) }.disabled(locked)
-                if let onOpenBrowser {
-                    Spacer()
-                    Button("打开浏览器查看") { onOpenBrowser() }
+                Button("确认执行", role: .destructive) { submit(true) }.disabled(locked)
+            }
+            .font(.callout).padding(.horizontal, 12).padding(.vertical, 9)
+            .frame(maxWidth: .infinity)
+            .interventionCardBackground()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("等待确认").font(.headline)
+                Text(detailText)
+                HStack {
+                    Button("确认执行", role: .destructive) { submit(true) }.disabled(locked)
+                    Button("拒绝") { submit(false) }.disabled(locked)
+                    if let onOpenBrowser {
+                        Spacer()
+                        Button("打开浏览器查看") { onOpenBrowser() }
+                    }
                 }
             }
+            .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .interventionCardBackground()
         }
-        .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-        .interventionCardBackground()
     }
     private func submit(_ execute: Bool) {
         guard !locked, engine.conversationTaskID == taskID else { return }
@@ -345,12 +368,45 @@ struct ConfirmCard: View {
 ///   取消口径继续任务。
 /// 与 ConfirmCard 同口径：本地 locked 防重复点按，解决动作都走引擎的
 /// 既有等待解决路径，不在此新造状态。
+/// 浏览器置顶小条形态（ZORDER-FIX，2026-11-03）：用户在卡上点「打开
+/// 浏览器*」后，根层级把坞升到遮罩之上、卡收成本层的 compact 小条
+/// （层级表 InterventionZOrder 在 ContentView.swift）——网页不再被卡
+/// 与遮罩挡住，用户亲手处理完点小条上的解决按钮（与全卡同一路径）
+/// 即随介入解除恢复常态；小条上的「说明」可随时回全卡重读详情。
 struct UploadCard: View {
     @ObservedObject var engine: AgentEngine
     let upload: AgentEngine.PendingUpload
     var onOpenBrowser: (() -> Void)? = nil
+    /// 小条形态（ZORDER-FIX）：同 ConfirmCard 口径——body 内分支渲染
+    /// 单行条（短标题＋本阶段解决按钮＋「说明」），解决按钮仍走本卡
+    /// lock 守卫与引擎既有路径，@State 锁不因形态切换丢失。
+    var compact: Bool = false
+    /// 小条上的「说明」：回到全卡形态（ContentView 复位置顶状态）。
+    var onShowFull: (() -> Void)? = nil
     @State private var locked = false
     var body: some View {
+        if compact {
+            HStack(spacing: 10) {
+                if upload.stage == .confirmUpload {
+                    Text("上传确认").font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let onShowFull { Button("说明") { onShowFull() } }
+                    Button("取消") { lock { engine.cancelPendingUpload() } }.disabled(locked)
+                    Button("确认上传") { lock { engine.confirmPendingUpload() } }.disabled(locked)
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Text("选择文件").font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let onShowFull { Button("说明") { onShowFull() } }
+                    Button("取消上传") { lock { engine.finishUploadPick(completed: false) } }.disabled(locked)
+                    Button("已选好，继续核验") { lock { engine.finishUploadPick(completed: true) } }.disabled(locked)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .font(.callout).padding(.horizontal, 12).padding(.vertical, 9)
+            .frame(maxWidth: .infinity)
+            .interventionCardBackground()
+        } else {
         VStack(alignment: .leading, spacing: 8) {
             if upload.stage == .confirmUpload {
                 Text("上传前确认").font(.headline)
@@ -379,6 +435,7 @@ struct UploadCard: View {
         }
         .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
         .interventionCardBackground()
+        }
     }
     private func lock(_ action: () -> Void) {
         guard !locked else { return }
@@ -391,6 +448,13 @@ struct InterventionPrompt: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var web: WebController
     var onOpenBrowser: () -> Void
+    /// 小条形态（ZORDER-FIX）：浏览器置顶态下由 ContentView 下传 true，
+    /// 三卡各收成单行小条浮在浏览器之上（短标题＋解决按钮＋「说明」），
+    /// 说明文字不绘制、不挡网页操作区；解决按钮与全卡走同一引擎路径
+    /// 与防重复守卫（紧凑渲染在各卡内部 body 分支，@State 锁不丢）。
+    var compact: Bool = false
+    /// 小条上的「说明」：回到全卡形态（ContentView 复位置顶状态）。
+    var onShowFull: (() -> Void)? = nil
     /// 同一时刻只出一张卡的种类判定（纯函数，UI-LEGIBILITY 抽出供自检
     /// 十七断言真值表）：上传优先于确认、确认优先于手输，与 body 的
     /// 渲染优先级一致——保证介入文字只在一张卡里绘制一层，不叠印。
@@ -415,28 +479,46 @@ struct InterventionPrompt: View {
                              isWaitingManualWithInput: manualText != nil) {
         case .upload:
             if let upload = engine.pendingUpload {
-                UploadCard(engine: engine, upload: upload, onOpenBrowser: onOpenBrowser)
+                UploadCard(engine: engine, upload: upload, onOpenBrowser: onOpenBrowser,
+                           compact: compact, onShowFull: onShowFull)
             }
         case .confirm:
             if let action = confirmAction {
                 ConfirmCard(engine: engine, action: action, taskID: engine.conversationTaskID,
-                            pageTitle: pageTitle, pageHost: pageHost, onOpenBrowser: onOpenBrowser)
+                            pageTitle: pageTitle, pageHost: pageHost, onOpenBrowser: onOpenBrowser,
+                            compact: compact, onShowFull: onShowFull)
             }
         case .manual:
             if let text = manualText {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("需要你手动处理").font(.headline)
-                    Text(text)
-                    Text("完成后点击「已处理，继续」。")
-                    HStack {
-                        Button("打开浏览器") { onOpenBrowser() }
-                        Spacer()
+                if compact {
+                    // 小条（ZORDER-FIX）：用户正亲手在浏览器里处理，条上
+                    // 只留标题、回全卡的「说明」与「已处理，继续」（走
+                    // engine.resume() 既有路径，与全卡同一落点）。
+                    HStack(spacing: 10) {
+                        Text("需要你手动处理").font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Spacer(minLength: 4)
+                        if let onShowFull { Button("说明") { onShowFull() } }
                         Button("已处理，继续") { engine.resume() }
                             .buttonStyle(.borderedProminent)
                     }
+                    .font(.callout).padding(.horizontal, 12).padding(.vertical, 9)
+                    .frame(maxWidth: .infinity)
+                    .interventionCardBackground()
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("需要你手动处理").font(.headline)
+                        Text(text)
+                        Text("完成后点击「已处理，继续」。")
+                        HStack {
+                            Button("打开浏览器") { onOpenBrowser() }
+                            Spacer()
+                            Button("已处理，继续") { engine.resume() }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .interventionCardBackground()
                 }
-                .font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                .interventionCardBackground()
             }
         case .none:
             EmptyView()

@@ -14,6 +14,7 @@ struct SelfTestView: View {
     @State private var editorNavTestRunning = false
     @State private var legibilityTestRunning = false
     @State private var autonomyTestRunning = false
+    @State private var zOrderTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -132,6 +133,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || autonomyTestRunning)
             Text("自检十八预期（AUTONOMY-FIX）：两层。Tier A 不调用模型（本按钮，要求引擎空闲，会占用当前标签页打开本地合成页 test-autonomy）：①分类门——「请用户亲手点弹窗」「请用户手动打开编辑页」两条现场原例与 askKind=manual 声明均判 capability（拒绝停车），声明 clarify 但文本是请用户操作网页同样判 capability（防绕门），任务歧义问答判 clarify（照旧等待、不收紧）；②安全类回归——SafetyPolicy 对「确认付款」判 .confirm、type 进 password 字段判 .manual、SP-01 非任务生成文件判 .confirm（停车依据只读引用、安全策略零改动）；③绕行梯状态机逐级推进、三级试完梯尽、梯账快照往返不变；④失败结案文案含卡点＋已试路径＋页面证据且无请用户代劳措辞；⑤直达提取三路（带 ID 编辑链接直用、无 ID 模板＋实证 ID 拼装、无候选返回 nil）与合成页链接农场 harvest 实测；⑥合成页条款弹窗（按钮无行为、点按不关）经弹窗导航绕行（非编辑页重载分支）消失，且全程引擎未进入等待确认/等待手输停车态。Tier B 真机人工（步骤见案卷 AUTONOMY-FIX-IMPL 的复测清单）：公众号编辑器弹窗场走保存→离开→直达返回往返不丢稿、草稿入口全败时直达 URL 打开编辑页、安全类（发表确认）仍停车。").font(.caption).foregroundStyle(.secondary)
+            Button("自检十九：介入态浏览器置顶层级") {
+                guard !zOrderTestRunning else { return }
+                zOrderTestRunning = true
+                runZOrderTest()
+                dismiss()
+            }.disabled(!engine.active || zOrderTestRunning)
+            Text("自检十九预期（ZORDER-FIX）：两层。Tier A 不调用模型（本按钮）：结构断言——直接核对根层级表纯函数 InterventionZOrder（ContentView 实际使用的同一份数值）：常态下遮罩＞坞、卡＞遮罩、输入栏最上（与 UI-LEGIBILITY 定版一致，非介入态层级零回归）；介入态点「打开浏览器」进入置顶态后坞＞遮罩（变暗遮罩不覆盖浏览器窗口、网页可看可亲手点）、卡（小条）＞坞（「已处理，继续」等解决按钮在浏览器置顶时可达）、遮罩仍＞对话层、输入栏仍最上；置顶切换只交换坞与遮罩名次、卡与输入栏名次不变；小条形态与置顶态同进退（置顶即收条、复位即全卡）。Tier B 真机人工（步骤见案卷 ZORDER-FIX-IMPL 的复测清单）：公众号场遇介入→点「打开浏览器」→浏览器浮到顶层能亲手点网页弹窗→点小条「已处理，继续」→层级恢复、任务按 AUTONOMY 口径续跑；安全类停车（发表确认）在小条上点「已处理」后的回读口径不变。").font(.caption).foregroundStyle(.secondary)
         }.navigationTitle("本地自检")
     }
 
@@ -181,6 +189,41 @@ struct SelfTestView: View {
             let failed = lines.filter { $0.hasPrefix("✗") }.count
             conversation.localFeedback(failed == 0 ? "自检十八结论（Tier A）：全部通过——分类门分流、安全类回归、绕行梯状态机、结案文案措辞、直达提取与弹窗导航绕行实测均成立，全程无停车态；Tier B 公众号真机场景按案卷清单人工复测" : "自检十八结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
         }
+    }
+
+    /// 自检十九 Tier A 编排（ZORDER-FIX）：介入态浏览器置顶的层级结构
+    /// 断言——直接断言 ContentView 实际使用的层级表纯函数
+    /// InterventionZOrder（同一份数值供视图与本断言共用，非另抄一份
+    /// 常量），结论以「自检十九」条目写进对话。不调用模型、不占用
+    /// 标签页；真机层级观感（浏览器是否真浮到顶层、小条是否挡操作）
+    /// 属 Tier B 真机人工（见上方说明与案卷复测清单），本按钮不冒充。
+    private func runZOrderTest() {
+        let conversation = self.conversation
+        conversation.localFeedback("自检十九：开始——介入态浏览器置顶层级结构断言（不调用模型）")
+        defer { zOrderTestRunning = false }
+        var lines: [String] = []
+        func check(_ ok: Bool, _ text: String) { lines.append((ok ? "✓ " : "✗ ") + text) }
+        check(InterventionZOrder.scrim(browserRaised: false) > InterventionZOrder.dock(browserRaised: false),
+              "常态：变暗遮罩在浏览器坞之上（介入卡出现时整屏压暗，UI-LEGIBILITY 口径不变）")
+        check(InterventionZOrder.card(browserRaised: false) > InterventionZOrder.scrim(browserRaised: false)
+              && InterventionZOrder.inputBar(browserRaised: false) > InterventionZOrder.card(browserRaised: false)
+              && InterventionZOrder.dock(browserRaised: false) > InterventionZOrder.chat(browserRaised: false),
+              "常态：介入卡在遮罩之上、坞在对话层之上、输入栏永远最上层（既有层级关系不回归）")
+        check(InterventionZOrder.dock(browserRaised: true) > InterventionZOrder.scrim(browserRaised: true),
+              "置顶态：浏览器坞 z 序高于变暗遮罩——遮罩不覆盖浏览器窗口，网页完整可看可亲手点")
+        check(InterventionZOrder.card(browserRaised: true) > InterventionZOrder.dock(browserRaised: true),
+              "置顶态：介入小条仍在坞之上——「已处理，继续」等解决按钮在浏览器置顶时可达")
+        check(InterventionZOrder.scrim(browserRaised: true) > InterventionZOrder.chat(browserRaised: true)
+              && InterventionZOrder.inputBar(browserRaised: true) > InterventionZOrder.card(browserRaised: true),
+              "置顶态：遮罩仍压暗对话层、输入栏仍为最上层")
+        check(InterventionZOrder.card(browserRaised: true) == InterventionZOrder.card(browserRaised: false)
+              && InterventionZOrder.inputBar(browserRaised: true) == InterventionZOrder.inputBar(browserRaised: false),
+              "置顶切换只交换坞与遮罩名次，卡与输入栏名次不变")
+        check(InterventionZOrder.cardCompact(browserRaised: true) && !InterventionZOrder.cardCompact(browserRaised: false),
+              "小条形态与置顶态同进退：置顶即收条让出网页操作区、复位即回全卡")
+        for line in lines { conversation.localFeedback("自检十九：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检十九结论（Tier A）：全部通过——常态层级与 0209 定版一致、置顶态坞高于遮罩且小条可达、只换坞与遮罩名次、收条与置顶同进退；Tier B 真机层级观感按案卷清单人工复测" : "自检十九结论（Tier A）：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检十四 Tier A 编排（WECHAT-COVER-FIX Part A）：frame 探针在

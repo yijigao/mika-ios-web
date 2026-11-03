@@ -16,6 +16,14 @@ struct ContentView: View {
     /// 「打开浏览器查看／打开浏览器」点击时 +1，下传浏览器坞展开。坞的一切形态
     /// 变化只来自用户动作（护盾点按／收起按钮／本令牌），程序不再自动展开。
     @State private var dockExpandRequest = 0
+    /// 介入态「浏览器置顶」呈现状态（ZORDER-FIX）：用户在介入卡上点
+    /// 「打开浏览器*」时与 expandRequest 同一次点击置真——根层级换位
+    /// （层级表见 InterventionZOrder）：浏览器坞升至变暗遮罩之上（遮罩
+    /// 不再覆盖浏览器窗口，网页可看可亲手点），介入卡收成坞之上的小条
+    /// （解决按钮仍在条上可达、「说明」可回全卡）。介入解除
+    /// （showsInterventionPrompt 转假）时自动复位。纯呈现状态，不参与
+    /// 任何引擎／安全判定；与 AUTONOMY-FIX 的介入分类门只做呈现配合。
+    @State private var interventionBrowserRaised = false
     /// 会话列表 sheet（M1）：多会话外壳的管理入口（新建／切换／改名／删除
     /// 会话、队列查看与取消），编排顺序契约在 SessionListView 文件头。
     @State private var showSessions = false
@@ -33,35 +41,50 @@ struct ContentView: View {
         NavigationStack {
             // 布局层（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md；
             // 层级调整 2026-11-02，案卷 CHAT-KEYBOARD-FIX-2026-11-02.md 问题 3；
-            // 介入层 2026-11-02，案卷 INTERVENTION-PROMPT-IMPL-2026-11-02.md）：
-            // ZStack 自下而上——对话消息层（全屏常驻根层）＜ 浏览器坞（expanded
-            // 全屏／mini 悬浮小窗，WKWebView 实例常驻保活，见 BrowserDockView.swift）
-            // ＜ 介入提示卡（仅等待确认／手输时出现，固定在输入栏上方，小窗与展开态
-            // 都可见）＜ 聊天输入栏（输入框＋发送键，永远在最上层，坞怎么拖/展开都
-            // 盖不住；键盘升起时随根层安全区上浮、仍在最上层）。
+            // 介入层 2026-11-02，案卷 INTERVENTION-PROMPT-IMPL-2026-11-02.md；
+            // 介入态浏览器置顶 2026-11-03，案卷 ZORDER-FIX-IMPL-2026-11-03.md）：
+            // ZStack 自下而上（名次以 InterventionZOrder 层级表为准，视图与
+            // 自检十九共用一份数值）——常态：对话消息层（全屏常驻根层）＜ 浏览器
+            // 坞（expanded 全屏／mini 悬浮小窗，WKWebView 实例常驻保活，见
+            // BrowserDockView.swift）＜ 变暗遮罩＋介入提示卡（仅等待确认／手输时
+            // 出现，固定在输入栏上方，小窗与展开态都可见）＜ 聊天输入栏（输入框
+            // ＋发送键，永远在最上层，坞怎么拖/展开都盖不住；键盘升起时随根层
+            // 安全区上浮、仍在最上层）。介入态用户点卡上「打开浏览器*」后进入
+            // 置顶态：只交换坞与遮罩的名次（遮罩退到坞之下、不再覆盖浏览器
+            // 窗口），介入卡收成坞之上的小条，处理完点小条上的解决按钮即随
+            // 介入解除自动复位。
             // App 级对象图与持有形态（MikaWebApp.swift）不变，五件仍经原参数通道下传。
             ZStack(alignment: .bottom) {
                 AgentChatView(engine: engine, settings: settings, conversation: conversation,
                               inputFocus: $chatInputFocused, followLatest: $followLatest,
                               bottomInset: inputBarHeight)
+                    .zIndex(InterventionZOrder.chat(browserRaised: interventionBrowserRaised))
                 BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused,
                                 bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState,
                                 onReturnToExecution: { returnToExecution() })
+                    .zIndex(InterventionZOrder.dock(browserRaised: interventionBrowserRaised))
                 if showsInterventionPrompt {
                     // 变暗遮罩（UI-LEGIBILITY，2026-11-03）：介入卡出现时整屏
                     // 压暗对话层与浏览器坞，卡面成为唯一可读层，背景文字不再
                     // 透叠。遮罩不拦截触摸（参数 OverlayStyle.scrimAllowsHitTesting
                     // ＝false），用户照常亲手点网页弹窗与坞控件，触摸路径不变。
+                    // 置顶态下本遮罩的名次退到坞之下（InterventionZOrder），
+                    // 不再覆盖浏览器窗口——只剩对话层被压暗。
                     Color.black.opacity(OverlayStyle.scrimOpacity)
                         .ignoresSafeArea()
                         .allowsHitTesting(OverlayStyle.scrimAllowsHitTesting)
+                        .zIndex(InterventionZOrder.scrim(browserRaised: interventionBrowserRaised))
                     InterventionPrompt(engine: engine, web: web,
-                                       onOpenBrowser: { dockExpandRequest += 1 })
+                                       onOpenBrowser: { dockExpandRequest += 1; interventionBrowserRaised = true },
+                                       compact: InterventionZOrder.cardCompact(browserRaised: interventionBrowserRaised),
+                                       onShowFull: { interventionBrowserRaised = false })
                         .padding(.horizontal, 12)
                         .padding(.bottom, inputBarHeight + 6)
+                        .zIndex(InterventionZOrder.card(browserRaised: interventionBrowserRaised))
                 }
                 ChatInputBar(engine: engine, conversation: conversation,
                              inputFocus: $chatInputFocused, followLatest: $followLatest)
+                    .zIndex(InterventionZOrder.inputBar(browserRaised: interventionBrowserRaised))
                     .onGeometryChange(for: CGFloat.self) { proxy in
                         proxy.size.height
                     } action: { newHeight in
@@ -84,6 +107,11 @@ struct ContentView: View {
         }
         .onAppear { consumePending() }
         .onChange(of: pending.task) { _, _ in consumePending() }
+        .onChange(of: showsInterventionPrompt) { _, shown in
+            // 介入解除（已处理／已确认／已解决，含切走会话时卡片隐去）→
+            // 浏览器置顶呈现自动复位，层级回到常态（ZORDER-FIX 规格 2）。
+            if !shown { interventionBrowserRaised = false }
+        }
     }
     private func consumePending() {
         if let task = pending.task { conversation.draft = task; pending.task = nil }
@@ -114,4 +142,26 @@ struct ContentView: View {
         web.revealExecutionTab()
         dockExpandRequest += 1
     }
+}
+
+/// 根层级表（ZORDER-FIX，纯函数：ContentView 的 ZStack 实际使用、自检
+/// 十九断言同一份数值）。自下而上的名次以 zIndex 表达：
+/// - 常态（browserRaised=false，与 UI-LEGIBILITY 定版一致）：对话 0
+///   ＜ 坞 1 ＜ 遮罩 2 ＜ 介入卡 3 ＜ 输入栏 4——介入卡出现时遮罩压暗
+///   坞与对话、卡面唯一可读、输入栏永远最上层；
+/// - 置顶态（用户在介入卡上点了「打开浏览器*」）：只交换坞与遮罩的
+///   名次——对话 0 ＜ 遮罩 1 ＜ 坞 2 ＜ 介入卡（小条）3 ＜ 输入栏 4：
+///   遮罩退到坞之下、不再覆盖浏览器窗口，网页完整可看可亲手点；卡
+///   收成小条仍居坞之上，解决按钮（已处理，继续／确认执行／已选好，
+///   继续核验等）与回全卡的「说明」都可达；卡与输入栏名次不变。
+/// 介入解除后 ContentView 复位 browserRaised，名次自动回到常态。
+enum InterventionZOrder {
+    static func chat(browserRaised: Bool) -> Double { 0 }
+    static func scrim(browserRaised: Bool) -> Double { browserRaised ? 1 : 2 }
+    static func dock(browserRaised: Bool) -> Double { browserRaised ? 2 : 1 }
+    static func card(browserRaised: Bool) -> Double { 3 }
+    static func inputBar(browserRaised: Bool) -> Double { 4 }
+    /// 介入卡是否收成小条：与置顶态同进退（置顶即收条让出网页操作
+    /// 区、复位即回全卡），ContentView 据此下传 InterventionPrompt。
+    static func cardCompact(browserRaised: Bool) -> Bool { browserRaised }
 }
