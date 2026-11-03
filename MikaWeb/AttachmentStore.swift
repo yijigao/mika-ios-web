@@ -52,6 +52,11 @@ struct AttachmentRecord: Codable, Identifiable, Equatable {
     var imageWidth: Int?
     var imageHeight: Int?
     var createdAt: Date
+    /// 是否已同步存入系统相册（COVER-UPLOAD-FIX A，本任务生成的图片
+    /// 生成后写入相册时置 true）：附件中心与选文件指引据此告诉用户
+    /// 「去相册最近项目找它」。可选字段——旧索引 JSON 无此键时解码为
+    /// nil（按未存入处理），不另做迁移。
+    var savedToPhotos: Bool?
 }
 
 final class AttachmentStore: ObservableObject {
@@ -142,7 +147,8 @@ final class AttachmentStore: ObservableObject {
                                       isScreenshot: isScreenshot, origin: origin,
                                       contentType: type.identifier, byteCount: data.count,
                                       readState: .storedOnly, extractedText: nil,
-                                      imageWidth: nil, imageHeight: nil, createdAt: Date())
+                                      imageWidth: nil, imageHeight: nil, createdAt: Date(),
+                                      savedToPhotos: nil)
         if type.conforms(to: .image), let image = UIImage(data: data), let scaled = Self.scaledJPEG(image) {
             let scaledName = "\(id.uuidString)-scaled.jpg"
             try? scaled.data.write(to: directory.appendingPathComponent(scaledName), options: [.atomic])
@@ -188,6 +194,31 @@ final class AttachmentStore: ObservableObject {
         persist(sessionID: sessionID)
     }
 
+    /// 按稳定 ID 取记录（引擎供文件/指引用）。
+    func record(id: UUID, sessionID: UUID) -> AttachmentRecord? {
+        attachments(for: sessionID).first { $0.id == id }
+    }
+
+    /// 标记某附件已存入系统相册（COVER-UPLOAD-FIX A）：索引落盘同步，
+    /// 附件中心与注入段下次读取即带「已存入相册」口径。
+    func markSavedToPhotos(id: UUID, sessionID: UUID) {
+        var records = attachments(for: sessionID)
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        records[index].savedToPhotos = true
+        cache[sessionID] = records
+        persist(sessionID: sessionID)
+    }
+
+    /// 展示排序（COVER-UPLOAD-FIX B）：本任务生成的文件置顶（上传时
+    /// 最先要找的就是它），同组内新在前。附件中心与注入段共用同一
+    /// 排序，用户与模型看到的顺序一致。
+    static func displayOrdered(_ records: [AttachmentRecord]) -> [AttachmentRecord] {
+        records.sorted { a, b in
+            if (a.origin == .taskGenerated) != (b.origin == .taskGenerated) { return a.origin == .taskGenerated }
+            return a.createdAt > b.createdAt
+        }
+    }
+
     /// 按引用找附件（模型在 upload_file 的 text 里给出附件 id 或文件名）：
     /// 先按完整/前缀 id 匹配，再按展示名精确匹配、最后大小写不敏感包含
     /// 匹配；多义或找不到返回 nil（调用方据此降级为「现选文件」口径）。
@@ -212,11 +243,12 @@ final class AttachmentStore: ObservableObject {
         guard !records.isEmpty else { return "" }
         var lines = ["【本会话附件】（已存入 App，按编号或文件名引用；存入≠已上传到任何网页）"]
         var excerptCount = 0
-        for record in records {
+        for record in Self.displayOrdered(records) {
             let size = ByteCountFormatter.string(fromByteCount: Int64(record.byteCount), countStyle: .file)
             let originText = record.origin == .taskGenerated ? "本任务生成" : "用户文件"
             let location = record.isScreenshot ? "浏览器截图" : "附件"
             var line = "· [\(String(record.id.uuidString.prefix(8)))] \(record.displayName)（\(location)，\(size)，\(originText)）"
+            if record.savedToPhotos == true { line += "（已存入系统相册）" }
             switch record.readState {
             case .textExtracted:
                 line += "—文本已抽取，可引用"

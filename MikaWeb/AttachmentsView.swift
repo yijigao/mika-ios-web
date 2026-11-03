@@ -28,8 +28,10 @@ struct AttachmentsView: View {
 
     private var sessionID: UUID { sessionStore.currentSessionID }
     private var records: [AttachmentRecord] { store.attachments(for: sessionID) }
-    private var fileRecords: [AttachmentRecord] { records.filter { !$0.isScreenshot } }
-    private var shotRecords: [AttachmentRecord] { records.filter { $0.isScreenshot } }
+    // 展示排序与注入段同口径（COVER-UPLOAD-FIX B）：本任务生成的置顶、
+    // 新在前——上传卡点时用户最先要找的就是刚生成的那份。
+    private var fileRecords: [AttachmentRecord] { AttachmentStore.displayOrdered(records.filter { !$0.isScreenshot }) }
+    private var shotRecords: [AttachmentRecord] { AttachmentStore.displayOrdered(records.filter { $0.isScreenshot }) }
 
     var body: some View {
         NavigationStack {
@@ -104,7 +106,17 @@ struct AttachmentsView: View {
 
     private func row(_ record: AttachmentRecord) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(record.displayName).font(.callout).lineLimit(2)
+            HStack(spacing: 6) {
+                Text(record.displayName).font(.callout).lineLimit(2)
+                if record.origin == .taskGenerated {
+                    // 本任务生成徽标（COVER-UPLOAD-FIX B）：置顶之外再给
+                    // 一个一眼可辨的标记，用户照选文件卡指引对号时先认它。
+                    Text("本任务生成").font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
             Text(detailLine(record)).font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 16) {
                 Button("预览") { previewItem = PreviewItem(url: store.fileURL(for: record)) }
@@ -126,7 +138,9 @@ struct AttachmentsView: View {
         case .imageScaled: state = "图片，已存缩放副本\(record.imageWidth.map { "（\($0)×\(record.imageHeight ?? 0)）" } ?? "")"
         case .storedOnly: state = "仅存储，模型未读内容"
         }
-        return "\(size) · \(origin) · \(state)"
+        var text = "\(size) · \(origin) · \(state)"
+        if record.savedToPhotos == true { text += " · 已存入系统相册" }
+        return text
     }
 
     private func saveCurrentPageScreenshot() {

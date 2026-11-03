@@ -22,6 +22,8 @@
 	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>把任务里生成的封面图存入系统相册，方便你之后在上传图片时直接从相册「最近项目」里找到并选中它。App 只添加图片，不读取你的相册。</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.jigaoyi.mikaweb.agent.*</string>

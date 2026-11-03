@@ -410,7 +410,7 @@ struct UploadCard: View {
         VStack(alignment: .leading, spacing: 8) {
             if upload.stage == .confirmUpload {
                 Text("上传前确认").font(.headline)
-                Text("将把你的文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)（页面上的「\(upload.elementLabel)」）。确认后会进入选文件一步，由你在系统选择器里选定文件；这张确认只对这一个文件、这一个页面有效，取消或失败后不会被复用。")
+                Text("将把你的文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)（页面上的「\(upload.elementLabel)」）。确认后进入选文件一步：系统支持自动供文件时（iOS 18.4+）由 App 直接把这份文件交给页面，不用你再选；不支持或未触发时再由你在选择器里选定。这张确认只对这一个文件、这一个页面有效，取消或失败后不会被复用。")
                 HStack {
                     Button("确认上传") { lock { engine.confirmPendingUpload() } }.disabled(locked)
                         .buttonStyle(.borderedProminent)
@@ -422,7 +422,7 @@ struct UploadCard: View {
                 }
             } else {
                 Text("请选择要上传的文件").font(.headline)
-                Text("已尝试打开页面上的文件控件（「\(upload.elementLabel)」）。如果系统选择器没有弹出，点「打开浏览器查看」，在页面上点该上传按钮/区域，再在系统选择器里选要上传的文件（目标：\(upload.attachmentName)）。选好后回到这里点「已选好，继续核验」，我会回读页面确认它已持有该文件；不想传了点「取消上传」，任务会继续做其他部分。")
+                Text("已尝试打开页面上的文件控件（「\(upload.elementLabel)」）。\(AgentEngine.uploadPickGuidance(upload: upload, supplyArmed: engine.uploadSupplyArmed))如果系统选择器没有弹出，点「打开浏览器查看」，在页面上点该上传按钮/区域再选。选好后回到这里点「已选好，继续核验」，我会回读页面确认它已持有该文件；不想传了点「取消上传」，任务会继续做其他部分。")
                 HStack {
                     Button("已选好，继续核验") { lock { engine.finishUploadPick(completed: true) } }.disabled(locked)
                         .buttonStyle(.borderedProminent)

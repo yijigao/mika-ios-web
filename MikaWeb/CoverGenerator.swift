@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import Photos
 
 // 封面自产（COVER-CONSENT-IMPL-2026-11-03，缺陷 B）：Joey 2026-11-03
 // 01:46 真机现场——公众号文章已存草稿、卡在封面：素材库没有可用封面，
@@ -12,6 +13,15 @@ import UIKit
 // 豁免判定（任务生成文件不弹新卡，原有对外发送/敏感边界不变），
 // 附件中心 UI 按来源徽标展示。生成只是把文件备好，设没设上封面以
 // 页面回读为准（系统提示与 playbook 均按此口径）。
+//
+// COVER-UPLOAD-FIX（2026-11-03）追加：0336 真机现场——封面已生成却
+// 传不上：图只在 App 沙箱/附件区，Joey 手动上传时在系统相册里找不到
+// 它，文件名又带全角标点（「封面--别让AI替你…；用这套三步法.png」）
+// 在选择器里极难对号。本文件两处对治：① 生成文件名改走
+// GeneratedFileName（短名、只用 ASCII 安全字符）；② 生成后同时写入
+// 系统相册（PhotoLibrarySaver，只申请「添加」权限），步流把「已存入
+// 相册＋确切文件名」或失败原因如实说清——用户在相册「最近项目」最新
+// 一张即可命中，不必再翻沙箱文件。
 
 /// 封面版式：三款内置模板，模型以 dark/light/green（或中文别名）点名。
 enum CoverTemplate: String, CaseIterable {
@@ -168,19 +178,125 @@ return UIFont.systemFont(ofSize: 30, weight:.bold)
 // MARK: - 生成并登记（引擎 generate_cover 动作的落点）
 
 /// 渲染＋登记进指定会话的附件目录：来源恒为 taskGenerated（本任务
-/// 生成），展示名「封面-<标题前 18 字>.png」；登记后附件中心可见、
-/// 注入段可引用，upload_file 引用时走 SP-01 豁免。
+/// 生成），展示名走 GeneratedFileName 的 ASCII 安全短名（COVER-
+/// UPLOAD-FIX B）；登记后附件中心可见、注入段可引用，upload_file
+/// 引用时走 SP-01 豁免。
 /// 标题为空或渲染失败返回 nil（引擎据此如实回报，不假装已生成）。
 @discardableResult
 static func generate(title: String, subtitle: String, template: CoverTemplate, sessionID: UUID) -> AttachmentRecord? {
 guard let data = renderPNG(title: title, subtitle: subtitle, template: template) else { return nil}
-let short = String(title.trimmingCharacters(in:.whitespacesAndNewlines).prefix(18))
-return AttachmentStore.shared.registerData(data, displayName: "封面-\(short).png",
+return AttachmentStore.shared.registerData(data, displayName: GeneratedFileName.coverFileName(title: title),
 sessionID: sessionID, origin:.taskGenerated,
 isScreenshot: false)
 }
 
-// MARK: - 自检十一 Tier A（COVER-CONSENT）：封面自产的程序化核查
+/// 生成＋登记＋写入系统相册（COVER-UPLOAD-FIX A，引擎 generate_cover
+/// 的现行落点）：附件登记与旧路径一致；相册写入是追加动作——成功时
+/// 给记录打 savedToPhotos 标记（附件中心与选文件指引据此说话），失败
+/// （未授权/系统错误）只如实回报 outcome，不影响附件本身可用。
+/// record 为 nil＝渲染失败（photo 恒为 nil）。
+static func generateAndSaveToPhotos(title: String, subtitle: String, template: CoverTemplate, sessionID: UUID) async -> (record: AttachmentRecord?, photo: PhotoSaveOutcome?) {
+guard let record = generate(title: title, subtitle: subtitle, template: template, sessionID: sessionID) else { return (nil, nil) }
+guard let data = try? Data(contentsOf: AttachmentStore.shared.fileURL(for: record)) else {
+return (record,.failed("附件落盘后回读失败"))
+}
+let outcome = await PhotoLibrarySaver.saveImageData(data)
+if outcome == .saved {
+AttachmentStore.shared.markSavedToPhotos(id: record.id, sessionID: sessionID)
+}
+return (record, outcome)
+}
+
+// MARK: - 生成文件命名规整（COVER-UPLOAD-FIX B）
+
+/// 本任务生成文件的命名规整（纯函数，自检二十二断言）：短名、只用
+/// ASCII 字母/数字/连字符——全角标点、空格、中文一律不进文件名（中文
+/// 标题进 slug 时整段被折成连字符，slug 为空时退到时间戳名）。这样
+/// 文件名在系统选择器、附件中心、模型引用三处都易对号、不会被任何
+/// 一层转码或截断搞坏。注意：标题原文只活在步流与图面文字里，文件名
+/// 不承担标题语义（附件身份靠稳定 ID，见 AttachmentStore）。
+enum GeneratedFileName {
+/// slug 部分（cover- 之后、.png 之前）的字符上限
+static let slugLimit = 24
+
+static func coverFileName(title: String, date: Date = Date()) -> String {
+let slug = asciiSlug(title)
+if !slug.isEmpty { return "cover-\(slug).png" }
+let formatter = DateFormatter()
+formatter.locale = Locale(identifier: "en_US_POSIX")
+formatter.dateFormat = "yyyyMMdd-HHmmss"
+return "cover-\(formatter.string(from: date)).png"
+}
+
+/// ASCII slug：小写字母与数字原样保留，其余字符（空白/标点/全角/
+/// 中文等）整段折成单个连字符；首尾连字符去掉；超 slugLimit 截断
+/// 后再去尾连字符。纯中文标题 → 空串（调用方退时间戳名）。
+static func asciiSlug(_ raw: String) -> String {
+var slug = ""
+var pendingSeparator = false
+for scalar in raw.lowercased().unicodeScalars {
+let isSafe = (scalar.value >= 97 && scalar.value <= 122) || (scalar.value >= 48 && scalar.value <= 57)
+if isSafe {
+if pendingSeparator, !slug.isEmpty { slug.append("-") }
+pendingSeparator = false
+slug.append(Character(scalar))
+} else {
+pendingSeparator = true
+}
+}
+if slug.count > slugLimit {
+slug = String(slug.prefix(slugLimit))
+while slug.hasSuffix("-") { slug.removeLast() }
+}
+return slug
+}
+}
+
+// MARK: - 系统相册写入（COVER-UPLOAD-FIX A）
+
+/// 相册写入结局：三态分开——saved 才许说「已存入相册」；denied（用户
+/// 未给「添加照片」权限）与 failed（系统错误）都如实进文案，不许把
+/// 「已生成」说成「在相册里能找到」。
+enum PhotoSaveOutcome: Equatable {
+case saved
+case denied
+case failed(String)
+
+/// 引擎步流文案（纯函数，自检二十二断言口径）：每态一句话，带确切
+/// 文件名——用户照这句去相册「最近项目」对号，或知道图不在相册、
+/// 该去附件中心找。
+func stepDescription(fileName: String) -> String {
+switch self {
+case.saved:
+return "封面已生成并存入系统相册（相册「最近项目」里最新的一张就是它，文件名 \(fileName)）"
+case.denied:
+return "封面已生成，但没有存入系统相册（未获得「添加照片」权限，文件名 \(fileName)）——它在本会话附件里，上传时照选文件卡指引从附件中心找它"
+case.failed(let reason):
+return "封面已生成，但存入系统相册失败（\(reason)，文件名 \(fileName)）——它在本会话附件里，上传时照选文件卡指引从附件中心找它"
+}
+}
+}
+
+/// 相册写入器：只申请 addOnly（只添加、不读用户相册），写入用
+/// PHAssetCreationRequest 直接挂 PNG 数据。权限请求会弹一次系统
+/// 询问（首次生成封面时）；被拒后系统不再重复弹，本函数照常返回
+/// .denied 由步流如实说明，不反复打扰。
+enum PhotoLibrarySaver {
+static func saveImageData(_ data: Data) async -> PhotoSaveOutcome {
+let status = await PHPhotoLibrary.requestAuthorization(for:.addOnly)
+guard status == .authorized else { return.denied}
+do {
+try await PHPhotoLibrary.shared().performChanges {
+let request = PHAssetCreationRequest.forAsset()
+request.addResource(with:.photo, data: data, options: nil)
+}
+return.saved
+} catch {
+return.failed(error.localizedDescription)
+}
+}
+}
+
 
 /// 渲染三款版式（尺寸＋非空白像素）、空标题拒绝、scratch 会话里
 /// 生成登记（落盘/来源标记/缩放副本）、SP-01 豁免判定、注入段口径。

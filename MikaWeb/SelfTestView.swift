@@ -17,6 +17,7 @@ struct SelfTestView: View {
     @State private var zOrderTestRunning = false
     @State private var trustedClickTestRunning = false
     @State private var ladderFixTestRunning = false
+    @State private var coverUploadFixTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -156,6 +157,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || ladderFixTestRunning)
             Text("自检二十一预期（LADDER-FIX）：不调用模型（本按钮，要求引擎空闲，会占用执行页打开本地合成页 test-ladder 与 test-ladder-zero）。纯逻辑——第 1 级逐项验收状态机（下达不记已试、真实 click 的多项实证口径、frameClose 判不适用后才完成）；harvest 扩展来源（data 属性裸 ID＋onclick 模板拼装、内嵌数据直用、跨页模板记忆、预览链接排除计数、零候选实况行）；梯尽结案文案强制含 harvest 实况节；词表外动作判定；预览/编辑链接的感知区分。回路（真实调用主循环同款生产函数在合成页上驱动）——场景A：单次能力类信号只下达第 1 级（不记 attempted），生产记账喂齐手段后，动作后推进钩子不等第二次信号即结级并驱动直达 URL 一级（test-ladder 的编辑 ID 只在 data 属性、模板只在 onclick 里）成功关卡点；场景B：卡点在开且梯未尽时 done 被梯门拦下、引擎驱动成功后才放行；场景C：零候选页推进第 2 级落空、第 3 级重载后弹窗仍在→梯尽抛失败结案且文案含 harvest 实况（含预览排除数）；场景D：澄清问题不吞卡点（步流明示保持在开）、词表外动作「teleport」经生产处理后记账留痕并计入卡点证据、引擎不置失败不清进度。测试前后引擎现场完整恢复。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十二：封面上传修复（COVER-UPLOAD-FIX）") {
+                guard !coverUploadFixTestRunning else { return }
+                coverUploadFixTestRunning = true
+                runCoverUploadFixTest()
+                dismiss()
+            }.disabled(!engine.active || coverUploadFixTestRunning)
+            Text("自检二十二预期（COVER-UPLOAD-FIX）：不调用模型（本按钮，要求引擎空闲，会占用执行页打开本地合成页 test-upload）。纯逻辑——生成文件名规整（混合标题小写 slug、全角标点剔除且全 ASCII、纯中文标题回退时间戳名、slug 长度上限）；相册写入三态文案（成功才说已存入相册，未授权/失败如实说没存入并带原因与文件名）；附件展示排序（本任务生成置顶、其余新在前）；选文件指引文案（已存相册给「最近项目」路线，未存不给相册路线、只指附件中心置顶项，待供武装时加「点上传按钮自动带上」）；环境门（不支持文件面板回调时武装恒失败不留武装态）。回路（iOS 18.4+）——在 test-upload 上武装一份临时文件、合成触发文件控件：回调被拉起且页面回读持有该文件记回路成立；合成触发未拉起面板记「未触发」（属环境结论，真机生产路径为用户真点上传按钮时供文件，Tier B 复测为准）；系统低于 iOS 18.4 时回路记环境结论（只能手动选文件）。相册真实写入（权限弹窗与落盘）不在本按钮内，属 Tier B 真机人工。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -195,6 +203,26 @@ struct SelfTestView: View {
             for line in lines { conversation.localFeedback("自检二十一：\(line)") }
             let failed = lines.filter { $0.hasPrefix("✗") }.count
             conversation.localFeedback(failed == 0 ? "自检二十一结论：全部通过——第 1 级逐项验收、引擎自动推进、done 梯门、harvest 扩展来源与梯尽实况、词表外动作去终结化、澄清不吞卡点均有回路级实证" : "自检二十一结论：\(failed) 项未通过，见上方逐条记录")
+        }
+    }
+
+    /// 自检二十二编排（COVER-UPLOAD-FIX）：引擎纯逻辑断言（命名规整、
+    /// 相册三态文案、展示排序、选文件指引、环境门）＋ WebController
+    /// 回路（合成页 test-upload 上武装供文件→合成触发→回读页面持有），
+    /// 结论以「自检二十二」条目写进对话。不调用模型、不起任务；要求
+    /// 引擎空闲（回路会占用执行页打开合成页）。
+    private func runCoverUploadFixTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十二：开始——封面上传修复核查（不调用模型）")
+        Task { @MainActor in
+            defer { coverUploadFixTestRunning = false }
+            let logicLines = await engine.verifyCoverUploadFix()
+            for line in logicLines { conversation.localFeedback("自检二十二：\(line)") }
+            let loopLines = await engine.verifyUploadPanelSupply()
+            for line in loopLines { conversation.localFeedback("自检二十二：\(line)") }
+            let failed = (logicLines + loopLines).filter { $0.hasPrefix("✗") }.count
+            conversation.localFeedback(failed == 0 ? "自检二十二结论：全部通过——命名规整、相册三态文案、附件置顶排序、选文件指引与自动供文件回路均有实证" : "自检二十二结论：\(failed) 项未通过，见上方逐条记录（回路「未触发／环境结论」同样计未通过以便醒目，不代表代码失败）")
         }
     }
 

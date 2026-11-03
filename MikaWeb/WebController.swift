@@ -1,6 +1,9 @@
 import SwiftUI
 import WebKit
 import Combine
+import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 extension Notification.Name {
     /// 页面发起通行密钥（WebAuthn）请求且被平台拒绝时，由 BrowserTab 发出、
@@ -714,6 +717,109 @@ enum TCProbeLogStore {
     }
 }
 
+/// 文件面板回退选择器（COVER-UPLOAD-FIX D）：iOS 18.4+ 上宿主一旦
+/// 实现 runOpenPanel 回调，WebKit 就不再自弹系统选择器——没有武装
+/// 待供文件时（用户手动点页面上传按钮、或 upload_file 未解析到具体
+/// 附件要现选），由本协调器弹标准选择面补回「用户自己选」：动作表
+/// 二选一（照片图库 PhotosPicker／文件 UIDocumentPicker，两者都是
+/// 系统公开选择器、无新依赖）。选出的文件先落进 App 临时目录再把
+/// URL 交给 WebKit（选择器给的临时/安全域 URL 只在回调期内有效，
+/// 直接转发会让 WebKit 读不到）。取消一律回 nil（＝面板取消语义）。
+/// 相机入口未提供：WebKit 自带面板的「拍照」选项在此无法等价复刻，
+/// agent 场景用不到，缺失如实记在案卷。
+@available(iOS 18.4, *)
+@MainActor final class OpenPanelFallback: NSObject, UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
+    private static var active: OpenPanelFallback?
+    private var completion: (([URL]?) -> Void)?
+    private var allowsMultiple = false
+
+    static func present(parameters: WKOpenPanelParameters, from webView: WKWebView, completion: @escaping ([URL]?) -> Void) {
+        guard let presenter = topPresenter() else { completion(nil); return }
+        let session = OpenPanelFallback()
+        session.completion = completion
+        session.allowsMultiple = parameters.allowsMultipleSelection
+        active = session
+        let sheet = UIAlertController(title: "选择要上传的文件", message: nil, preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "从照片图库选择", style: .default) { _ in session.presentPhotoPicker(from: presenter) })
+        sheet.addAction(UIAlertAction(title: "从文件选择", style: .default) { _ in session.presentDocumentPicker(from: presenter) })
+        sheet.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in session.finish(nil) })
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = webView
+            popover.sourceRect = CGRect(x: webView.bounds.midX, y: webView.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(sheet, animated: true)
+    }
+
+    private static func topPresenter() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap { $0.windows }
+        let window = windows.first { $0.isKeyWindow } ?? windows.first
+        var top = window?.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        return top
+    }
+
+    private func presentPhotoPicker(from presenter: UIViewController) {
+        var config = PHPickerConfiguration()
+        config.filter = .any(of: [.images, .videos])
+        config.selectionLimit = allowsMultiple ? 0 : 1
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        presenter.present(picker, animated: true)
+    }
+
+    private func presentDocumentPicker(from presenter: UIViewController) {
+        // asCopy：系统先把文件拷进 App 容器再给 URL——普通安全域 URL
+        // 在回调后即失效，WebKit 随后读取会落空，asCopy 的 URL 才稳。
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.allowsMultipleSelection = allowsMultiple
+        picker.delegate = self
+        presenter.present(picker, animated: true)
+    }
+
+    // PHPickerViewControllerDelegate
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard !results.isEmpty else { finish(nil); return }
+        Task { @MainActor in
+            var urls: [URL] = []
+            for result in results {
+                if let url = await Self.loadPickedFile(result.itemProvider) { urls.append(url) }
+            }
+            finish(urls.isEmpty ? nil : urls)
+        }
+    }
+
+    /// 图库条目 → App 临时目录里的真实文件 URL：loadFileRepresentation
+    /// 给的临时 URL 只在回调期内有效，回调内同步拷走再交出去。
+    private static func loadPickedFile(_ provider: NSItemProvider) async -> URL? {
+        guard let typeID = provider.registeredTypeIdentifiers.first else { return nil }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
+            provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, _ in
+                guard let url else { continuation.resume(returning: nil); return }
+                let ext = url.pathExtension.isEmpty ? "dat" : url.pathExtension
+                let dest = FileManager.default.temporaryDirectory.appendingPathComponent("panel-\(UUID().uuidString).\(ext)")
+                continuation.resume(returning: (try? FileManager.default.copyItem(at: url, to: dest)) != nil ? dest : nil)
+            }
+        }
+    }
+
+    // UIDocumentPickerDelegate
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        finish(allowsMultiple ? urls : Array(urls.prefix(1)))
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finish(nil) }
+
+    private func finish(_ urls: [URL]?) {
+        let completion = self.completion
+        self.completion = nil
+        if Self.active === self { Self.active = nil }
+        completion?(urls)
+    }
+}
+
 // 浏览器标签管理器＋当前页门面（标签页改造前的 WebController API 逐个保留、语义改为
 // 「作用于当前标签页」，既有调用点 BrowserView／BrowserDockView／AgentEngine 不需改签名）：
 // address／progress／canGoBack／canGoForward／pageError／revision／webView／load／reload／
@@ -1036,11 +1142,18 @@ enum TCProbeLogStore {
 
     // MARK: - 网页上传人在环（F1）：触发文件控件与回读已选文件
     //
-    // iOS 平台事实：WKWebView 没有 macOS 的 runOpenPanel 回调；文件控件被
-    // 真实点击时由 WebKit 拉起系统选择器，用户选完后文件挂在 input.files
-    // 上、页面自己负责后续提交。合成 click 是否被当作可拉起选择器的手势
-    // 由系统决定（部分场景不认）——所以触发只算「尝试打开」，引擎无论
-    // 结果都进入等待卡：选择器没弹时用户可自己在页面上点上传按钮选文件。
+    // iOS 平台事实（COVER-UPLOAD-FIX 调研修正）：文件面板回调
+    // WKUIDelegate.runOpenPanelWithParameters 长期只有 macOS 有
+    // （10.12 起）；iOS 自 18.4 起公开同一回调（WebKit 源码头文件
+    // WK_API_AVAILABLE(macos(10.12), ios(18.4), visionos(2.4)) 为据，
+    // 详见案卷 COVER-UPLOAD-FIX-IMPL 调研节）。iOS 18.4+ 上宿主实现
+    // 该回调即可在文件面板被请求时直接把文件 URL 交给页面（见下方
+    // 「文件面板供文件」节），或自行弹选择器转发结果；不实现则与
+    // Safari 行为一致（系统选择器）。18.4 以下无此回调：文件控件被
+    // 真实点击时由 WebKit 拉起系统选择器，用户选完后文件挂在
+    // input.files 上、页面自己负责后续提交。合成 click 是否被当作
+    // 可拉起面板的手势由系统决定（部分场景不认）——所以触发只算
+    // 「尝试打开」，引擎无论结果都进等待卡兜底。
 
     /// 触发执行页上的文件控件（按 data-mika-idx 定位，含被站点隐藏的
     /// file input）：滚入视口后点击。返回 false＝控件已不在页面上。
@@ -1068,6 +1181,87 @@ enum TCProbeLogStore {
         guard let raw = result as? String, let data = raw.data(using: .utf8),
               let names = try? JSONDecoder().decode([String].self, from: data) else { return [] }
         return names
+    }
+
+    // MARK: - 文件面板供文件（COVER-UPLOAD-FIX D，iOS 18.4+ 公开回调）
+
+    /// 一次性待供文件：引擎在 upload_file 选文件阶段开始前武装（附件
+    /// 已解析＋SP-01 已过：任务生成豁免或用户已在确认卡点过确认），
+    /// 文件面板回调命中执行页时消费并作废——供完一次即失效，不会给
+    /// 后来无关的文件控件误供。绑定标签页：只有执行页的面板请求能
+    /// 消费它。
+    private struct ArmedUploadSupply { let tabID: UUID; let url: URL; let fileName: String }
+    private var armedUploadSupply: ArmedUploadSupply?
+
+    /// 当前系统是否有文件面板公开回调（iOS 18.4+）。引擎据此决定走
+    /// 自动供文件还是纯手动选文件路径。
+    var uploadSupplySupported: Bool {
+        if #available(iOS 18.4, *) { return true }
+        return false
+    }
+
+    /// 武装待供文件（绑定当前执行页）。系统不支持时返回 false，调用
+    /// 方按手动路径继续。
+    @discardableResult
+    func armUploadSupply(url: URL, fileName: String) -> Bool {
+        guard uploadSupplySupported else { return false }
+        armedUploadSupply = ArmedUploadSupply(tabID: executionTab.id, url: url, fileName: fileName)
+        return true
+    }
+
+    /// 解除武装（上传收口/取消/丢弃时调用）：未消费的待供文件作废。
+    func disarmUploadSupply() { armedUploadSupply = nil }
+
+    /// 待供文件是否仍在武装中（未被面板回调消费）。
+    var uploadSupplyArmed: Bool { armedUploadSupply != nil }
+
+    /// 自检二十二回路（COVER-UPLOAD-FIX D）：在本地上传页 test-upload
+    /// 上走完整回路——备一份临时文件→武装供文件→用引擎同款合成触发
+    /// 碰文件控件→回读页面持有状态。判定两段分开：回调被触发且页面
+    /// 持有供的文件＝回路成立；武装成功但触发后面板回调没来（合成
+    /// click 在本环境不被认作可拉起面板的手势）→ 如实记未触发，本单
+    /// 的真机生产路径退到「用户在页面上真点上传按钮时供文件」（同一
+    /// 回调、真实手势），Tier B 复测以真机为准。系统低于 iOS 18.4 时
+    /// 回调不存在，直接记环境结论。结束时解除武装，不留待供文件。
+    func verifyUploadPanelSupply() async -> [String] {
+        var lines: [String] = []
+        guard uploadSupplySupported else {
+            lines.append("✗ 回路·自动供文件：当前系统低于 iOS 18.4，文件面板公开回调不存在——本机只能走手动选文件路径（环境结论，非代码失败）")
+            return lines
+        }
+        do { try loadLocalOnExecutionTab("test-upload") } catch {
+            lines.append("✗ 回路·自动供文件：合成页 test-upload 加载失败：\(error.localizedDescription)")
+            return lines
+        }
+        try? await Task.sleep(for: .milliseconds(900))
+        defer { disarmUploadSupply() }
+        guard let page = try? await state(),
+              let input = page.elements.first(where: { $0.tag == "input" && $0.inputType.lowercased() == "file" }) else {
+            lines.append("✗ 回路·自动供文件：test-upload 页未抽到文件控件，回路未启动")
+            return lines
+        }
+        // 临时样本文件：一句话文本充当任意文件（面板只认 URL 不认内容）
+        let sampleName = "cover-panel-selftest.txt"
+        let sampleURL = FileManager.default.temporaryDirectory.appendingPathComponent(sampleName)
+        try? "COVER-UPLOAD-FIX selftest payload".write(to: sampleURL, atomically: true, encoding: .utf8)
+        let armed = armUploadSupply(url: sampleURL, fileName: sampleName)
+        guard armed else {
+            lines.append("✗ 回路·自动供文件：武装失败（系统自称支持回调却未能武装）")
+            return lines
+        }
+        _ = await triggerFileInput(index: input.index)
+        try? await Task.sleep(for: .milliseconds(1500))
+        let names = await probeFileInput(index: input.index)
+        let consumed = !uploadSupplyArmed
+        if consumed && names.contains(where: { $0.contains(sampleName) }) {
+            lines.append("✓ 回路·自动供文件：合成触发拉起文件面板回调，宿主直接把武装文件交给页面——未弹选择器，页面文件控件已持有 \(sampleName)（回读实证），待供凭据消费即作废")
+        } else if consumed {
+            lines.append("✗ 回路·自动供文件异常：待供凭据已被消费，但页面回读未见 \(sampleName)（实见 \(names.isEmpty ? "无" : names.joined(separator: "、"))）")
+        } else {
+            lines.append("✗ 回路·自动供文件未触发：合成 click 未拉起文件面板（回调没来、凭据仍武装）——本环境下自动供文件不成立；真机生产路径为用户在页面上真点上传按钮时由同一回调供文件（Tier B 复测为准，不得视为已验）")
+        }
+        lines.append("自检临时文件位于系统临时目录，不进附件索引、不留任务状态")
+        return lines
     }
 
     /// 页面图像清单回读（WECHAT-COVER-FIX Part B，上传双回读的第二项）：
@@ -1266,6 +1460,25 @@ enum TCProbeLogStore {
     /// 网页脚本 window.close()：按同一套关闭规则关掉对应标签。
     func webViewDidClose(_ webView: WKWebView) {
         if let tab = tabs.first(where: { $0.webView === webView }) { closeTab(tab.id) }
+    }
+
+    /// 文件面板请求（COVER-UPLOAD-FIX D，iOS 18.4+ 公开回调）：页面
+    /// 文件控件要打开文件面板时 WebKit 改问宿主。两条路：① 执行页有
+    /// 武装好的待供文件（upload_file 已解析附件且 SP-01 已过）→ 直接
+    /// 把该文件 URL 交给页面，不弹任何选择器，消费即作废；② 其余
+    /// 情况（用户手动点页面上传按钮、或 upload_file 未解析到具体
+    /// 附件要现选）→ 宿主弹标准选择器（照片图库／文件）转发用户选择，
+    /// 保持「用户自己选」语义不变。iOS 18.4 以下系统不调用本方法，
+    /// 行为与 Safari 一致（系统选择器）。
+    @available(iOS 18.4, *)
+    func webView(_ webView: WKWebView, runOpenPanelWithParameters parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        if let supply = armedUploadSupply,
+           let tab = tabs.first(where: { $0.webView === webView }), tab.id == supply.tabID {
+            armedUploadSupply = nil
+            completionHandler([supply.url])
+            return
+        }
+        OpenPanelFallback.present(parameters: parameters, from: webView, completion: completionHandler)
     }
 
     // MARK: - agent 执行通道（路由到执行页）

@@ -601,6 +601,13 @@ struct OpenStall {
         /// 阶段开始前采集，收口时与上传后的清单作差——「页面新增图像」
         /// 是封面缩略图/预览图出现的客观第二回读。仅存源串（元数据）。
         var preUploadImages: [String] = []
+        /// 目标附件是否为图片、是否已存入系统相册（COVER-UPLOAD-FIX
+        /// A/C）：选文件卡与等待文案据此给出确切找图指引（相册「最近
+        /// 项目」最新一张／附件中心置顶项）。在 runUpload 解析附件时
+        /// 填入；现选文件（无附件）恒 false。仅内存态，不进快照 DTO
+        /// （恢复时按附件记录现查回填）。
+        var isImage: Bool = false
+        var savedToPhotos: Bool = false
         enum Stage { case confirmUpload, pickFile }
     }
     @Published private(set) var pendingUpload: PendingUpload?
@@ -1262,12 +1269,20 @@ struct OpenStall {
                             if coverTitle.isEmpty {
                                 appendStep("cover", "generate_cover 缺标题：请在 text 里给出封面标题（通常用文章标题）后重试")
                                 loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: "", outcome: "missing-title")
-                            } else if let produced = CoverGenerator.generate(title: coverTitle, subtitle: action.subtitle, template: CoverTemplate.from(action.template), sessionID: runSessionID) {
-                                appendStep("cover", "已自产封面「\(produced.displayName)」并存入本会话附件（编号 \(String(produced.id.uuidString.prefix(8)))，版式 \(CoverTemplate.from(action.template).label)，900×383，来源＝本任务生成）；设为网页封面时用 upload_file 引用该编号（任务生成文件免 SP-01 确认卡），设没设上以页面回读为准")
-                                loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "ok")
                             } else {
-                                appendStep("cover", "封面渲染失败（标题：\(coverTitle)），请如实汇报或调整标题后重试，不要假装已生成")
-                                loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "render-failed")
+                                // 生成＋登记＋同步相册（COVER-UPLOAD-FIX A）：
+                                // 相册结局三态由 PhotoSaveOutcome 文案如实
+                                // 带出——saved 才说「去相册最近项目找它」，
+                                // denied/failed 明说图只在附件里，不让用户
+                                // 去相册空找。
+                                let coverResult = await CoverGenerator.generateAndSaveToPhotos(title: coverTitle, subtitle: action.subtitle, template: CoverTemplate.from(action.template), sessionID: runSessionID)
+                                if let produced = coverResult.record {
+                                    appendStep("cover", "已自产封面「\(produced.displayName)」并存入本会话附件（编号 \(String(produced.id.uuidString.prefix(8)))，版式 \(CoverTemplate.from(action.template).label)，900×383，来源＝本任务生成）；\(coverResult.photo?.stepDescription(fileName: produced.displayName) ?? "未同步系统相册")；设为网页封面时用 upload_file 引用该编号（任务生成文件免 SP-01 确认卡），设没设上以页面回读为准")
+                                    loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "ok")
+                                } else {
+                                    appendStep("cover", "封面渲染失败（标题：\(coverTitle)），请如实汇报或调整标题后重试，不要假装已生成")
+                                    loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "render-failed")
+                                }
                             }
                         } else if action.action == "upload_file" {
                             // 网页上传人在环（F1）：定位文件控件后停在等待侧
@@ -1279,6 +1294,11 @@ struct OpenStall {
                             case .waiting:
                                 persistSnapshot()
                                 return
+                            case .autoSupplied:
+                                // App 已直接供文件且双回读已在
+                                // beginUploadPickStage 内收口：不停等待，
+                                // 任务照常续跑，模型下一轮看页面现状判断。
+                                loopFingerprint = LoopDetector.fingerprint(action: action.action, target: "index:\(action.index)", outcome: "ok")
                             case .strategySwitch:
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: "index:\(action.index)", outcome: "strategy-switch")
                             }
@@ -1469,7 +1489,7 @@ struct OpenStall {
     }
     // MARK: - 网页上传人在环（F1：SP-01 确认门＋系统选择器选文件＋回读核验）
 
-    private enum UploadOutcome { case waiting, strategySwitch }
+    private enum UploadOutcome { case waiting, strategySwitch, autoSupplied }
 
     /// upload_file 的定位与等待置位：在模型所见快照里按稳定描述重找目标
     /// （与 click/type 同口径，预算 1 次重取快照），目标必须是文件控件
@@ -1514,6 +1534,10 @@ struct OpenStall {
                                    elementLabel: !target.ariaLabel.isEmpty ? target.ariaLabel : (!target.name.isEmpty ? target.name : "文件上传控件"),
                                    stage: needsConfirm ? .confirmUpload : .pickFile,
                                    confirmationToken: nil)
+        // 找图指引口径（COVER-UPLOAD-FIX A/C）：选文件卡要能确切告诉
+        // 用户文件在哪——是否图片、是否已存入系统相册，此刻定格。
+        upload.isImage = attachment?.contentType.hasPrefix("image/") ?? false
+        upload.savedToPhotos = attachment?.savedToPhotos == true
         if needsConfirm {
             upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: attachment?.id, pageURL: snapshot.url)
             pendingUpload = upload
@@ -1523,30 +1547,73 @@ struct OpenStall {
             appendStep("upload", "已定位文件控件（\(upload.elementLabel)），按 SP-01 先出确认卡：文件「\(upload.attachmentName)」→ \(upload.pageHost.isEmpty ? upload.pageURL : upload.pageHost)，等用户确认")
         } else {
             pendingUpload = upload
-            appendStep("upload", "已定位文件控件（\(upload.elementLabel)），文件为本任务生成物、SP-01 豁免确认，等用户选文件")
-            await beginUploadPickStage()
+            appendStep("upload", "已定位文件控件（\(upload.elementLabel)），文件为本任务生成物、SP-01 豁免确认")
+            if await beginUploadPickStage() { return .autoSupplied }
         }
         return .waiting
     }
 
-    /// 进入选文件阶段：尝试触发页面上的文件控件（合成点击是否拉起系统
-    /// 选择器由系统决定），无论成败都置等待——选择器没弹时用户照介入卡
-    /// 指引自己在页面上点上传按钮选文件。等待文案与 waitingInput 同步
-    /// 更新（对话里留一条 manual 条目）。
-    private func beginUploadPickStage() async {
-        guard var upload = pendingUpload else { return }
+    /// 进入选文件阶段，返回 true＝已由 App 自动供文件并收口（调用方
+    /// 不要再停等待：runUpload 侧任务续跑、确认卡侧 launch 续跑）。
+    ///
+    /// 先做双回读基线采集，再（附件已解析且系统支持时）武装待供文件
+    /// 并触发控件——iOS 18.4+ 的文件面板公开回调命中即由 App 直接把
+    /// 文件交给页面、不弹选择器（COVER-UPLOAD-FIX D；SP-01 语义不变：
+    /// 走到这里说明已豁免或确认卡已消费）。触发后留一个短窗口等回调
+    /// 消费：命中→双回读收口；未命中（合成 click 未被认作拉起面板的
+    /// 手势）→待供文件保持武装转手动等待，用户在页面上真点上传按钮
+    /// 时同一回调会自动供文件。无附件/系统不支持时与旧路径一致：
+    /// 触发尝试＋置等待，用户照介入卡指引自己选文件。等待文案与
+    /// waitingInput 同步更新（对话里留一条 manual 条目）。
+    private func beginUploadPickStage() async -> Bool {
+        guard var upload = pendingUpload else { return false }
         upload.stage = .pickFile
         // 双回读基线（Part B）：触发控件前先存页面图像清单——收口时
         // 只有「上传后新增的图像」才算封面/预览出现的第二回读证据
         upload.preUploadImages = await web.probePageImages()
         pendingUpload = upload
+        var supplyArmed = false
+        if let attachmentID = upload.attachmentID,
+           let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
+            supplyArmed = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
+        }
         _ = await web.triggerFileInput(index: upload.elementIndex)
+        if supplyArmed {
+            try? await Task.sleep(for: .milliseconds(1200))
+            if !web.uploadSupplyArmed {
+                appendStep("upload", "App 已直接供文件：SP-01 已过后由 App 把「\(upload.attachmentName)」直接交给了页面文件控件（iOS 文件面板公开回调，未经系统选择器、未再向用户索取确认）")
+                pendingUpload = nil
+                waitingInput = nil
+                await verifyPickedUpload(upload: upload)
+                return true
+            }
+            appendStep("upload", "自动供文件未触发（合成触发未拉起文件面板）——文件已由 App 备好并保持待供：在网页上点一次上传按钮就会自动带上，不用在选择器里翻找")
+        }
         let text = "请选择要上传的文件（目标：\(upload.attachmentName)）"
         // 等待 id 每阶段一换：对话层按 id 去重，复用确认阶段的 id 会把
         // 选文件这条等待条目吞掉
         waitingInput = .manual(id: UUID(), text: text)
         status = .waitingManual(text)
         persistSnapshot()
+        return false
+    }
+
+    /// 选文件卡的找图指引（COVER-UPLOAD-FIX C，纯函数、自检二十二
+    /// 断言）：按附件实况拼出「去哪里选这份文件」——已存入相册的图片
+    /// 指相册「最近项目」最新一张；其余指附件中心置顶的「本任务生成」
+    /// 项；待供文件仍武装时加一句「在页面点上传按钮会自动带上」。
+    /// 介入卡与快照恢复文案共用，保证两处口径一致。
+    static func uploadPickGuidance(upload: PendingUpload, supplyArmed: Bool) -> String {
+        var routes: [String] = []
+        if upload.isImage && upload.savedToPhotos {
+            routes.append("打开照片选择里的「最近项目」，最新的一张就是它（文件名 \(upload.attachmentName)）")
+        }
+        routes.append("或在本 App 的附件中心里选置顶、标着「本任务生成」的那份（文件名 \(upload.attachmentName)）")
+        var text = "这份文件在哪选：" + routes.joined(separator: "；")
+        if supplyArmed {
+            text += "；也可以直接在网页上点一次上传按钮——文件已由 App 备好，会自动带上，不用在选择器里翻找"
+        }
+        return text
     }
 
     /// SP-01 确认卡「确认上传」：在此消费一次性凭据——凭据已过期/被消费/
@@ -1564,7 +1631,12 @@ struct OpenStall {
             }
         }
         appendStep("upload", "用户已确认上传文件「\(upload.attachmentName)」（SP-01 一次性确认已消费，不可复用）")
-        Task { @MainActor [weak self] in await self?.beginUploadPickStage() }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // 自动供文件命中时选文件阶段已自行收口，任务直接续跑；
+            // 未命中则已置等待（选文件卡），等用户照卡操作。
+            if await self.beginUploadPickStage() { self.launch() }
+        }
     }
 
     /// 上传等待中取消（确认卡「取消」与选文件卡「取消上传」共用）：
@@ -1585,33 +1657,39 @@ struct OpenStall {
         guard let upload = pendingUpload, upload.stage == .pickFile else { return }
         pendingUpload = nil
         waitingInput = nil
+        web.disarmUploadSupply()
         guard completed else {
             appendStep("upload", "用户取消了选文件（文件「\(upload.attachmentName)」未上传），请继续任务的其他部分，不要反复要求上传同一文件")
             launch()
             return
         }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await verifyPickedUpload(upload: upload)
+            launch()
+        }
+    }
+
+    /// 选文件收口的双回读核验（手动选文件与 App 自动供文件共用）：
+    /// ①文件控件持有状态 ②页面新增图像（封面缩略图/预览图）。双过才
+    /// 算「封面已设上」写里程碑；单过按 VERIFY-1 的 unknown 口径如实
+    /// 记步、不写里程碑、不声称设上；控件未持有则明说没读到。
+    private func verifyPickedUpload(upload: PendingUpload) async {
         let index = upload.elementIndex
         let host = upload.pageHost
         let baseline = Set(upload.preUploadImages)
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            // 双回读（Part B）：①文件控件持有状态 ②页面新增图像（封面
-            // 缩略图/预览图）。双过才算「封面已设上」写里程碑；单过按
-            // VERIFY-1 的 unknown 口径如实记步、不写里程碑、不声称设上
-            let names = await web.probeFileInput(index: index)
-            if names.isEmpty {
-                appendStep("upload", "上传回读核验：页面文件控件里未读到已选文件——可能还没选完或页面未持有该文件，不要声称已上传成功；确需上传时重新发起 upload_file")
+        let names = await web.probeFileInput(index: index)
+        if names.isEmpty {
+            appendStep("upload", "上传回读核验：页面文件控件里未读到已选文件——可能还没选完或页面未持有该文件，不要声称已上传成功；确需上传时重新发起 upload_file")
+        } else {
+            let afterImages = await web.probePageImages()
+            let newImages = afterImages.filter { !baseline.contains($0) }
+            if newImages.isEmpty {
+                appendStep("upload", "上传回读核验（unknown）：文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），但页面上未见新增的封面/预览图像——封面可能尚未设上或预览未渲染，不要声称封面已设好；下一轮看页面现状再判断（可稍等预览出现或核对封面区）")
             } else {
-                let afterImages = await web.probePageImages()
-                let newImages = afterImages.filter { !baseline.contains($0) }
-                if newImages.isEmpty {
-                    appendStep("upload", "上传回读核验（unknown）：文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），但页面上未见新增的封面/预览图像——封面可能尚未设上或预览未渲染，不要声称封面已设好；下一轮看页面现状再判断（可稍等预览出现或核对封面区）")
-                } else {
-                    appendStep("upload", "上传回读核验（双回读通过）：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），且页面新增了 \(newImages.count) 处图像（封面缩略图/预览已出现）——两项回读相互印证，封面已设上；是否已提交到服务器以下一轮页面反馈为准")
-                    stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
-                }
+                appendStep("upload", "上传回读核验（双回读通过）：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），且页面新增了 \(newImages.count) 处图像（封面缩略图/预览已出现）——两项回读相互印证，封面已设上；是否已提交到服务器以下一轮页面反馈为准")
+                stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
             }
-            launch()
         }
     }
 
@@ -1622,7 +1700,14 @@ struct OpenStall {
             AttachmentStore.shared.invalidateUploadConfirmation(token)
         }
         pendingUpload = nil
+        // 待供文件一并解除武装（COVER-UPLOAD-FIX D）：任务/会话离开
+        // 这个上传后，备好的文件不得再被后来的文件面板误消费。
+        web.disarmUploadSupply()
     }
+
+    /// 选文件卡指引用（COVER-UPLOAD-FIX D）：待供文件是否仍武装中
+    /// （介入卡据此决定是否展示「点上传按钮自动带上」一句）。
+    var uploadSupplyArmed: Bool { web.uploadSupplyArmed }
 
     /// click／type 的执行结果：executed＝已执行；strategySwitch＝目标整轮重找仍无法定位，
     /// 已记策略切换步、交模型按新快照重新判断；waiting＝已进入确认／手输等待（状态已置位）；
@@ -2218,6 +2303,74 @@ struct OpenStall {
             lines.append("✓ 全程无停车态：分类门与绕行梯驱动期间引擎未进入等待确认/等待手输状态")
         }
         return lines
+    }
+
+    /// 自检二十二（COVER-UPLOAD-FIX）：封面上传卡点的修复核查。纯逻辑
+    /// 部（本函数）——生成文件命名规整（ASCII 化、全角标点剔除、纯中文
+    /// 标题时间戳回退）、相册写入三态的步流文案口径（只有 saved 许说
+    /// 已存入相册）、附件展示排序（本任务生成置顶）、选文件指引文案
+    /// （相册路线/附件路线/自动带上三句按实况出现）、待供文件武装的
+    /// 基本性质（不支持环境下 arm 恒 false 且不留武装态）。回路部在
+    /// WebController.verifyUploadPanelSupply（合成页 test-upload 上
+    /// 武装→触发→回读），由 SelfTestView 编排在纯逻辑之后。不调用
+    /// 模型；要求引擎空闲。
+    func verifyCoverUploadFix() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十二未执行（先等当前任务终结或停止）"] }
+        var lines: [String] = []
+        func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
+        // —— 命名规整（B）——
+        let mixed = GeneratedFileName.coverFileName(title: "AI Weekly Report 2026!")
+        lines.append("\(fmt(mixed == "cover-ai-weekly-report-2026.png")) 命名·混合标题：「AI Weekly Report 2026!」→ \(mixed)（小写 slug、标点折连字符）")
+        let fullWidth = GeneratedFileName.coverFileName(title: "别让AI替你瞎编；用这套三步法")
+        let fullWidthOK = fullWidth.hasPrefix("cover-ai-") && fullWidth.hasSuffix(".png") && fullWidth.unicodeScalars.allSatisfy { $0.isASCII }
+        lines.append("\(fmt(fullWidthOK)) 命名·全角标点剔除：0336 现场标题（含全角分号）→ \(fullWidth)（全 ASCII、无全角残留）")
+        let fixedDate = Date(timeIntervalSince1970: 1762142400)
+        let chineseOnly = GeneratedFileName.coverFileName(title: "纯中文标题没有英文", date: fixedDate)
+        lines.append("\(fmt(chineseOnly.hasPrefix("cover-20") && chineseOnly.hasSuffix(".png") && chineseOnly.unicodeScalars.allSatisfy { $0.isASCII })) 命名·纯中文回退：slug 为空时退时间戳名 → \(chineseOnly)")
+        let longTitle = GeneratedFileName.coverFileName(title: String(repeating: "abcdefgh ", count: 10))
+        lines.append("\(fmt(longTitle.count <= "cover-.png".count + GeneratedFileName.slugLimit)) 命名·长度上限：超长标题 slug 截断在 \(GeneratedFileName.slugLimit) 字符内 → \(longTitle)")
+        // —— 相册三态文案（A 的失败路径口径）——
+        let savedText = PhotoSaveOutcome.saved.stepDescription(fileName: "cover-ai.png")
+        lines.append("\(fmt(savedText.contains("已生成并存入系统相册") && savedText.contains("cover-ai.png"))) 相册文案·成功态：明说已存入相册并带确切文件名")
+        let deniedText = PhotoSaveOutcome.denied.stepDescription(fileName: "cover-ai.png")
+        lines.append("\(fmt(deniedText.contains("没有存入系统相册") && deniedText.contains("cover-ai.png"))) 相册文案·未授权态：明说没存入相册（不假装在相册里），指出文件在附件里")
+        let failedText = PhotoSaveOutcome.failed("样本错误").stepDescription(fileName: "cover-ai.png")
+        lines.append("\(fmt(failedText.contains("存入系统相册失败") && failedText.contains("样本错误"))) 相册文案·失败态：带失败原因如实上报，不冒充成功")
+        // —— 展示排序（B 置顶）——
+        let now = Date()
+        func probeRecord(origin: AttachmentOrigin, secondsAgo: TimeInterval) -> AttachmentRecord {
+            AttachmentRecord(id: UUID(), sessionID: runSessionID, displayName: "probe", storedName: "probe", scaledName: nil, isScreenshot: false, origin: origin, contentType: "image/png", byteCount: 1, readState: .storedOnly, extractedText: nil, imageWidth: nil, imageHeight: nil, createdAt: now.addingTimeInterval(-secondsAgo), savedToPhotos: nil)
+        }
+        let ordered = AttachmentStore.displayOrdered([probeRecord(origin: .userPrivate, secondsAgo: 10), probeRecord(origin: .taskGenerated, secondsAgo: 60), probeRecord(origin: .userPrivate, secondsAgo: 5)])
+        let orderOK = ordered.count == 3 && ordered[0].origin == .taskGenerated && ordered[1].createdAt > ordered[2].createdAt
+        lines.append("\(fmt(orderOK)) 展示排序：本任务生成置顶（哪怕更旧），其余新在前")
+        // —— 选文件指引（C）——
+        var guideUpload = PendingUpload(id: UUID(), attachmentID: nil, attachmentName: "cover-ai.png", isTaskGenerated: true, pageURL: "https://example.com/edit", pageHost: "example.com", elementIndex: 0, elementLabel: "封面", stage: .pickFile, confirmationToken: nil)
+        guideUpload.isImage = true
+        guideUpload.savedToPhotos = true
+        let guideSaved = Self.uploadPickGuidance(upload: guideUpload, supplyArmed: false)
+        lines.append("\(fmt(guideSaved.contains("最近项目") && guideSaved.contains("cover-ai.png") && guideSaved.contains("本任务生成"))) 指引·已存相册：给出相册「最近项目」路线＋附件中心置顶路线＋确切文件名")
+        guideUpload.savedToPhotos = false
+        let guideUnsaved = Self.uploadPickGuidance(upload: guideUpload, supplyArmed: false)
+        lines.append("\(fmt(!guideUnsaved.contains("最近项目") && guideUnsaved.contains("cover-ai.png"))) 指引·未存相册：不给相册路线（图不在相册，不让用户空找），只指附件中心")
+        let guideArmed = Self.uploadPickGuidance(upload: guideUpload, supplyArmed: true)
+        lines.append("\(fmt(guideArmed.contains("自动带上"))) 指引·待供武装：加「在页面点上传按钮会自动带上」一句")
+        // —— 待供武装基本性质（D）——
+        if !web.uploadSupplySupported {
+            let armResult = web.armUploadSupply(url: URL(fileURLWithPath: "/tmp/probe"), fileName: "probe")
+            lines.append("\(fmt(!armResult && !web.uploadSupplyArmed)) 供文件·环境门：当前系统不支持文件面板回调时 arm 恒失败且不留武装态（引擎自动走手动路径）")
+        } else {
+            lines.append("✓ 供文件·环境门：当前系统支持文件面板回调（iOS 18.4+），武装/消费回路在回路部核查")
+        }
+        return lines
+    }
+
+    /// 自检二十二回路部转发（COVER-UPLOAD-FIX D）：合成页上的供文件
+    /// 回路在 WebController 侧（verifyUploadPanelSupply），SelfTestView
+    /// 经引擎转发调用，保持自检视图不直持 WebController 的既有形态。
+    func verifyUploadPanelSupply() async -> [String] {
+        guard !busy else { return ["✗ 引擎忙碌中，自检二十二回路未执行（先等当前任务终结或停止）"] }
+        return await web.verifyUploadPanelSupply()
     }
 
     /// 自检二十一（LADDER-FIX）：绕行梯引擎驱动的回路级核查。诊断 D5
@@ -3267,10 +3420,21 @@ struct OpenStall {
                 } else {
                     upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: dto.attachmentID, pageURL: dto.pageURL)
                 }
+                // 找图指引字段按附件记录现查回填（COVER-UPLOAD-FIX C）；
+                // 恢复到选文件阶段且附件可解析时重新武装待供文件——
+                // 进程被杀不改变「用户点上传按钮即自动带上」的口径。
+                if let attachmentID = dto.attachmentID,
+                   let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
+                    upload.isImage = record.contentType.hasPrefix("image/")
+                    upload.savedToPhotos = record.savedToPhotos == true
+                    if upload.stage == .pickFile {
+                        _ = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
+                    }
+                }
                 pendingUpload = upload
                 let text = upload.stage == .confirmUpload
                     ? "上传前请确认：将把文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)"
-                    : "请选择要上传的文件（目标：\(upload.attachmentName)）"
+                    : "请选择要上传的文件（目标：\(upload.attachmentName)）。\(Self.uploadPickGuidance(upload: upload, supplyArmed: web.uploadSupplyArmed))"
                 waitingInput = .manual(id: upload.id, text: text)
                 status = .waitingManual(text)
             }
