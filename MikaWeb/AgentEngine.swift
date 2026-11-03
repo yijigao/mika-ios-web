@@ -2319,22 +2319,22 @@ struct OpenStall {
         var lines: [String] = []
         func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
         // —— 命名规整（B）——
-        let mixed = GeneratedFileName.coverFileName(title: "AI Weekly Report 2026!")
+        let mixed = CoverGenerator.GeneratedFileName.coverFileName(title: "AI Weekly Report 2026!")
         lines.append("\(fmt(mixed == "cover-ai-weekly-report-2026.png")) 命名·混合标题：「AI Weekly Report 2026!」→ \(mixed)（小写 slug、标点折连字符）")
-        let fullWidth = GeneratedFileName.coverFileName(title: "别让AI替你瞎编；用这套三步法")
+        let fullWidth = CoverGenerator.GeneratedFileName.coverFileName(title: "别让AI替你瞎编；用这套三步法")
         let fullWidthOK = fullWidth.hasPrefix("cover-ai-") && fullWidth.hasSuffix(".png") && fullWidth.unicodeScalars.allSatisfy { $0.isASCII }
         lines.append("\(fmt(fullWidthOK)) 命名·全角标点剔除：0336 现场标题（含全角分号）→ \(fullWidth)（全 ASCII、无全角残留）")
         let fixedDate = Date(timeIntervalSince1970: 1762142400)
-        let chineseOnly = GeneratedFileName.coverFileName(title: "纯中文标题没有英文", date: fixedDate)
+        let chineseOnly = CoverGenerator.GeneratedFileName.coverFileName(title: "纯中文标题没有英文", date: fixedDate)
         lines.append("\(fmt(chineseOnly.hasPrefix("cover-20") && chineseOnly.hasSuffix(".png") && chineseOnly.unicodeScalars.allSatisfy { $0.isASCII })) 命名·纯中文回退：slug 为空时退时间戳名 → \(chineseOnly)")
-        let longTitle = GeneratedFileName.coverFileName(title: String(repeating: "abcdefgh ", count: 10))
-        lines.append("\(fmt(longTitle.count <= "cover-.png".count + GeneratedFileName.slugLimit)) 命名·长度上限：超长标题 slug 截断在 \(GeneratedFileName.slugLimit) 字符内 → \(longTitle)")
+        let longTitle = CoverGenerator.GeneratedFileName.coverFileName(title: String(repeating: "abcdefgh ", count: 10))
+        lines.append("\(fmt(longTitle.count <= "cover-.png".count + CoverGenerator.GeneratedFileName.slugLimit)) 命名·长度上限：超长标题 slug 截断在 \(CoverGenerator.GeneratedFileName.slugLimit) 字符内 → \(longTitle)")
         // —— 相册三态文案（A 的失败路径口径）——
-        let savedText = PhotoSaveOutcome.saved.stepDescription(fileName: "cover-ai.png")
+        let savedText = CoverGenerator.PhotoSaveOutcome.saved.stepDescription(fileName: "cover-ai.png")
         lines.append("\(fmt(savedText.contains("已生成并存入系统相册") && savedText.contains("cover-ai.png"))) 相册文案·成功态：明说已存入相册并带确切文件名")
-        let deniedText = PhotoSaveOutcome.denied.stepDescription(fileName: "cover-ai.png")
+        let deniedText = CoverGenerator.PhotoSaveOutcome.denied.stepDescription(fileName: "cover-ai.png")
         lines.append("\(fmt(deniedText.contains("没有存入系统相册") && deniedText.contains("cover-ai.png"))) 相册文案·未授权态：明说没存入相册（不假装在相册里），指出文件在附件里")
-        let failedText = PhotoSaveOutcome.failed("样本错误").stepDescription(fileName: "cover-ai.png")
+        let failedText = CoverGenerator.PhotoSaveOutcome.failed("样本错误").stepDescription(fileName: "cover-ai.png")
         lines.append("\(fmt(failedText.contains("存入系统相册失败") && failedText.contains("样本错误"))) 相册文案·失败态：带失败原因如实上报，不冒充成功")
         // —— 展示排序（B 置顶）——
         let now = Date()
