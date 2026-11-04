@@ -29,6 +29,7 @@ struct SelfTestView: View {
     @State private var recoveryBudgetTestRunning = false
     @State private var thermalGateTestRunning = false
     @State private var readbackRegistryTestRunning = false
+    @State private var typeVerifyTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -258,6 +259,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || readbackRegistryTestRunning)
             Text("自检三十六预期：纯状态机核对同任务单回读页、跨任务隔离、popup 不回收、终局清理与单页注销；真实页面保护和绑定恢复需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十七：富文本 type 校验（TYPE-VERIFY）") {
+                guard !typeVerifyTestRunning else { return }
+                typeVerifyTestRunning = true
+                runTypeVerifyTest()
+                dismiss()
+            }.disabled(!engine.active || typeVerifyTestRunning)
+            Text("自检三十七预期：字数信号丢失、无信号宽容、冻结、目标量级、基线增长兜底、DOM 缺失及旧探针 JSON 解码兼容均通过；真实编辑器需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -407,6 +415,33 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十五：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十五结论：全部通过（\(lines.count) 项）" : "自检三十五结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runTypeVerifyTest() {
+        defer { typeVerifyTestRunning = false }
+        conversation.localFeedback("自检三十七：开始——type 判定真值表（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) { lines.append("\(passed ? "✓" : "✗") \(note)") }
+        typealias Verdict = TypeVerifyPolicy.Verdict
+        func verdict(_ baseline: Int?, _ post: Int?, _ textOK: Bool) -> Verdict {
+            TypeVerifyPolicy.verdict(baselineCount: baseline, postCount: post,
+                                     textOK: textOK, expectedCount: 1236)
+        }
+        check(verdict(0, nil, true) == .failSignalLost, "基线 0、写后无信号：failSignalLost")
+        check(verdict(nil, nil, true) == .pass, "前后都无信号：pass")
+        check(verdict(0, 0, true) == .failFrozen(0), "字数冻结在 0：failFrozen")
+        check(verdict(0, 1236, true) == .pass, "目标 1236 字：pass")
+        check(verdict(100, 1300, true) == .pass, "基线 100、写后 1300：pass")
+        check(verdict(1000, 2236, true) == .pass, "基线 1000、写后 2236：增长兜底 pass")
+        check(verdict(0, 1236, false) == .failDomMissing &&
+              verdict(nil, nil, false) == .failDomMissing, "DOM 未命中优先 failDomMissing")
+        let oldJSON = Data(#"{"found":true,"count":0,"saveState":null,"textLength":0}"#.utf8)
+        let decoded = try? JSONDecoder().decode(WebController.EditorSignals.self, from: oldJSON)
+        check(decoded?.found == true && decoded?.locatedByIndex == false,
+              "旧探针 JSON 缺 locatedByIndex 时解为 false")
+        for line in lines { conversation.localFeedback("自检三十七：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检三十七结论：全部通过（\(lines.count) 项）" : "自检三十七结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runReadbackRegistryTest() {

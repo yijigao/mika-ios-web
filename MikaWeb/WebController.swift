@@ -923,6 +923,11 @@ enum TCProbeLogStore {
     /// 每次 click 执行前清空；只供串行引擎在成功后读取，不参与动作结果。
     private(set) var lastClickEffect: ClickEffect?
     private(set) var lastClickEffectMissingBefore = false
+    private(set) var lastEditorTypeTrace: [String] = []
+    func takeEditorTypeTrace() -> [String] {
+        defer { lastEditorTypeTrace = [] }
+        return lastEditorTypeTrace
+    }
     private var lastClickDispatchedAt: Date?
     @Published private(set) var tabs: [BrowserTab]
     @Published private(set) var activeTabID: UUID
@@ -2124,12 +2129,23 @@ enum TCProbeLogStore {
 
     /// 编辑器自报信号探针结果：页面可读的「字数：N」计数与保存状态文案，以及
     /// 编辑器 DOM 全文长度（次级信号）。count/saveState 为 nil 表示页面没有
-    /// 这类信号（校验回落 DOM 口径，不硬判）。
-    private struct EditorSignals: Decodable {
+    /// 这类信号；仅基线与写后均无 count 时沿用 DOM 口径。
+    struct EditorSignals: Decodable {
         let found: Bool
+        let locatedByIndex: Bool
         let count: Int?
         let saveState: String?
         let textLength: Int
+
+        private enum CodingKeys: String, CodingKey { case found, locatedByIndex, count, saveState, textLength }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            found = try values.decode(Bool.self, forKey: .found)
+            locatedByIndex = try values.decodeIfPresent(Bool.self, forKey: .locatedByIndex) ?? false
+            count = try values.decodeIfPresent(Int.self, forKey: .count)
+            saveState = try values.decodeIfPresent(String.self, forKey: .saveState)
+            textLength = try values.decode(Int.self, forKey: .textLength)
+        }
     }
 
     /// 探针：定位 contenteditable 编辑器（先按 data-mika-idx，再退首个可见编辑器），
@@ -2143,8 +2159,9 @@ enum TCProbeLogStore {
         (()=>{const a=\(json);
         const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
         let ed=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        const locatedByIndex=!!(ed&&ed.isContentEditable);
         if(!ed||!ed.isContentEditable)ed=[...document.querySelectorAll('[contenteditable="true"]')].find(vis)||null;
-        if(!ed||!ed.isContentEditable)return JSON.stringify({found:false,count:null,saveState:null,textLength:0});
+        if(!ed||!ed.isContentEditable)return JSON.stringify({found:false,locatedByIndex:false,count:null,saveState:null,textLength:0});
         const textLength=(ed.innerText||'').length;
         const countRe=/(?:字数|words?|characters?)\\s*[:：]?\\s*(\\d{1,7})/i;
         const savingRe=/保存中|正在保存|saving/i, savedRe=/已保存|保存成功|草稿已保存|上次保存|最近保存|保存于|saved/i;
@@ -2158,7 +2175,7 @@ enum TCProbeLogStore {
         let saveState=null;
         if(cands.some(t=>savingRe.test(t)))saveState='saving';
         else if(cands.some(t=>savedRe.test(t)))saveState='saved';
-        return JSON.stringify({found:true,count:count,saveState:saveState,textLength:textLength});})()
+        return JSON.stringify({found:true,locatedByIndex:locatedByIndex,count:count,saveState:saveState,textLength:textLength});})()
         """, on: tab) as? String, let decoded = try? JSONDecoder().decode(EditorSignals.self, from: Data(raw.utf8)) else {
             throw MikaError("编辑器状态探针失败（页面无响应）")
         }
@@ -2168,21 +2185,6 @@ enum TCProbeLogStore {
     /// 与 verifyType 同口径的归一化长度（去空白与零宽字符）。
     private static func normalizedLength(_ s: String) -> Int {
         s.filter { !$0.isWhitespace && $0 != "\u{200B}" && $0 != "\u{FEFF}" }.count
-    }
-
-    /// 字数一致性：写入是全选替换，落定字数应与目标文本量级一致（±15%＋余量）；
-    /// 编辑器原有内容场景再给一条兜底：较基线增长了目标量级也算吃进去了。
-    /// 计数与基线相同（冻结）必然不过——这正是专栏编辑器的实证形态。
-    private static func countConsistent(_ count: Int, expected: Int, baseline: Int?) -> Bool {
-        if expected == 0 { return true }
-        let low = max(0, Int(Double(expected) * 0.85) - 5)
-        let high = Int(Double(expected) * 1.15) + 10
-        if count >= low && count <= high { return true }
-        if let b = baseline, count > b {
-            let growth = count - b
-            if growth >= low && growth <= high { return true }
-        }
-        return false
     }
 
     /// 保存落定处理：状态停在「保存中」时，先让编辑器失焦促一次同步，再轮询
@@ -2200,12 +2202,13 @@ enum TCProbeLogStore {
         return last
     }
 
-    /// type 总流程分发：目标是 contenteditable 富文本编辑器且基线探针找得到它
-    /// 时，走编辑器状态校验流程（performTypeInEditor）；其余目标（表单字段、
-    /// 探针落空）走旧流程（performTypeLegacy，行为逐字不变）。
+    /// type 总流程分发：基线探针找到编辑器，且目标标为 editable 或按 idx
+    /// 命中编辑器时走状态校验；表单字段与探针落空走原样 Legacy。
     private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
-        if expected.editable, let baseline = try? await probeEditorSignals(action: action, tab: tab), baseline.found {
+        lastEditorTypeTrace = []
+        if let baseline = try? await probeEditorSignals(action: action, tab: tab), baseline.found,
+           (expected.editable || baseline.locatedByIndex) {
             try await performTypeInEditor(action: action, expected: expected, approved: approved, baseline: baseline, tab: tab)
             return
         }
@@ -2215,6 +2218,7 @@ enum TCProbeLogStore {
     /// 编辑器写入失败的性质分类（阶梯耗尽后按最后一次失败区分口径汇报）。
     private enum EditorWriteFailure {
         case domMissing
+        case signalLost
         case stateRejected(count: Int, baseline: Int?)
         case saveUnsettled(count: Int?)
     }
@@ -2268,17 +2272,24 @@ enum TCProbeLogStore {
                 }
             }
             let signals = try? await probeEditorSignals(action: action, tab: tab)
-            guard v.textOK else {
+            switch TypeVerifyPolicy.verdict(baselineCount: baseline.count, postCount: signals?.count,
+                                            textOK: v.textOK, expectedCount: expectedLen) {
+            case .failDomMissing:
                 trace.append("\(path)=dom-missing")
                 failure = .domMissing
                 continue
+            case .failSignalLost:
+                trace.append("\(path)=count-signal-lost")
+                failure = .signalLost
+                continue
+            case .failFrozen(let count):
+                trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
+                failure = .stateRejected(count: count, baseline: baseline.count)
+                continue
+            case .pass:
+                break
             }
             if let count = signals?.count {
-                guard Self.countConsistent(count, expected: expectedLen, baseline: baseline.count) else {
-                    trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
-                    failure = .stateRejected(count: count, baseline: baseline.count)
-                    continue
-                }
                 if signals?.saveState == "saving" {
                     let settled = await waitForEditorSaveSettle(action: action, tab: tab)
                     if settled?.saveState == "saving" {
@@ -2302,12 +2313,15 @@ enum TCProbeLogStore {
                 await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
                 throw MikaError("文字已输入，但「\(v.submits[0].text)」按钮仍是灰的（禁用状态），没能发布")
             }
+            if trace.count >= 2 { lastEditorTypeTrace = trace }
             return
         }
         await captureFailureSnapshot(context: "type 编辑器状态校验失败：\(action.reason)｜\(trace.joined(separator: "；"))", tab: tab)
         switch failure {
         case .domMissing:
             throw MikaError("文字没能输入到编辑器：\(strategies.count) 种写入方式都已尝试、回读仍为空或对不上，请在网页手动输入后点继续")
+        case .signalLost:
+            throw MikaError("文字已出现在编辑器里，但写入后读不到编辑器字数信号，无法确认文字是否真正进入编辑器状态——已自动换了 \(strategies.count) 种输入方式仍不成功，请在网页手动输入后点继续")
         case .stateRejected(let count, let base):
             throw MikaError("文字已出现在编辑器里，但编辑器内部字数仍停在 \(count) 字（\(base.map { "写入前 \($0) 字" } ?? "写入前字数未知")），说明文字没有真正进入编辑器状态——已自动换了 \(strategies.count) 种输入方式仍不成功；这种状态下点更新只会提交旧内容，请在网页手动输入后点继续")
         case .saveUnsettled(let count):

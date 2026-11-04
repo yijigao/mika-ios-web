@@ -1580,6 +1580,10 @@ struct OpenStall {
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
                                 record(action)
+                                if action.action == "type" {
+                                    let trace = web.takeEditorTypeTrace()
+                                    if trace.count >= 2 { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+                                }
                                 if action.action == "click" { appendStep("effect", clickEffectDescription()) }
                                 // 卡点逐项验收记账（LADDER-FIX F2）：真实
                                 // 执行成功的 click 计入在开卡点的手段证据
@@ -1816,6 +1820,10 @@ struct OpenStall {
             try await web.execute(saved.0, expected: target, approved: true)
             try await checkpoint(token)
             record(saved.0)
+            if saved.0.action == "type" {
+                let trace = web.takeEditorTypeTrace()
+                if trace.count >= 2 { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+            }
             if saved.0.action == "click" { appendStep("effect", clickEffectDescription()) }
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
             // 指示，此路不设软门；台账记下后防的是后续轮次的无意识重复）
