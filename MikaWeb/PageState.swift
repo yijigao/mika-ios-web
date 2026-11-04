@@ -56,14 +56,16 @@ struct PageState: Codable {
     /// 时解码为空（decodeIfPresent）。
     var overlayNotes: [String] = []
     var coverage: Coverage?
+    var epoch: Int?
     var coverageComplete: Bool { coverage?.truncated != true }
     enum CodingKeys: String, CodingKey {
         case url, title, text, elements
         case overlayNotes = "overlays"
         case coverage
+        case epoch
     }
-    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = [], coverage: Coverage? = nil) {
-        self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes; self.coverage = coverage
+    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = [], coverage: Coverage? = nil, epoch: Int? = nil) {
+        self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes; self.coverage = coverage; self.epoch = epoch
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -73,6 +75,7 @@ struct PageState: Codable {
         elements = try c.decode([PageElement].self, forKey: .elements)
         overlayNotes = try c.decodeIfPresent([String].self, forKey: .overlayNotes) ?? []
         coverage = try c.decodeIfPresent(Coverage.self, forKey: .coverage)
+        epoch = try c.decodeIfPresent(Int.self, forKey: .epoch)
     }
 }
 enum PageScript {

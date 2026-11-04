@@ -2,6 +2,12 @@ import SwiftUI
 import UIKit
 import BackgroundTasks
 import Combine
+enum StaleTargetPolicy {
+    static func isStaleTarget(errorDomain: String, code: Int, message: String) -> Bool {
+        guard errorDomain == "WKErrorDomain", code == 4 else { return false }
+        return ["目标元素已失效", "目标元素已变化"].contains { message.contains($0) }
+    }
+}
 enum AgentStatus {
     case idle, running, paused(String), waitingConfirm(AgentAction), waitingManual(String), done(String), failed(String), ended(String)
     var label: String {
@@ -2168,7 +2174,13 @@ struct OpenStall {
                     }
                     throw await capabilityFailureError(stuck: "弹窗点按无响应，目标「\(label)」被弹窗挡住")
                 }
-                guard Self.isStaleTargetError(error), refinds < 2 else { throw error }
+                let ns = error as NSError
+                // 阿仁亲审补漏（刀3）：WebController 的 guard 缓存未命中／代次
+                // 不一致是以 Swift 侧 MikaError 抛出的同名失效信号（非 WK 错
+                // 误形态），须与 JS guard 的 WK code 4 同口径认作失效走重找，
+                // 否则一次导航竞态会把可恢复的点击判死。
+                let nativeStale = (error as? MikaError).map { $0.message == "目标元素已失效" || $0.message == "目标元素已变化" } ?? false
+                guard nativeStale || StaleTargetPolicy.isStaleTarget(errorDomain: ns.domain, code: ns.code, message: error.localizedDescription + "|" + String(describing: ns.userInfo)), refinds < 2 else { throw error }
                 refinds += 1
                 snapshot = try await web.state()
             }
@@ -2664,6 +2676,7 @@ struct OpenStall {
             try? await Task.sleep(for: .milliseconds(800))
             _ = await web.settledCapture()
             let after = await web.dialogCensus()
+            guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
             let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
             return gone
                 ? (true, "成功（非编辑页重载绕行）：重载前弹窗 \(sigsBefore.count) 个，重载后原弹窗签名全部消失")
@@ -2693,6 +2706,7 @@ struct OpenStall {
         } catch { return (false, "导航往返抛错：\(error.localizedDescription)") }
         _ = await web.settledCapture()
         let after = await web.dialogCensus()
+        guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
         let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
         return gone
             ? (true, "成功（编辑页往返绕行）：先保存并 settle 回读落定→离开→直达返回后，原弹窗签名全部消失；正文完整以模型下一轮回读为准")
@@ -3188,19 +3202,6 @@ struct OpenStall {
         return lines
     }
 
-    /// 失效类错误判定：元素被重渲染换掉／目标已变化这一类（区别于「按钮是灰的／没输入
-    /// 进去／敏感操作未经确认」等有具体口径的失败，那些不走重找、照原样上抛）。两路命中：
-    /// ① 错误文案含「已失效／已变化」（Swift 侧抛出的同名错误、以及被 WebKit 带回原文的
-    /// JS 错误）；② WKErrorDomain 的 JavaScript 异常（code 4）——注入脚本的 guard 校验
-    /// 抛出的同名错误若未被带回原文，就以这个形态出现。把 ② 也算失效类的安全性：每次
-    /// 重找重试前都会对新目标重跑 Swift 侧 SafetyPolicy.check，JS 侧的安全类抛错（敏感
-    /// 操作／敏感字段）即使被误判为失效，重试也只会落到确认／手输流程，绝不绕过安全边界。
-    private static func isStaleTargetError(_ error: Error) -> Bool {
-        let ns = error as NSError
-        if ns.domain == "WKErrorDomain", ns.code == 4 { return true }
-        let text = error.localizedDescription + "|" + String(describing: ns.userInfo)
-        return text.contains("已失效") || text.contains("已变化")
-    }
 
     /// 前台检查点（取代旧 check，BACKGROUND-RESILIENCE 层 1）：代次不对／任务被取消
     /// 才抛错；App 不在前台时**原地驻停**等回前台（进程被系统冻结时本循环一并冻结、

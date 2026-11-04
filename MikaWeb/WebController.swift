@@ -11,6 +11,50 @@ extension Notification.Name {
     static let mikaWebAuthnBlocked = Notification.Name("MikaWeb.WebAuthnBlocked")
 }
 
+struct ClickGuardCacheKey: Equatable {
+    let tabID: UUID
+    let epoch: Int
+    let index: Int
+    static func hits(_ cached: Self?, tabID: UUID, epoch: Int, index: Int) -> Bool {
+        cached == Self(tabID: tabID, epoch: epoch, index: index)
+    }
+}
+
+enum SettleDecisionPolicy {
+    enum Decision: Equatable { case `continue`, settled, timedOut }
+    struct State { var signature: String? = nil; var epoch: Int? = nil; var consecutive = 0 }
+    static func step(_ state: inout State, signature: String?, epoch: Int, networkQuiet: Bool, remaining: TimeInterval) -> Decision {
+        if remaining <= 0 { return .timedOut }
+        guard let signature else { state = State(); return .continue }
+        if state.signature == signature && state.epoch == epoch { state.consecutive += 1 }
+        else { state.consecutive = 1 }
+        state.signature = signature; state.epoch = epoch
+        return state.consecutive >= 3 && networkQuiet ? .settled : .continue
+    }
+    static func shouldCaptureState(remaining: TimeInterval) -> Bool { remaining >= 1.5 }
+}
+
+enum SettleLoopPolicy {
+    enum Step: Equatable { case `continue`, cancelled, settled, timedOut }
+    static func next(cancelled: Bool, settled: Bool, remaining: TimeInterval) -> Step {
+        if cancelled { return .cancelled }
+        if settled { return .settled }
+        if remaining <= 0 { return .timedOut }
+        return .continue
+    }
+}
+
+@MainActor private final class CaptureDeadlineGate {
+    private var finished = false
+    private let continuation: CheckedContinuation<PageState?, Never>
+    init(_ continuation: CheckedContinuation<PageState?, Never>) { self.continuation = continuation }
+    func finish(_ page: PageState?) {
+        guard !finished else { return }
+        finished = true
+        continuation.resume(returning: page)
+    }
+}
+
 /// 弹窗 frame 探针的消息中枢（WECHAT-COVER-FIX）：探针脚本注入在每个
 /// frame 里，各 frame 的回報（probe-report／click-report）经消息处理器
 /// 到达这里；按（webView 身份＋本次探查 token）匹配正在等待的收集者，
@@ -141,6 +185,7 @@ enum SiteMode: String {
     @Published private(set) var canGoForward = false
     @Published var pageError: String?
     private(set) var revision = 0
+    private(set) var documentEpoch = 0
     private var observations: [NSKeyValueObservation] = []
     /// 网页进程终止时 webView.url 可能已被清空，保留最后已知地址供后续导航使用。
     private var lastKnownURL: URL?
@@ -701,6 +746,7 @@ enum SiteMode: String {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { revision += 1; pageError = nil; update() }
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) { documentEpoch += 1 }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         update()
         // Cookie 备份／回注（ADOPTION-TOP3 第 1 条）：真实导航完成即记访问（老化
@@ -709,13 +755,14 @@ enum SiteMode: String {
         CookieBackup.shared.noteVisit(url: webView.url)
         Task { @MainActor in await CookieBackup.shared.syncIfNeeded(store: WKWebsiteDataStore.default().httpCookieStore) }
     }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { documentEpoch += 1; pageError = error.localizedDescription; update() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
     /// 系统杀掉网页进程时只记事件并通知引擎；恢复由引擎统一预算调度，
     /// 此处不自作主张重载（页面的 JS／表单状态已丢失）。
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         if let url = webView.url { lastKnownURL = url }
         terminatedAt = Date()
+        documentEpoch += 1
         revision += 1
         pageError = "网页进程终止"
         onContentProcessTerminated?(self)
@@ -861,6 +908,7 @@ enum TCProbeLogStore {
 // goBack／goForward／evaluate 均为当前页门面；state／execute 则路由到「执行页」——任务开始
 // 时由 AgentEngine 捕获的标签页（executionTabID），用户中途手动切页不影响正在跑的任务。
 @MainActor final class WebController: NSObject, ObservableObject, WKUIDelegate {
+    private var clickGuardCache: ClickGuardCacheKey?
     struct ClickEffect: Equatable {
         let urlChanged: Bool
         let contentChanged: Bool
@@ -1690,13 +1738,13 @@ enum TCProbeLogStore {
         throw MikaError("网页加载超时")
     }
     /// 等页面短暂稳定再取快照（AGENT-VIEWPORT-FIX）：动作（输入／点击）常引发框架重渲染，
-    /// 立刻抽取会拿到中间态快照、元素引用随即失效。短轮询页面签名（就绪态／正文文本量／
-    /// 节点数／文档高度），连续两次相同即认为 DOM 已静默；上限约 1.6 秒，超时照常取快照
+    /// 立刻抽取会拿到中间态快照、元素引用随即失效。短轮询页面签名（就绪态／
+    /// 节点数／文档高度／资源末端时间），连续两次相同即认为 DOM 已静默；上限约 1.6 秒，超时照常取快照
     /// （动画／轮播类页面永不完全静默，不为它无限等）。全程尽力而为，不抛错、不拦加载判定。
     private func waitForStability(in tab: BrowserTab) async {
         // 切后台驻停：DOM 静默轮询整体停手，不向正在被挂起的网页进程连发探针
         if agentWorkSuspended { return }
-        let probe = "(()=>{const b=document.body;return [document.readyState,b?b.innerText.length:0,document.querySelectorAll('*').length,document.documentElement?document.documentElement.scrollHeight:0].join('|');})()"
+        let probe = "(()=>{let end=0;try{for(const e of performance.getEntriesByType('resource'))if(e.responseEnd>end)end=e.responseEnd;}catch(_){}return [document.readyState,document.querySelectorAll('*').length,document.documentElement?document.documentElement.scrollHeight:0,end].join('|');})()"
         var last: String?
         for _ in 0..<8 {
             if agentWorkSuspended { return }
@@ -1713,7 +1761,7 @@ enum TCProbeLogStore {
     /// 只取主文档首段可见文本，避免把整页内容带回原生侧。
     private func clickSignature(in tab: BrowserTab) async -> ClickSignature? {
         if agentWorkSuspended { return nil }
-        let script = "(()=>{const b=document.body;if(!b)return null;return JSON.stringify({url:location.href,count:document.querySelectorAll('*').length,text:(b.innerText||'').slice(0,2048)});})()"
+        let script = "(()=>{const b=document.body;if(!b)return null;let text='',n;const w=document.createTreeWalker(b,NodeFilter.SHOW_TEXT);while(text.length<2048&&(n=w.nextNode())){const p=n.parentElement;if(!p||p.closest('script,style,noscript'))continue;const r=p.getBoundingClientRect(),s=getComputedStyle(p);if(r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none')text+=n.textContent.trim()+' ';}return JSON.stringify({url:location.href,count:document.querySelectorAll('*').length,text:text.slice(0,2048)});})()"
         guard let raw = (try? await evaluate(script, on: tab)) as? String,
               let data = raw.data(using: .utf8),
               let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1748,9 +1796,9 @@ enum TCProbeLogStore {
     /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
     func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
     private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
-    func state() async throws -> PageState {
-        let tab = executionTab
-        if !agentWorkSuspended {
+    func state() async throws -> PageState { try await state(in: executionTab) }
+    private func state(in tab: BrowserTab, forCapture: Bool = false) async throws -> PageState {
+        if !agentWorkSuspended && !forCapture {
             // 取快照前先同步一次 Cookie（60 秒节流，BACKGROUND-RESILIENCE 的驻停
             // 期不做）：任务开始时若登录态已被 ITP 静默清除，先回注再让 agent 看
             // 页面，避免它对着登录墙误判（ADOPTION-TOP3 第 1 条）。
@@ -1758,10 +1806,27 @@ enum TCProbeLogStore {
             await CookieBackup.shared.syncIfNeeded(store: WKWebsiteDataStore.default().httpCookieStore)
         }
         try await ready(in: tab)
-        await waitForStability(in: tab)
-        guard let json = try await evaluate(PageScript.extract, on: tab) as? String else { throw MikaError("无法抽取页面状态") }
-        do { return try JSONDecoder().decode(PageState.self, from: Data(json.utf8)) }
-        catch { throw MikaError("页面状态解析失败，请刷新页面后重试") }
+        if !forCapture { await waitForStability(in: tab) }
+        // 文档代次一致性（阿仁亲审补漏，刀3）：抽取期间撞上主 frame 导航／
+        // 终止时整份重抽一次，两次都撞上才判失效——单次竞态不许把主循环
+        // 的一次正常取快照判死（该错误不属瞬时类、也不走重找路径）。
+        for attempt in 0..<2 {
+            try Task.checkCancellation()
+            let epoch = tab.documentEpoch
+            guard let json = try await evaluate(PageScript.extract, on: tab) as? String else { throw MikaError("无法抽取页面状态") }
+            try Task.checkCancellation()
+            if tab.documentEpoch != epoch {
+                if attempt == 0 { continue }
+                throw MikaError("目标元素已失效")
+            }
+            do {
+                var page = try JSONDecoder().decode(PageState.self, from: Data(json.utf8))
+                page.epoch = epoch
+                return page
+            }
+            catch { throw MikaError("页面状态解析失败，请刷新页面后重试") }
+        }
+        throw MikaError("目标元素已失效")
     }
     func execute(_ action: AgentAction, expected: PageElement? = nil, approved: Bool = false) async throws {
         let tab = executionTab
@@ -1821,6 +1886,25 @@ enum TCProbeLogStore {
         if(!\(approved ? "true" : "false")&&\(keywords).some(k=>label.includes(k)))throw new Error('敏感操作未经确认');
         const e=document.querySelector('[data-mika-idx="'+a.index+'"]');
         if(!e||!e.isConnected)throw new Error('目标元素已失效');
+        """
+    }
+
+    /// 派发时只复核目标及关联 label；不重跑 PageScript.extract。
+    private func localClickGuard(action: AgentAction, expected: PageElement, approved: Bool) throws -> String {
+        let json = String(decoding: try JSONEncoder().encode(expected), as: UTF8.self)
+        let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
+        return """
+        const expected=\(json),e=document.querySelector('[data-mika-idx="\(action.index)"]');
+        if(!e||!e.isConnected)throw new Error('目标元素已失效');
+        if(e.tagName.toLowerCase()!==expected.tag||!!e.isContentEditable!==!!expected.editable)throw new Error('目标元素已变化');
+        const labels=[...(e.labels||[])].map(x=>(x.innerText||'').trim()).join(' ');
+        const names=[(e.innerText||'').trim(),(e.getAttribute('aria-label')||'').trim(),(e.title||'').trim(),(e.getAttribute('alt')||'').trim(),labels,(e.placeholder||'').trim(),String(e.value||'').trim()];
+        if(expected.text&&expected.nameSource!=='none'&&expected.nameSource!=='bg'&&expected.nameSource!=='icon'&&!names.some(x=>x.slice(0,300)===expected.text))throw new Error('目标元素已变化');
+        const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.getAttribute('alt'),e.autocomplete,labels].join(' ');
+        if(/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint))throw new Error('敏感字段必须手动输入');
+        const label=[...names,e.name||''].join(' ').toLowerCase();
+        if(!\(approved ? "true" : "false")&&\(keywords).some(k=>label.includes(k)))throw new Error('敏感操作未经确认');
+        if(e.disabled===true||e.getAttribute('aria-disabled')==='true')return 'disabled';
         """
     }
 
@@ -2028,7 +2112,7 @@ enum TCProbeLogStore {
     /// 才扫全页。编辑器自身内容不参与匹配；「保存中」优先于「已保存」（保存进行
     /// 时旧的已保存标签可能同时在场，活动状态说了算）。
     private func probeEditorSignals(action: AgentAction, tab: BrowserTab) async throws -> EditorSignals {
-        let data = try JSONSerialization.data(withJSONObject: ["index": action.index])
+        let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "epoch": tab.documentEpoch])
         let json = String(decoding: data, as: UTF8.self)
         guard let raw = try await evaluate("""
         (()=>{const a=\(json);
@@ -2039,10 +2123,11 @@ enum TCProbeLogStore {
         const textLength=(ed.innerText||'').length;
         const countRe=/(?:字数|words?|characters?)\\s*[:：]?\\s*(\\d{1,7})/i;
         const savingRe=/保存中|正在保存|saving/i, savedRe=/已保存|保存成功|草稿已保存|上次保存|最近保存|保存于|saved/i;
-        const collect=root=>{const out=[];if(!root)return out;root.querySelectorAll('*').forEach(x=>{if(ed.contains(x)||!vis(x))return;const t=(x.innerText||'').trim();if(t&&t.length<=40)out.push(t);});return out;};
-        let cands=[],scope=ed;
-        for(let i=0;i<9;i++){scope=scope.parentElement;if(!scope)break;cands=cands.concat(collect(scope));if(cands.some(t=>countRe.test(t)))break;}
-        if(!cands.length)cands=collect(document.body);
+        const root=ed.closest('[data-editor-root],form,main,[class*="editor-root"],[id*="editor-root"]')||document.body;
+        const key='__mikaEditorSignals',old=window[key];
+        let nodes=old&&old.epoch===a.epoch&&old.editor===ed&&old.root===root&&old.nodes.every(x=>x.isConnected&&root.contains(x))?old.nodes:null;
+        if(!nodes){nodes=[...root.querySelectorAll('*')].filter(x=>{if(ed.contains(x)||x.contains(ed))return false;const t=(x.innerText||'').trim();return (t.length<=40&&(countRe.test(t)||savingRe.test(t)||savedRe.test(t)))||/save|status|count|word|character/i.test((x.id||'')+' '+(x.className||''));});window[key]={epoch:a.epoch,editor:ed,root:root,nodes:nodes};}
+        const cands=nodes.filter(vis).map(x=>(x.innerText||'').trim()).filter(t=>t&&t.length<=40);
         let count=null;
         for(const t of cands){const m=t.match(countRe);if(m){count=parseInt(m[1],10);break;}}
         let saveState=null;
@@ -2240,10 +2325,11 @@ enum TCProbeLogStore {
     /// rescan=true 时不做快照一致性校验（页面可能已重渲染），按原 data-mika-idx 节点或同文案候选重新定位，
     /// 并对命中节点复用同一套安全词检查。
     private func runClickScript(action: AgentAction, expected: PageElement, approved: Bool, rescan: Bool, tab: BrowserTab) async throws -> String {
+        guard ClickGuardCacheKey.hits(clickGuardCache, tabID: tab.id, epoch: tab.documentEpoch, index: action.index) else { throw MikaError("目标元素已失效") }
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
         let script: String
         if rescan {
-            let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": expected.text.isEmpty ? expected.ariaLabel : expected.text])
+            let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": expected.text.isEmpty ? expected.ariaLabel : expected.text, "tag": expected.tag])
             let json = String(decoding: data, as: UTF8.self)
             script = """
             (()=>{const a=\(json);
@@ -2251,10 +2337,10 @@ enum TCProbeLogStore {
             const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
             const lab=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim();
             const dis=x=>x.disabled===true||x.getAttribute('aria-disabled')==='true';
-            const safe=x=>{const l=[lab(x),x.getAttribute('aria-label')||''].join(' ').toLowerCase();if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');};
+            const safe=x=>{const hint=[x.type,x.name,x.id,x.placeholder,x.getAttribute('aria-label'),x.getAttribute('alt'),x.autocomplete,...[...(x.labels||[])].map(y=>y.innerText||'')].join(' ');if(/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint))throw new Error('敏感字段必须手动输入');const l=[lab(x),x.getAttribute('aria-label')||''].join(' ').toLowerCase();if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');};
             const tryClick=x=>{safe(x);x.scrollIntoView({block:'center'});x.focus();x.click();return 'clicked';};
             let node=document.querySelector('[data-mika-idx="'+a.index+'"]');
-            if(node&&node.isConnected&&vis(node)&&!dis(node))return tryClick(node);
+            if(node&&node.isConnected&&vis(node)&&!dis(node)&&node.tagName.toLowerCase()===a.tag&&(!a.text||norm(lab(node))===norm(a.text)))return tryClick(node);
             const want=norm(a.text);
             if(want){
               const cands=[...document.querySelectorAll('button,[role="button"],a,input[type="submit"],input[type="button"]')].filter(x=>vis(x)&&norm(lab(x))===want);
@@ -2287,10 +2373,12 @@ enum TCProbeLogStore {
             return 'missing';})()
             """
         } else {
-            let prefix = try guardScript(action: action, expected: expected, approved: approved)
+            guard ClickGuardCacheKey.hits(clickGuardCache, tabID: tab.id, epoch: tab.documentEpoch, index: action.index) else {
+                throw MikaError("目标元素已失效")
+            }
+            let prefix = try localClickGuard(action: action, expected: expected, approved: approved)
             script = """
             (()=>{\(prefix)
-            if(e.disabled===true||e.getAttribute('aria-disabled')==='true')return 'disabled';
             e.scrollIntoView({block:'center'});e.focus();e.click();return 'clicked';})()
             """
         }
@@ -2335,6 +2423,8 @@ enum TCProbeLogStore {
     /// 点击前探针（guard 校验与旧口径一致：目标已变化/已失效照旧 throw）：
     /// 返回 'ready-dialog'（目标在弹窗内）／'ready-plain'／'disabled'。
     private func probeClickContext(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws -> String {
+        clickGuardCache = nil
+        let epoch = tab.documentEpoch
         let prefix = try guardScript(action: action, expected: expected, approved: approved)
         let script = """
         (()=>{\(prefix)
@@ -2343,31 +2433,43 @@ enum TCProbeLogStore {
         return dialogOf(e)?'ready-dialog':'ready-plain';})()
         """
         let result = try await evaluate(script, on: tab)
+        guard tab.documentEpoch == epoch else { throw MikaError("目标元素已失效") }
+        clickGuardCache = ClickGuardCacheKey(tabID: tab.id, epoch: epoch, index: action.index)
         return (result as? String) ?? "ready-plain"
     }
 
     /// 弹窗存续探针：点击之后「同一弹窗仍在」是否成立——目标节点仍连接、
     /// 可见且身处弹窗内，或任一可见弹窗容器里还有同文案的可见按钮。
-    private func dialogPersists(action: AgentAction, expected: PageElement, tab: BrowserTab) async -> Bool {
+    private struct DialogPersistence {
+        let persists: Bool
+        let coverageComplete: Bool
+        var confirmedGone: Bool { coverageComplete && !persists }
+    }
+    private func dialogPersists(action: AgentAction, expected: PageElement, tab: BrowserTab) async -> DialogPersistence {
+        let epoch = tab.documentEpoch
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         guard let data = try? JSONSerialization.data(withJSONObject: ["index": action.index, "label": label]),
-              let json = String(data: data, encoding: .utf8) else { return false }
+              let json = String(data: data, encoding: .utf8) else { return DialogPersistence(persists: false, coverageComplete: false) }
         let script = """
         (()=>{const a=\(json);
         \(Self.dialogProbeJS)
         const e=document.querySelector('[data-mika-idx="'+a.index+'"]');
         if(e&&e.isConnected&&visDlg(e)&&dialogOf(e))return 'still';
         const want=normDlg(a.label);
+        if(!want)return 'unknown';
+        const examine=d=>{if(!visDlg(d)||dialogOf(d)!==d)return false;const cands=d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');for(const c of cands){if(visDlg(c)&&normDlg(labDlg(c))===want)return true;}return false;};
         if(want){
-          const all=document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],div,section');
-          for(const d of all){if(!visDlg(d)||dialogOf(d)!==d)continue;
-            const cands=d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');
-            for(const c of cands){if(visDlg(c)&&normDlg(labDlg(c))===want)return 'still';}}
+          const known=document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],.modal,[class*="dialog"],[class*="modal"],[class*="popup"]');
+          let seen=0;for(const d of known){if(++seen>64)return 'unknown';if(examine(d))return 'still';}
+          const walk=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT);
+          let d;seen=0;while((d=walk.nextNode())){if(++seen>2000)return 'unknown';if(d.matches('button,[role="button"],a,input[type="button"],input[type="submit"]')&&visDlg(d)&&normDlg(labDlg(d))===want&&dialogOf(d))return 'still';}
         }
         return 'gone';})()
         """
         let result = try? await evaluate(script, on: tab)
-        return (result as? String) == "still"
+        guard tab.documentEpoch == epoch else { return DialogPersistence(persists: false, coverageComplete: false) }
+        let status = result as? String
+        return DialogPersistence(persists: status == "still", coverageComplete: status == "still" || status == "gone")
     }
 
     /// 完整点按序列的单步派发：每步独立求值（步间由 Swift 侧睡出小间隔），
@@ -2417,10 +2519,14 @@ enum TCProbeLogStore {
     /// 弹窗升级点击：完整序列→等 600ms→存续探针；仍在则再来一轮；
     /// 连败 2 次抛「弹窗点按无响应」（引擎判能力类卡点走绕行梯；不静默循环、不假装已同意）。
     private func performModalClick(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
+        guard ClickGuardCacheKey.hits(clickGuardCache, tabID: tab.id, epoch: tab.documentEpoch, index: action.index) else { throw MikaError("目标元素已失效") }
+        let local = try localClickGuard(action: action, expected: expected, approved: approved)
+        let validity = try await evaluate("(()=>{\(local)return 'ready';})()", on: tab) as? String
+        guard validity == "ready" else { throw MikaError("目标元素已失效") }
         for _ in 1...2 {
             try await performPointerSequence(action: action, approved: approved, tab: tab)
             try await Task.sleep(for: .milliseconds(600))
-            if await dialogPersists(action: action, expected: expected, tab: tab) == false { return }
+            if await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone { return }
         }
         await captureFailureSnapshot(context: "弹窗点按无响应：\(action.reason)", tab: tab)
         throw MikaError("\(Self.modalUnresponsivePrefix)：弹窗内的按钮经完整点按序列（真实坐标的 pointer/mouse 事件）两次尝试后仍未关闭——合成点按不是真实点按（isTrusted=false），这类网页只认真实点按")
@@ -2455,6 +2561,8 @@ enum TCProbeLogStore {
     struct FrameCensus {
         let frameCount: Int
         let hits: [FrameDialogHit]
+        let framePaths: Set<String>
+        let coverageComplete: Bool
         /// 人话摘要（进诊断与失败原文）：frame 总数＋每个命中弹窗的位置与按钮。
         var summary: String {
             guard !hits.isEmpty else { return "共 \(frameCount) 个 frame，未发现弹窗" }
@@ -2498,7 +2606,9 @@ enum TCProbeLogStore {
                                            text: (dialog["text"] as? String) ?? "", buttons: buttons))
             }
         }
-        return FrameCensus(frameCount: box.messages.count, hits: hits)
+        return FrameCensus(frameCount: box.messages.count, hits: hits,
+                           framePaths: Set(box.messages.compactMap { $0["path"] as? String }),
+                           coverageComplete: box.messages.contains { ($0["isTop"] as? Bool) == true })
     }
 
     struct FrameClickReport {
@@ -2698,7 +2808,7 @@ enum TCProbeLogStore {
             status = first
             if first == "clicked" {
                 try await Task.sleep(for: .milliseconds(500))
-                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
                     try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
                 }
                 return
@@ -2709,7 +2819,7 @@ enum TCProbeLogStore {
             status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
             if status == "clicked" {
                 try await Task.sleep(for: .milliseconds(500))
-                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
                     try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
                 }
                 return
@@ -2729,7 +2839,7 @@ enum TCProbeLogStore {
             let retry = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
             if retry == "clicked" {
                 try await Task.sleep(for: .milliseconds(500))
-                if await dialogPersists(action: action, expected: expected, tab: tab) {
+                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
                     try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
                 }
                 return
@@ -2977,6 +3087,9 @@ enum TCProbeLogStore {
             lines.append("✗ 文本锚点样本元素（锚点目标词）未进快照")
             return lines
         }
+        if let act = Self.selfTestClickAction(index: spanEl.index) {
+            _ = try? await probeClickContext(action: act, expected: spanEl, approved: false, tab: tab)
+        }
         _ = try? await evaluate("(()=>{const s=document.getElementById('anchorSpan');if(s){const c=s.cloneNode(true);s.replaceWith(c);}document.querySelectorAll('[data-mika-idx]').forEach(x=>x.removeAttribute('data-mika-idx'));return 'wiped';})()", on: tab)
         if let act = Self.selfTestClickAction(index: spanEl.index) {
             do {
@@ -3018,6 +3131,7 @@ enum TCProbeLogStore {
         let samples: [VerificationSample]
         let settled: Bool
         let after: PageState
+        let finalCaptureSkipped: Bool
     }
 
     /// 动作后取证：每 300ms 探一帧，签名连续 3 帧不变且最近网络响应
@@ -3026,35 +3140,61 @@ enum TCProbeLogStore {
     func settledCapture(timeoutMs: Int = 5000) async -> SettledCapture {
         let tab = executionTab
         var samples: [VerificationSample] = []
-        var lastSig: String?
-        var stableRepeats = 0
+        var decisionState = SettleDecisionPolicy.State()
         var settled = false
+        var cancelled = false
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
-        while Date() < deadline {
+        while SettleLoopPolicy.next(cancelled: Task.isCancelled, settled: settled, remaining: deadline.timeIntervalSinceNow) == .continue {
             if agentWorkSuspended { break }
+            let epoch = tab.documentEpoch
             if let raw = (try? await evaluate(Self.settleProbe, on: tab)) as? String,
                let probe = try? JSONDecoder().decode(SettleProbeResult.self, from: Data(raw.utf8)) {
+                if Task.isCancelled { cancelled = true; break }
+                if tab.documentEpoch != epoch { decisionState = .init(); samples.removeAll(); continue }
+                if let previousURL = samples.last?.url, previousURL != probe.url { samples.removeAll() }
                 samples.append(VerificationSample(url: probe.url, text: probe.text))
                 let networkQuiet = probe.lastEnd == 0 || (probe.now - probe.lastEnd) > 600
-                if probe.sig == lastSig, networkQuiet {
-                    stableRepeats += 1
-                } else {
-                    stableRepeats = 0
-                }
-                lastSig = probe.sig
-                if stableRepeats >= 2 { settled = true; break }
+                settled = SettleDecisionPolicy.step(&decisionState, signature: probe.url + "|" + probe.sig, epoch: epoch, networkQuiet: networkQuiet, remaining: deadline.timeIntervalSinceNow) == .settled
+                if settled { break }
+            } else {
+                if Task.isCancelled { cancelled = true; break }
+                _ = SettleDecisionPolicy.step(&decisionState, signature: nil, epoch: epoch, networkQuiet: false, remaining: deadline.timeIntervalSinceNow)
             }
-            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { cancelled = true; break }
+            do { try await Task.sleep(for: .milliseconds(300)) }
+            catch { cancelled = true; break }
         }
+        if Task.isCancelled { cancelled = true }
+        if let sampledEpoch = decisionState.epoch, sampledEpoch != tab.documentEpoch { settled = false; samples.removeAll() }
+        if cancelled { settled = false }
         let after: PageState
-        if let fresh = try? await state() {
+        var finalCaptureSkipped = true
+        if !cancelled && SettleDecisionPolicy.shouldCaptureState(remaining: deadline.timeIntervalSinceNow),
+           let fresh = await captureState(in: tab, before: deadline) {
             after = fresh
-        } else if let last = samples.last {
-            after = PageState(url: last.url, title: "", text: last.text, elements: [])
+            if let sampledEpoch = decisionState.epoch, fresh.epoch != sampledEpoch { settled = false }
+            finalCaptureSkipped = false
         } else {
-            after = PageState(url: tab.webView.url?.absoluteString ?? "", title: "", text: "", elements: [])
+            let last = samples.last
+            after = PageState(url: last?.url ?? tab.webView.url?.absoluteString ?? "", title: "", text: last?.text ?? "", elements: [], epoch: tab.documentEpoch)
         }
-        return SettledCapture(samples: samples, settled: settled, after: after)
+        if Task.isCancelled { settled = false }
+        return SettledCapture(samples: samples, settled: settled, after: after, finalCaptureSkipped: finalCaptureSkipped)
+    }
+
+    private func captureState(in tab: BrowserTab, before deadline: Date) async -> PageState? {
+        await withCheckedContinuation { continuation in
+            let gate = CaptureDeadlineGate(continuation)
+            let work = Task { @MainActor in
+                gate.finish(try? await self.state(in: tab, forCapture: true))
+            }
+            Task { @MainActor in
+                let ms = max(1, Int(deadline.timeIntervalSinceNow * 1000))
+                try? await Task.sleep(for: .milliseconds(ms))
+                work.cancel()
+                gate.finish(nil)
+            }
+        }
     }
 
     // MARK: - 自检十三 Tier A（VERIFY-1）：核验合约的合成页全链驱动

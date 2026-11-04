@@ -230,6 +230,10 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || extractionBudgetTestRunning)
             Text("自检三十预期：不调用模型、不占用标签页；核对预算常量、coverage 新旧 JSON 兼容和唯一候选真值表。JS 常量需人工核对同值。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十一：目标复核（TARGET-REVALIDATION）") { runKnife3Test(31) }.disabled(!engine.active)
+            Text("自检三十一预期：纯逻辑核对目标失效文案与 guard 缓存的 tab、epoch、index 键。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十二：稳定决策（SETTLE-DECISION）") { runKnife3Test(32) }.disabled(!engine.active)
+            Text("自检三十二预期：纯逻辑核对三帧连续、资源静默、失败帧、文档代次变化和最终取证预算。").font(.caption).foregroundStyle(.secondary)
             Button("自检三十三：恢复预算（RECOVERY-BUDGET）") {
                 guard !recoveryBudgetTestRunning else { return }
                 recoveryBudgetTestRunning = true
@@ -237,6 +241,8 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || recoveryBudgetTestRunning)
             Text("自检三十三预期：不调用模型、不占用标签页；验证整任务恢复尝试与加载上限、2/5/10 秒退避、两类计数独立、Codable 往返和默认值相等。真实页面恢复与进程终止需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十四：取消决策（CANCELLATION）") { runKnife3Test(34) }.disabled(!engine.active)
+            Text("自检三十四预期：纯状态机核对取消优先于稳定与超时，置位后下一步必退出。").font(.caption).foregroundStyle(.secondary)
             Button("自检三十五：热态门（THERMAL-GATE）") {
                 guard !thermalGateTestRunning else { return }
                 thermalGateTestRunning = true
@@ -277,6 +283,46 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十结论：全部通过（\(lines.count) 项）" : "自检三十结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runKnife3Test(_ number: Int) {
+        var lines: [String] = []
+        func check(_ ok: Bool, _ note: String) { lines.append("\(ok ? "✓" : "✗") \(note)") }
+        switch number {
+        case 31:
+            check(StaleTargetPolicy.isStaleTarget(errorDomain: "WKErrorDomain", code: 4, message: "目标元素已失效"), "code 4 且目标失效文案命中")
+            check(!StaleTargetPolicy.isStaleTarget(errorDomain: "WKErrorDomain", code: 4, message: "普通脚本异常"), "普通 JS 异常不当 stale")
+            check(!StaleTargetPolicy.isStaleTarget(errorDomain: "WKErrorDomain", code: 3, message: "目标元素已变化"), "code 非 4 不当 stale")
+            check(!StaleTargetPolicy.isStaleTarget(errorDomain: "OtherDomain", code: 4, message: "目标元素已失效"), "其他域不当 stale")
+            let id = UUID()
+            let key = ClickGuardCacheKey(tabID: id, epoch: 2, index: 7)
+            check(ClickGuardCacheKey.hits(key, tabID: id, epoch: 2, index: 7), "同 tab、epoch、index 缓存命中")
+            check(!ClickGuardCacheKey.hits(key, tabID: id, epoch: 3, index: 7), "文档代次变则失效")
+            check(!ClickGuardCacheKey.hits(key, tabID: id, epoch: 2, index: 8), "目标 index 变则失效")
+            check(!ClickGuardCacheKey.hits(key, tabID: UUID(), epoch: 2, index: 7), "跨 tab 不命中")
+        case 32:
+            var state = SettleDecisionPolicy.State()
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: true, remaining: 3) == .continue, "首帧不稳定")
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: true, remaining: 3) == .continue, "两帧不稳定")
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: false, remaining: 3) == .continue, "三帧但资源未静默不稳定")
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: true, remaining: 3) == .settled, "连续三帧且静默才稳定")
+            _ = SettleDecisionPolicy.step(&state, signature: nil, epoch: 1, networkQuiet: false, remaining: 3)
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: true, remaining: 3) == .continue, "失败帧重置连续性")
+            _ = SettleDecisionPolicy.step(&state, signature: "a", epoch: 1, networkQuiet: true, remaining: 3)
+            check(SettleDecisionPolicy.step(&state, signature: "a", epoch: 2, networkQuiet: true, remaining: 3) == .continue, "同 URL 重载但 epoch 变则重置")
+            check(!SettleDecisionPolicy.shouldCaptureState(remaining: 1.49) && SettleDecisionPolicy.shouldCaptureState(remaining: 1.5), "不足 1.5 秒用样本收口")
+            check(SettleDecisionPolicy.step(&state, signature: nil, epoch: 2, networkQuiet: true, remaining: 0) == .timedOut, "预算耗尽且证据不足不产 settled")
+        case 34:
+            check(SettleLoopPolicy.next(cancelled: false, settled: false, remaining: 1) == .continue, "正常继续")
+            check(SettleLoopPolicy.next(cancelled: true, settled: false, remaining: 1) == .cancelled, "取消后下一步退出")
+            check(SettleLoopPolicy.next(cancelled: true, settled: true, remaining: 0) == .cancelled, "取消优先于稳定和超时")
+            check(SettleLoopPolicy.next(cancelled: false, settled: true, remaining: 1) == .settled, "稳定退出")
+            check(SettleLoopPolicy.next(cancelled: false, settled: false, remaining: 0) == .timedOut, "超时退出")
+        default: return
+        }
+        for line in lines { conversation.localFeedback("自检三\(number == 31 ? "十一" : number == 32 ? "十二" : "十四")：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback("自检三\(number == 31 ? "十一" : number == 32 ? "十二" : "十四")结论：\(failed == 0 ? "全部通过" : "\(failed) 项未通过")（\(lines.count) 项）")
     }
 
     private func runRecoveryBudgetTest() {
