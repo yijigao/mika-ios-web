@@ -871,6 +871,8 @@ struct OpenStall {
     /// 不循环（防 Issue #181 式「全量重发＋重试」死循环）。进程恢复后随
     /// 内存态重置（恢复出的步数已多、自动折叠级别本就更高，不构成循环）。
     private var contextRetryUsed = false
+    /// 本次 launch 至多要求一次结案回读；与上下文重试同批重置。
+    private var finalAuditFired = false
     /// 当前会话目标（对话层判定「有可续跑上下文」用，只读）。
     var activeGoal: String { goal }
     /// 后台宽限断言（层 2）：进后台时申请、回前台／会话终结／到期时释放。
@@ -939,7 +941,7 @@ struct OpenStall {
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); stepLimitPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
-        stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false
+        stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         // 绕行梯随新任务重置（AUTONOMY-FIX）：每个任务从梯级①重新开始
         bypassLadder = BypassLadder()
         // 在开卡点随新任务重置（LADDER-FIX）：卡点是单任务现场
@@ -1210,7 +1212,7 @@ struct OpenStall {
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         discardPendingUpload()
-        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
+        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         runStartedAt = nil; activeRunContext = nil
     }
 
@@ -1372,6 +1374,7 @@ struct OpenStall {
         // 代次绑定（M1）：本代次与所属会话、对话任务一并记录；stop/新任务
         // 换代后，旧代次的 worker 在 checkpoint 处自行退出（见类头注释）
         runStartedAt = Date()
+        finalAuditFired = false
         activeRunContext = conversationTaskID.map { (sessionID: runSessionID, taskID: $0, generation: token) }
         worker?.cancel(); status = .running; sessionActive = true; applyIdleTimerPolicy()
         transientStreak = 0
@@ -1425,10 +1428,17 @@ struct OpenStall {
                             if let gate = try await evaluateDoneGate(token: token), gate == .driven {
                                 continue
                             }
-                            // 完成总结是模型回读页面后写下的核实结论：钉进台账
-                            // 里仍待核查的条目，后续追问轮次据此守定力口径
-                            markOutcomesVerified(summary: action.summary)
-                            record(action); status = .done(action.summary)
+                            let pendingThisRun = Self.pendingOutcomes(outcomeLedger, since: runStartedAt)
+                            if Self.containsCompletionClaim(summary: action.summary), !pendingThisRun.isEmpty, !finalAuditFired {
+                                finalAuditFired = true
+                                appendStep("audit", "结案自证门：总结含完成断言，但本轮提交仍待核查；请先回读内容列表/记录页，再给出结案口径")
+                                pendingLoopHint = "【结案自证门】本轮提交仍待核查。请去内容列表/记录页回读对应条目，引用页面原文；确认生效就在总结里写明证据来源；找不到或对不上就如实写未核实。不得再次提交同一内容。"
+                                continue
+                            }
+                            recordCompletionClaim(summary: action.summary, since: runStartedAt)
+                            record(action)
+                            let pendingNote = Self.pendingOutcomes(outcomeLedger, since: runStartedAt).isEmpty ? "" : "（注：本任务有提交未经回读核实，见步流）"
+                            status = .done(action.summary + pendingNote)
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
                             web.endExecution(); clearSnapshot(); resumeNote = nil
@@ -3419,35 +3429,97 @@ struct OpenStall {
         outcomeGateFired.insert(record.id)
         let when = Self.outcomeTime(record.recordedAt)
         let contentDesc = record.contentPrefix.isEmpty ? "该内容" : "内容「\(record.contentPrefix)…」"
-        let step = "重复提交提醒：\(contentDesc)已于 \(when) 在 \(record.host.isEmpty ? "本地页面" : record.host) 提交过（状态：\(record.statusNote)），本次重复提交已拦下未执行——先去内容列表/记录页核查现状再决定"
-        let hint = "【重复提交提醒】你刚才试图再次提交的\(contentDesc)已于 \(when) 提交过，台账状态：\(record.statusNote)。本次点击已被拦下、没有执行。现在先去该站的内容列表/记录页核查这条内容的当前状态（如审核中/已发布），再决定下一步：状态正常就向用户复述核实结果，不要回编辑器凭残稿重发；只有用户明确要求重新提交时，才再次点击提交（再次点击会放行，reason 里注明系用户要求）。"
+        let shownStatus = Self.displayedOutcomeStatus(record.statusNote)
+        let step = "重复提交提醒：\(contentDesc)已于 \(when) 在 \(record.host.isEmpty ? "本地页面" : record.host) 提交过（状态：\(shownStatus)），本次重复提交已拦下未执行——先去内容列表/记录页核查现状再决定"
+        let hint = "【重复提交提醒】你刚才试图再次提交的\(contentDesc)已于 \(when) 提交过，台账状态：\(shownStatus)。本次点击已被拦下、没有执行。现在先去该站的内容列表/记录页核查这条内容的当前状态（如审核中/已发布），再决定下一步：状态正常就向用户复述核实结果，不要回编辑器凭残稿重发；只有用户明确要求重新提交时，才再次点击提交（再次点击会放行，reason 里注明系用户要求）。"
         return (step, hint)
     }
 
-    /// 任务以 done 收口时，把台账里仍「待核查」的条目钉上模型的完成总结
-    /// 作为已核实结论：总结是模型回读页面（列表核查等）后写下的，钉进
-    /// 台账后每轮注入——后续追问轮次再想改口「无法确认」，先要面对自己
-    /// 写进台账的这句总结（定力口径，配合系统提示「成果定力」段）。
-    private func markOutcomesVerified(summary: String) {
+    /// 只看本次运行落记、且仍待核查的条目；台账本身跨任务保存。
+    private static func pendingOutcomes(_ records: [OutcomeRecord], since startedAt: Date?) -> [OutcomeRecord] {
+        guard let startedAt else { return [] }
+        return records.filter { $0.recordedAt >= startedAt && $0.statusNote.contains("待核查") }
+    }
+
+    /// 完成断言词前四字内有否定词时不触发；「未核实」出现在断言之后
+    /// 仍算断言，需由自证门要求回读。
+    private static func containsCompletionClaim(summary: String) -> Bool {
+        let claims = ["已发表", "已发布", "已提交", "已存草稿", "已保存", "发表成功", "提交成功", "发布成功", "保存成功", "已投稿", "发送成功", "已发送", "已完成"]
+        let negations = ["未", "没", "无法", "未能", "尚未"]
+        for claim in claims {
+            var search = summary.startIndex..<summary.endIndex
+            while let range = summary.range(of: claim, range: search) {
+                let prefix = summary[..<range.lowerBound].suffix(4)
+                if !negations.contains(where: { prefix.contains($0) }) { return true }
+                search = range.upperBound..<summary.endIndex
+            }
+        }
+        return false
+    }
+
+    /// done 只把模型结案自述附于本轮待核查条目，不据此晋级核实状态。
+    private func recordCompletionClaim(summary: String, since startedAt: Date?) {
         let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         var changed = false
-        for index in outcomeLedger.indices where outcomeLedger[index].statusNote.contains("待核查") {
-            outcomeLedger[index].statusNote = "已核实（完成总结）：\(String(trimmed.prefix(80)))"
+        guard let startedAt else { return }
+        for index in outcomeLedger.indices where outcomeLedger[index].recordedAt >= startedAt && outcomeLedger[index].statusNote.contains("待核查") {
+            outcomeLedger[index].statusNote = "已提交（待核查）；结案自述（未经独立核实）：\(String(trimmed.prefix(80)))"
             changed = true
         }
         if changed { saveOutcomeLedger() }
     }
 
-    /// 台账注入段：逐条列出已留痕的提交，附定力硬口径。返回空串＝台账为空。
+    /// 旧数据只在展示时映射，不改盘上的原字段。
+    private static func displayedOutcomeStatus(_ note: String) -> String {
+        let legacy = "已核实（完成总结）"
+        guard note.hasPrefix(legacy) else { return note }
+        return "结案自述（旧口径，未经独立核实）" + String(note.dropFirst(legacy.count))
+    }
+
+    /// 自检二十七（FINAL-CLAIM-AUDIT）：纯断言真值表与跨任务时间筛选。
+    /// 不调用模型、不改引擎现场；可由调试入口调用。
+    func verifyFinalClaimAudit() -> [String] {
+        let cases: [(String, Bool)] = [
+            ("已发表", true), ("文章已发布", true), ("已提交审核", true),
+            ("已存草稿", true), ("已保存", true), ("发表成功", true),
+            ("提交成功", true), ("发布成功", true), ("保存成功", true),
+            ("已投稿", true), ("发送成功", true),
+            ("未发布", false), ("没提交成功", false), ("无法保存成功", false),
+            ("未能发表成功", false), ("尚未存草稿", false),
+            ("已完成但未核实", true),
+            ("已查看列表，汇总如下", false), ("", false)
+        ]
+        var lines = cases.map { item in
+            let (sample, expected) = item
+            let actual = Self.containsCompletionClaim(summary: sample)
+            return "\(actual == expected ? "✓" : "✗") 断言「\(sample.isEmpty ? "（空串）" : sample)」：期望 \(expected)，实际 \(actual)"
+        }
+        let start = Date()
+        func sample(_ time: Date, _ note: String) -> OutcomeRecord {
+            OutcomeRecord(id: UUID(), pageURL: "https://example.invalid/list", host: "example.invalid",
+                          elementLabel: "提交", contentFingerprint: "", contentPrefix: "样本",
+                          statusNote: note, recordedAt: time, resubmittedAt: nil)
+        }
+        let old = sample(start.addingTimeInterval(-1), "已提交（待核查）")
+        let current = sample(start, "已提交（待核查）")
+        let checked = sample(start.addingTimeInterval(1), "页面回读已核实")
+        let pending = Self.pendingOutcomes([old, current, checked], since: start)
+        lines.append("\(pending.count == 1 && pending[0].id == current.id ? "✓" : "✗") 运行起点筛选：旧任务待核查与已离开待核查状态的条目均不入门")
+        let legacy = Self.displayedOutcomeStatus("已核实（完成总结）：旧总结")
+        lines.append("\(legacy == "结案自述（旧口径，未经独立核实）：旧总结" ? "✓" : "✗") 旧状态只在展示时降级，原字段不迁移")
+        return lines
+    }
+
+    /// 台账注入段：动作留痕、效果核查、模型自述分层表述。
     private func outcomePromptBlock() -> String {
         let records = Self.prunedOutcomes(outcomeLedger)
         guard !records.isEmpty else { return "" }
         let lines = records.map { record in
             let content = record.contentPrefix.isEmpty ? "（正文未留指纹）" : "内容「\(record.contentPrefix)…」"
-            return "· \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」提交：\(content)，状态：\(record.statusNote)"
+            return "· \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」：\(content)，状态：\(Self.displayedOutcomeStatus(record.statusNote))"
         }
-        return "【本任务已完成的关键动作】\n" + lines.joined(separator: "\n") + "\n硬性口径：以上都是已真实执行并留痕的提交，不得对同一内容重复提交/发布。需要确认现状时，先去内容列表/记录页核查该条目的状态再下结论；编辑器里残留的同文草稿不是未提交的证据（提交后保留原文是常见形态）。已核实的结论无新证据不得改口为「无法确认」；用户追问时复述台账里的状态与证据来源。"
+        return "【本任务关键动作留痕】\n" + lines.joined(separator: "\n") + "\n硬性口径：①表中提交是引擎实录的动作留痕（点了什么、何时、何页），属于事实；不得对同一内容重复提交/发布。②提交是否真正生效（存上/发出去）以内容列表/记录页的回读证据为准；未回读前一律表述为「待核查」，用户追问时如实说待核查，不得声称已核实。编辑器残留同文草稿不能单独证明提交失败。③「结案自述」只是模型自己的总结，不是核验证据；引用已核实结果时须说明页面原文及证据来源。"
     }
 
     private func flushPendingOutcomeStep() {
@@ -3458,7 +3530,7 @@ struct OpenStall {
     /// 自检六只读口径：台账条数与最近一条的人读摘要。
     var outcomeLedgerCount: Int { outcomeLedger.count }
     var latestOutcomeDescription: String? {
-        outcomeLedger.last.map { "\($0.host.isEmpty ? "本地页面" : $0.host) · \($0.contentPrefix.isEmpty ? "（无正文指纹）" : $0.contentPrefix) · \($0.statusNote)" }
+        outcomeLedger.last.map { "\($0.host.isEmpty ? "本地页面" : $0.host) · \($0.contentPrefix.isEmpty ? "（无正文指纹）" : $0.contentPrefix) · \(Self.displayedOutcomeStatus($0.statusNote))" }
     }
 
     // MARK: - prompt 组装：状态卡、确定性折叠与预算（H1）
@@ -3489,7 +3561,7 @@ struct OpenStall {
             stateCard.todos = []
         }
         stateCard.outcomeRefs = outcomeLedger.map {
-            "\(Self.outcomeTime($0.recordedAt)) \($0.host.isEmpty ? "本地页面" : $0.host)「\($0.elementLabel)」：\($0.statusNote)"
+            "\(Self.outcomeTime($0.recordedAt)) \($0.host.isEmpty ? "本地页面" : $0.host)「\($0.elementLabel)」：\(Self.displayedOutcomeStatus($0.statusNote))"
         }
         stateCard.updatedAt = Date()
     }
@@ -4052,7 +4124,7 @@ struct OpenStall {
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil; outcomeLedger = []
         // 状态卡与折叠/重试内存态同样清零：恢复出的卡片只能来自快照（H1）
-        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false
+        stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         web.resetTabsToStartPage(sessionID: runSessionID)
         // —— 仅凭落盘恢复 ——
         restoreSnapshotIfNeeded()

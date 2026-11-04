@@ -20,6 +20,7 @@ struct SelfTestView: View {
     @State private var coverUploadFixTestRunning = false
     @State private var taskFinishTestRunning = false
     @State private var editorEntryBindTestRunning = false
+    @State private var finalClaimAuditTestRunning = false
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
     var body: some View {
@@ -196,6 +197,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || sessionUXTestRunning)
             Text("自检二十六预期（Tier A，不调用模型）：冷启动进入与切换会话都发出回底请求；用户上滑超过一屏后流式追加不强拉且出现回底按钮，点击恢复跟随；新对话首条用户消息生成标题并约定聚焦输入框；删除先二次确认、确认后即时更新列表。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十七：结案自证门（FINAL-CLAIM-AUDIT）") {
+                guard !finalClaimAuditTestRunning else { return }
+                finalClaimAuditTestRunning = true
+                runFinalClaimAuditTest()
+                dismiss()
+            }.disabled(!engine.active || finalClaimAuditTestRunning)
+            Text("自检二十七预期（FINISH-GATE 刀1，不调用模型、不占用标签页）：完成断言真值表 19 条（纯断言命中、否定断言不命中、「已完成但未核实」仍算断言、只读汇总不命中）、运行起点筛选（旧任务待核查与已离开待核查的条目不入门）、旧「已核实（完成总结）」只在展示时降级不迁移。结案门的真实回读行为属 Tier B 真机。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -309,6 +317,20 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检二十四：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检二十四结论：全部通过——配对只认同对象共现、噪声不误配、歧义不猜、翻页边界正确" : "自检二十四结论：\(failed) 项未通过，见上方逐条记录")
+    }
+
+    /// 自检二十七编排（FINAL-CLAIM-AUDIT，FINISH-GATE 刀1）：完成断言
+    /// 纯函数真值表、台账运行起点筛选与旧状态展示降级断言，结论以
+    /// 「自检二十七」条目写进对话。不调用模型、不占用标签页。
+    private func runFinalClaimAuditTest() {
+        let engine = self.engine
+        let conversation = self.conversation
+        conversation.localFeedback("自检二十七：开始——结案自证门纯函数核查（不调用模型）")
+        defer { finalClaimAuditTestRunning = false }
+        let lines = engine.verifyFinalClaimAudit()
+        for line in lines { conversation.localFeedback("自检二十七：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检二十七结论：全部通过——完成断言识别、运行起点筛选与旧状态展示降级均成立" : "自检二十七结论：\(failed) 项未通过，见上方逐条记录")
     }
 
     /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言
