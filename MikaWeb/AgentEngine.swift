@@ -1524,6 +1524,7 @@ struct OpenStall {
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
                                 record(action)
+                                if action.action == "click" { appendStep("effect", clickEffectDescription()) }
                                 // 卡点逐项验收记账（LADDER-FIX F2）：真实
                                 // 执行成功的 click 计入在开卡点的手段证据
                                 noteExecutedActionForStall(actionName: action.action, targetKey: targetKey)
@@ -1733,6 +1734,7 @@ struct OpenStall {
             try await web.execute(saved.0, expected: target, approved: true)
             try await checkpoint(token)
             record(saved.0)
+            if saved.0.action == "click" { appendStep("effect", clickEffectDescription()) }
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
             // 指示，此路不设软门；台账记下后防的是后续轮次的无意识重复）
             if let outcome = noteSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2) {
@@ -3526,6 +3528,22 @@ struct OpenStall {
         if let note = pendingOutcomeStep { appendStep("outcome", note); pendingOutcomeStep = nil }
         if let vstep = pendingVerificationStep { appendStep("verify", vstep); pendingVerificationStep = nil }
     }
+
+    /// 点击效果仅是短时页面观察，不进入循环指纹、卡点证据或成败裁决。
+    private func clickEffectDescription() -> String {
+        guard let effect = web.lastClickEffect else {
+            return web.lastClickEffectMissingBefore
+                ? "点击效果未知（点前签名缺失）"
+                : "点击效果未知（回读签名缺失）"
+        }
+        var changes: [String] = []
+        if effect.urlChanged { changes.append("URL 变化") }
+        if effect.contentChanged { changes.append("内容变化") }
+        if !changes.isEmpty { return "点击后页面已变化（\(changes.joined(separator: "／"))）" }
+        return "点击后 1.2s 内页面无可感知变化（可能仍在加载或需后续动作，不据此判失败）"
+    }
+
+    func verifyClickEffectClassification() -> [String] { web.verifyClickEffectClassification() }
 
     /// 自检六只读口径：台账条数与最近一条的人读摘要。
     var outcomeLedgerCount: Int { outcomeLedger.count }

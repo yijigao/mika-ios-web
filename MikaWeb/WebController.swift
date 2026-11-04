@@ -856,6 +856,21 @@ enum TCProbeLogStore {
 // goBack／goForward／evaluate 均为当前页门面；state／execute 则路由到「执行页」——任务开始
 // 时由 AgentEngine 捕获的标签页（executionTabID），用户中途手动切页不影响正在跑的任务。
 @MainActor final class WebController: NSObject, ObservableObject, WKUIDelegate {
+    struct ClickEffect: Equatable {
+        let urlChanged: Bool
+        let contentChanged: Bool
+    }
+
+    private struct ClickSignature: Equatable {
+        let url: String
+        let elementCount: Int
+        let textHash: Int
+    }
+
+    /// 每次 click 执行前清空；只供串行引擎在成功后读取，不参与动作结果。
+    private(set) var lastClickEffect: ClickEffect?
+    private(set) var lastClickEffectMissingBefore = false
+    private var lastClickDispatchedAt: Date?
     @Published private(set) var tabs: [BrowserTab]
     @Published private(set) var activeTabID: UUID
     /// 浏览器坞的几何／形态状态（CRASH-1031 追加项）：坞的 mode／小窗位置／
@@ -1684,6 +1699,43 @@ enum TCProbeLogStore {
             try? await Task.sleep(for: .milliseconds(200))
         }
     }
+
+    /// 与静默探针不同：比较文本内容本身，等长文案替换也能被看见。
+    /// 只取主文档首段可见文本，避免把整页内容带回原生侧。
+    private func clickSignature(in tab: BrowserTab) async -> ClickSignature? {
+        if agentWorkSuspended { return nil }
+        let script = "(()=>{const b=document.body;if(!b)return null;return JSON.stringify({url:location.href,count:document.querySelectorAll('*').length,text:(b.innerText||'').slice(0,2048)});})()"
+        guard let raw = (try? await evaluate(script, on: tab)) as? String,
+              let data = raw.data(using: .utf8),
+              let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let url = fields["url"] as? String,
+              let count = fields["count"] as? Int,
+              let visibleText = fields["text"] as? String else { return nil }
+        return ClickSignature(url: url, elementCount: count, textHash: visibleText.hashValue)
+    }
+
+    private static func classifyClickEffect(before: ClickSignature?, after: ClickSignature?) -> ClickEffect? {
+        guard let before, let after else { return nil }
+        return ClickEffect(urlChanged: before.url != after.url,
+                           contentChanged: before.elementCount != after.elementCount || before.textHash != after.textHash)
+    }
+
+    /// 自检二十八：纯分类真值表；不访问页面，也不改变执行现场。
+    func verifyClickEffectClassification() -> [String] {
+        let base = ClickSignature(url: "https://example.invalid/a", elementCount: 3, textHash: 11)
+        let cases: [(String, ClickSignature?, ClickSignature?, ClickEffect?)] = [
+            ("URL 变化", base, ClickSignature(url: "https://example.invalid/b", elementCount: 3, textHash: 11), ClickEffect(urlChanged: true, contentChanged: false)),
+            ("内容变化", base, ClickSignature(url: base.url, elementCount: 3, textHash: 12), ClickEffect(urlChanged: false, contentChanged: true)),
+            ("元素数变化", base, ClickSignature(url: base.url, elementCount: 4, textHash: 11), ClickEffect(urlChanged: false, contentChanged: true)),
+            ("都不变", base, base, ClickEffect(urlChanged: false, contentChanged: false)),
+            ("点前签名缺失", nil, base, nil)
+        ]
+        return cases.map { item in
+            let (name, before, after, expected) = item
+            let actual = Self.classifyClickEffect(before: before, after: after)
+            return "\(actual == expected ? "✓" : "✗") \(name)：期望 \(String(describing: expected))，实际 \(String(describing: actual))"
+        }
+    }
     /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
     func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
     private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
@@ -2234,7 +2286,9 @@ enum TCProbeLogStore {
             """
         }
         let result = try await evaluate(script, on: tab)
-        return (result as? String) ?? "missing"
+        let status = (result as? String) ?? "missing"
+        if status == "clicked" { lastClickDispatchedAt = Date() }
+        return status
     }
 
     // MARK: - 弹窗点按升级（COVER-CONSENT-IMPL-2026-11-03，缺陷 A）
@@ -2602,6 +2656,27 @@ enum TCProbeLogStore {
     /// 才报错且原文带揭示手段清单）；最终按「是灰的／找不到」两种
     /// 口径分别报错并留诊断快照。
     private func performClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
+        lastClickEffect = nil
+        lastClickEffectMissingBefore = false
+        lastClickDispatchedAt = nil
+        let before = await clickSignature(in: tab)
+        lastClickEffectMissingBefore = before == nil
+        try await dispatchClick(action, expected: expected, approved: approved, tab: tab)
+        guard before != nil else { return }
+        // 派发流程可能先经历目标重扫或弹窗升级。成功收口后只观察
+        // 1.2 秒，约每 300ms 一次；探针失败不改变 click 的成功语义。
+        let deadline = (lastClickDispatchedAt ?? Date()).addingTimeInterval(1.2)
+        repeat {
+            let after = await clickSignature(in: tab)
+            lastClickEffect = Self.classifyClickEffect(before: before, after: after)
+            if lastClickEffect?.urlChanged == true || lastClickEffect?.contentChanged == true { break }
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { break }
+            try? await Task.sleep(for: .milliseconds(min(300, max(1, Int(remaining * 1000)))))
+        } while !agentWorkSuspended
+    }
+
+    private func dispatchClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
         let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
         if probe == "ready-dialog" {

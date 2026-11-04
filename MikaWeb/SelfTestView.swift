@@ -21,6 +21,7 @@ struct SelfTestView: View {
     @State private var taskFinishTestRunning = false
     @State private var editorEntryBindTestRunning = false
     @State private var finalClaimAuditTestRunning = false
+    @State private var clickEffectTestRunning = false
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
     var body: some View {
@@ -204,6 +205,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || finalClaimAuditTestRunning)
             Text("自检二十七预期（FINISH-GATE 刀1，不调用模型、不占用标签页）：完成断言真值表 19 条（纯断言命中、否定断言不命中、「已完成但未核实」仍算断言、只读汇总不命中）、运行起点筛选（旧任务待核查与已离开待核查的条目不入门）、旧「已核实（完成总结）」只在展示时降级不迁移。结案门的真实回读行为属 Tier B 真机。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十八：点击效果分类（CLICK-EFFECT）") {
+                guard !clickEffectTestRunning else { return }
+                clickEffectTestRunning = true
+                runClickEffectTest()
+                dismiss()
+            }.disabled(!engine.active || clickEffectTestRunning)
+            Text("自检二十八预期（刀2，不调用模型、不占用标签页）：纯函数真值表覆盖 URL 变化、文本变化、元素数变化、都不变与点前签名缺失。真实点击回读的时序与页面效果需在真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -331,6 +339,15 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检二十七：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检二十七结论：全部通过——完成断言识别、运行起点筛选与旧状态展示降级均成立" : "自检二十七结论：\(failed) 项未通过，见上方逐条记录")
+    }
+
+    private func runClickEffectTest() {
+        defer { clickEffectTestRunning = false }
+        conversation.localFeedback("自检二十八：开始——点击效果分类纯函数核查（不调用模型）")
+        let lines = engine.verifyClickEffectClassification()
+        for line in lines { conversation.localFeedback("自检二十八：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检二十八结论：全部通过——五种签名分类成立" : "自检二十八结论：\(failed) 项未通过，见逐条记录")
     }
 
     /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言
