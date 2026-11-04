@@ -121,8 +121,8 @@ enum SiteMode: String {
 
 // 标签页会话（2026-11-02，案卷 TABS-IMPL-2026-11-02.md）：一个标签页＝一个独立 WKWebView
 // ＋独立历史／标题／加载状态。切换标签只是把当前页的 WKWebView 换入视图层级，离屏标签的
-// 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，按最后已知
-// 地址重载恢复该页（系统行为，见 webViewWebContentProcessDidTerminate）。
+// 实例与页面状态由本对象强持有保留、不重载；网页进程被系统内存压力杀掉时，
+// 只通知引擎，由引擎统一预算调度恢复。
 @MainActor final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, Identifiable {
     let id = UUID()
     /// 所属会话（M1，2026-11-02）：标签归属会话——切会话只换可见标签集合，
@@ -131,8 +131,7 @@ enum SiteMode: String {
     var sessionID: UUID
     /// 置顶（M1）：纯元数据——在标签列表里排前、关闭被守卫拒绝（见
     /// WebController.closeTab，含任何批量关闭路径，须先取消置顶才能关）。
-    /// 不承诺网页进程永驻：进程被系统回收时按最后已知地址重载恢复
-    /// （webViewWebContentProcessDidTerminate 既有路径）。
+    /// 不承诺网页进程永驻：进程被系统回收时由引擎调度恢复。
     @Published var isPinned = false
     let webView: WKWebView
     @Published private(set) var urlString = ""
@@ -143,8 +142,10 @@ enum SiteMode: String {
     @Published var pageError: String?
     private(set) var revision = 0
     private var observations: [NSKeyValueObservation] = []
-    /// 网页进程终止时 webView.url 可能已被清空，重载恢复以此为准
+    /// 网页进程终止时 webView.url 可能已被清空，保留最后已知地址供后续导航使用。
     private var lastKnownURL: URL?
+    private(set) var terminatedAt: Date?
+    var onContentProcessTerminated: ((BrowserTab) -> Void)?
 
     /// configuration 非空时用于承接 window.open／target=_blank 的新窗口（须用 WebKit 给的
     /// 配置原样建 WKWebView，opener 关系由 WebKit 经该配置维系）；此时不加载起始页，
@@ -710,10 +711,14 @@ enum SiteMode: String {
     }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { pageError = error.localizedDescription; update() }
-    /// 系统在内存压力下杀掉网页进程时，该标签页内容已丢失——按最后已知地址重载恢复
-    ///（该页的 JS／表单状态无法保留，属系统行为；其余标签不受影响）。
+    /// 系统杀掉网页进程时只记事件并通知引擎；恢复由引擎统一预算调度，
+    /// 此处不自作主张重载（页面的 JS／表单状态已丢失）。
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        if let url = webView.url ?? lastKnownURL { webView.load(URLRequest(url: url)) }
+        if let url = webView.url { lastKnownURL = url }
+        terminatedAt = Date()
+        revision += 1
+        pageError = "网页进程终止"
+        onContentProcessTerminated?(self)
     }
 }
 
@@ -899,6 +904,7 @@ enum TCProbeLogStore {
     /// 场景事务窗口里，主线与网页侧的工作都要第一时间安静下来）。用户手动浏览
     /// 不走 ready／state 通道，不受此标记影响。
     var agentWorkSuspended = false
+    var contentProcessTerminationHandler: ((BrowserTab) -> Void)?
     private var tabCancellables: [UUID: AnyCancellable] = [:]
 
     override init() {
@@ -914,6 +920,9 @@ enum TCProbeLogStore {
 
     private func adopt(_ tab: BrowserTab) {
         tab.webView.uiDelegate = self
+        tab.onContentProcessTerminated = { [weak self] tab in
+            self?.contentProcessTerminationHandler?(tab)
+        }
         tabCancellables[tab.id] = tab.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in self?.objectWillChange.send() }
         }

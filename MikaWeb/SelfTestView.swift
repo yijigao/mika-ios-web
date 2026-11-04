@@ -25,6 +25,7 @@ struct SelfTestView: View {
     @State private var writtenContentTestRunning = false
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
+    @State private var recoveryBudgetTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -220,10 +221,48 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || writtenContentTestRunning)
             Text("自检二十九预期（刀3，不调用模型、不占用标签页）：写入条目含目标、正文前24字与字数；无名目标回退；十次写入只留最近八条；状态卡随快照往返且旧快照缺 writes 键仍可解码；level 3 折叠时写入段及八条原文仍全文在 prompt 中。真实页面 type 成功路径需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十三：恢复预算（RECOVERY-BUDGET）") {
+                guard !recoveryBudgetTestRunning else { return }
+                recoveryBudgetTestRunning = true
+                runRecoveryBudgetTest()
+                dismiss()
+            }.disabled(!engine.active || recoveryBudgetTestRunning)
+            Text("自检三十三预期：不调用模型、不占用标签页；验证整任务恢复尝试与加载上限、2/5/10 秒退避、两类计数独立、Codable 往返和默认值相等。真实页面恢复与进程终止需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
         }.navigationTitle("本地自检")
+    }
+
+    private func runRecoveryBudgetTest() {
+        defer { recoveryBudgetTestRunning = false }
+        conversation.localFeedback("自检三十三：开始——恢复预算状态机（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) {
+            lines.append("\(passed ? "✓" : "✗") \(note)")
+        }
+        var budget = RecoveryBudget()
+        check(budget.attemptsRemaining == 3 && budget.loadsRemaining == 2 && budget.nextBackoff() == 2,
+              "初始预算：尝试剩余 3、加载剩余 2、下一次退避 2 秒")
+        let backoffs = (0..<4).map { _ in budget.reserveAttempt() }
+        check(backoffs[0] == 2 && backoffs[1] == 5 && backoffs[2] == 10 && backoffs[3] == nil && budget.attemptsUsed == 3 && budget.attemptsRemaining == 0,
+              "尝试预留：依次 2/5/10 秒，第四次拒绝且已用 3")
+        check(budget.reserveLoad() && budget.reserveLoad() && !budget.reserveLoad() && budget.loadsUsed == 2 && budget.loadsRemaining == 0,
+              "加载预留：两次成功，第三次拒绝且已用 2")
+        var independent = RecoveryBudget()
+        let loadFirst = independent.reserveLoad()
+        let attemptAfterLoad = independent.reserveAttempt()
+        check(loadFirst && attemptAfterLoad == 2 && independent.loadsUsed == 1 && independent.attemptsUsed == 1,
+              "计数独立：先预留加载再预留尝试，各计一次")
+        var saved = RecoveryBudget()
+        _ = saved.reserveAttempt(); _ = saved.reserveAttempt(); _ = saved.reserveLoad()
+        let decoded = (try? JSONEncoder().encode(saved)).flatMap { try? JSONDecoder().decode(RecoveryBudget.self, from: $0) }
+        check(decoded == saved && decoded?.attemptsUsed == 2 && decoded?.loadsUsed == 1 && decoded?.nextBackoff() == 10,
+              "Codable 往返：已用 2 次尝试、1 次加载原样保留")
+        check(RecoveryBudget() == RecoveryBudget(), "Equatable：两个默认新预算相等")
+        for line in lines { conversation.localFeedback("自检三十三：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检三十三结论：全部通过（\(lines.count) 项）" : "自检三十三结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runSessionUXTest() {

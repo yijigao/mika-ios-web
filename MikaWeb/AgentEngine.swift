@@ -749,6 +749,8 @@ struct OpenStall {
     /// 撞段限不再是死路：状态本就全量落盘（检查点），resume 开新段
     /// 续跑；全任务硬顶（段数 × 每段上限）封住失控成本。
     private var stepBudget = StepBudget(limit: 25)
+    private var recoveryBudget = RecoveryBudget()
+    private var lastTerminationNote: [ObjectIdentifier: Date] = [:]
     /// 当前暂停是否由「本段步数用完」引起（决定 resume 是否开新段；
     /// 随快照落盘，进程重启后口径不变）。
     private var stepLimitPaused = false
@@ -890,6 +892,9 @@ struct OpenStall {
     private var settingsCancellable: AnyCancellable?
     init(web: WebController, settings: SettingsStore) {
         self.web = web; self.settings = settings
+        web.contentProcessTerminationHandler = { [weak self] tab in
+            self?.noteContentProcessTermination(tab)
+        }
         settingsCancellable = settings.$keepScreenAwakeDuringTask.sink { [weak self] _ in
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
@@ -938,7 +943,7 @@ struct OpenStall {
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
-        goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); stepLimitPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
@@ -1666,15 +1671,31 @@ struct OpenStall {
                         } else if let kind = Self.transientKind(of: error) {
                             transientStreak += 1
                             writeTransientDiagnostic(kind: kind, error: error, streak: transientStreak)
+                            let backoff: Double
+                            if kind == .modelNetwork {
+                                backoff = Double(600 * transientStreak) / 1000
+                            } else {
+                                guard let reserved = recoveryBudget.reserveAttempt() else {
+                                    pauseForRecoveryBudget("页面多次恢复失败，已暂停等页面/网络恢复（整任务恢复预算已用完），进度已存，稍后点「继续」接着跑")
+                                    return
+                                }
+                                backoff = reserved
+                                persistSnapshot()
+                            }
                             if transientStreak >= Self.maxTransientStreak {
                                 throw MikaError(Self.transientFailureMessage(kind: kind, error: error))
                             }
                             appendStep("retry", Self.transientRetryNote(kind: kind, streak: transientStreak))
                             if (kind == .pageLoad || kind == .webContentProcess) && transientStreak == 2 {
+                                guard recoveryBudget.reserveLoad() else {
+                                    pauseForRecoveryBudget("页面需要重载但整任务重载预算已用完，已暂停等页面/网络恢复，进度已存，稍后点「继续」接着跑")
+                                    return
+                                }
+                                persistSnapshot()
                                 web.reloadExecutionTab() // 连败第 2 次：先重载执行页一次再试
                             }
                             if !active { try await checkpoint(token) } // 后台出的错先驻停、回前台再重试
-                            try await Task.sleep(for: .milliseconds(600 * transientStreak))
+                            try await Task.sleep(for: .milliseconds(Int(backoff * 1000)))
                         } else {
                             throw error
                         }
@@ -2599,6 +2620,8 @@ struct OpenStall {
         let originalURL = page.url
         let isEditor = originalURL.contains("appmsg_edit") || page.elements.contains { $0.editable }
         if !isEditor {
+            guard recoveryBudget.reserveLoad() else { return (false, "非编辑页需要重载但整任务重载预算已用完，此级失败") }
+            persistSnapshot()
             web.reloadExecutionTab()
             try? await Task.sleep(for: .milliseconds(800))
             _ = await web.settledCapture()
@@ -3192,11 +3215,11 @@ struct OpenStall {
     private static func transientFailureMessage(kind: TransientKind, error: Error) -> String {
         switch kind {
         case .javaScript, .webContentProcess:
-            return "页面反复出错：已自动重试 \(maxTransientStreak) 次仍不稳定，任务停下。错误原文已存入诊断（设置 → 崩溃报告），页面恢复后点「继续」可接着跑"
+            return "页面反复出错：已自动重试 \(maxTransientStreak - 1) 次仍不稳定，任务停下。错误原文已存入诊断（设置 → 崩溃报告），页面恢复后点「继续」可接着跑"
         case .pageLoad:
-            return "页面加载反复失败：已自动重试 \(maxTransientStreak) 次（含重载页面）仍不稳定，任务停下。错误原文已存入诊断（设置 → 崩溃报告），网络恢复后点「继续」可接着跑"
+            return "页面加载反复失败：已自动重试 \(maxTransientStreak - 1) 次（含重载页面）仍不稳定，任务停下。错误原文已存入诊断（设置 → 崩溃报告），网络恢复后点「继续」可接着跑"
         case .modelNetwork:
-            return "模型连接反复失败：已自动重试 \(maxTransientStreak) 次。\((error as? MikaError)?.message ?? error.localizedDescription)"
+            return "模型连接反复失败：已自动重试 \(maxTransientStreak - 1) 次。\((error as? MikaError)?.message ?? error.localizedDescription)"
         }
     }
     /// 瞬时错误留证：与 WebController 的操作失败快照同目录、同信封格式，诊断页
@@ -3207,6 +3230,28 @@ struct OpenStall {
                                                            "streak": streak, "domain": ns.domain, "code": ns.code,
                                                            "message": error.localizedDescription,
                                                            "goal": goal, "stepsRecorded": steps.count])
+    }
+    private func noteContentProcessTermination(_ tab: BrowserTab) {
+        let now = tab.terminatedAt ?? Date()
+        let key = ObjectIdentifier(tab)
+        if let previous = lastTerminationNote[key], now.timeIntervalSince(previous) < 3 { return }
+        lastTerminationNote[key] = now
+        let isExecutionTab = web.executionTabID == tab.id
+        let taskRunning: Bool
+        if case .running = status { taskRunning = true } else { taskRunning = false }
+        writeDiagnostic(types: ["网页进程终止"], payload: ["kind": "web-content-process-terminated",
+                                                   "tabID": tab.id.uuidString,
+                                                   "isExecutionTab": isExecutionTab,
+                                                   "taskRunning": taskRunning,
+                                                   "goal": goal])
+    }
+    private func pauseForRecoveryBudget(_ message: String) {
+        appendStep("pause", message)
+        stepLimitPaused = false
+        status = .paused(message)
+        sessionActive = false; applyIdleTimerPolicy()
+        endBackgroundGrace(); completeContinuedProcessing(success: false)
+        persistSnapshot()
     }
     private func writeDiagnostic(types: [String], payload: [String: Any]) {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -3878,6 +3923,8 @@ struct OpenStall {
         var budgetSegment: Int? = nil
         var totalModelSteps: Int? = nil
         var stepLimitPaused: Bool? = nil
+        // 恢复预算为整任务账；旧快照无键时给新预算。
+        var recoveryBudget: RecoveryBudget? = nil
         // AUTONOMY-FIX 起：绕行梯现场（已试梯级 rawValue 数组＋逐级
         // 留痕）。可选字段，此前快照无此二键照常解码（恢复时梯账为空、
         // 从梯级①重新开始）。
@@ -3987,6 +4034,7 @@ struct OpenStall {
                                        },
                                        modelStepsUsed: stepBudget.segmentUsed, budgetSegment: stepBudget.segment,
                                        totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused,
+                                       recoveryBudget: recoveryBudget,
                                        ladderAttempted: bypassLadder.attemptedRaw, ladderNotes: bypassLadder.notes,
                                        ladderTemplate: bypassLadder.harvestTemplate, ladderTemplateFrom: bypassLadder.harvestTemplateFrom, ladderFact: bypassLadder.harvestFact,
                                        stallStuck: openStall?.stuck, stallOpenURL: openStall?.openURL,
@@ -4052,6 +4100,7 @@ struct OpenStall {
             stepBudget = StepBudget(limit: snapshot.limit, segmentUsed: 0, segment: 1, totalUsed: snapshot.steps.count)
             stepLimitPaused = false
         }
+        recoveryBudget = snapshot.recoveryBudget ?? RecoveryBudget()
         // 绕行梯恢复（AUTONOMY-FIX）：带梯账的快照原样恢复（已试梯级
         // 不重走）；旧快照无此二键则梯账为空
         if let attemptedRaw = snapshot.ladderAttempted {
