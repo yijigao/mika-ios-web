@@ -23,6 +23,7 @@ struct SelfTestView: View {
     @State private var finalClaimAuditTestRunning = false
     @State private var clickEffectTestRunning = false
     @State private var writtenContentTestRunning = false
+    @State private var extractionBudgetTestRunning = false
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
     @State private var recoveryBudgetTestRunning = false
@@ -222,6 +223,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || writtenContentTestRunning)
             Text("自检二十九预期（刀3，不调用模型、不占用标签页）：写入条目含目标、正文前24字与字数；无名目标回退；十次写入只留最近八条；状态卡随快照往返且旧快照缺 writes 键仍可解码；level 3 折叠时写入段及八条原文仍全文在 prompt 中。真实页面 type 成功路径需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十：抽取预算（EXTRACTION-BUDGET）") {
+                guard !extractionBudgetTestRunning else { return }
+                extractionBudgetTestRunning = true
+                runExtractionBudgetTest()
+                dismiss()
+            }.disabled(!engine.active || extractionBudgetTestRunning)
+            Text("自检三十预期：不调用模型、不占用标签页；核对预算常量、coverage 新旧 JSON 兼容和唯一候选真值表。JS 常量需人工核对同值。").font(.caption).foregroundStyle(.secondary)
             Button("自检三十三：恢复预算（RECOVERY-BUDGET）") {
                 guard !recoveryBudgetTestRunning else { return }
                 recoveryBudgetTestRunning = true
@@ -240,6 +248,35 @@ struct SelfTestView: View {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
         }.navigationTitle("本地自检")
+    }
+
+    private func runExtractionBudgetTest() {
+        defer { extractionBudgetTestRunning = false }
+        conversation.localFeedback("自检三十：开始——抽取预算与覆盖兼容（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) {
+            lines.append("\(passed ? "✓" : "✗") \(note)")
+        }
+        check(ExtractionBudget.maxVisited == 2000 && ExtractionBudget.maxCandidates == 256,
+              "Swift 预算：访问 2000、候选 256（JS 常量人工核对）")
+        let coverage = Coverage(visited: 123, truncated: true)
+        let decodedCoverage = (try? JSONEncoder().encode(coverage)).flatMap { try? JSONDecoder().decode(Coverage.self, from: $0) }
+        check(decodedCoverage == coverage, "Coverage Codable 往返")
+        let oldJSON = #"{"url":"https://example.test","title":"旧快照","text":"","elements":[]}"#.data(using: .utf8)!
+        let old = try? JSONDecoder().decode(PageState.self, from: oldJSON)
+        check(old?.coverage == nil && old?.coverageComplete == true, "旧 JSON 缺 coverage 仍可解码，按完整覆盖")
+        let truncated = PageState(url: "https://example.test", title: "", text: "", elements: [], coverage: coverage)
+        check(!truncated.coverageComplete, "truncated=true 时 coverageComplete=false")
+        for complete in [true, false] {
+            for strong in [true, false] {
+                let expected = complete || strong
+                check(TargetResolutionPolicy.acceptsLoneCandidate(coverageComplete: complete, strongMatch: strong) == expected,
+                      "唯一候选：complete=\(complete)、strong=\(strong) → \(expected)")
+            }
+        }
+        for line in lines { conversation.localFeedback("自检三十：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检三十结论：全部通过（\(lines.count) 项）" : "自检三十结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runRecoveryBudgetTest() {

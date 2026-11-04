@@ -34,6 +34,17 @@ extension PageElement {
         return ""
     }
 }
+// 与 PageScript.extract 的 MAX_VISITED / MAX_CANDIDATES 同值。
+enum ExtractionBudget {
+    static let maxVisited = 2000
+    static let maxCandidates = 256
+}
+
+struct Coverage: Codable, Equatable {
+    let visited: Int
+    let truncated: Bool
+}
+
 struct PageState: Codable {
     let url, title, text: String
     let elements: [PageElement]
@@ -44,12 +55,15 @@ struct PageState: Codable {
     /// 各留一行），不改变元素清单与点击语义。旧快照 JSON 无此键
     /// 时解码为空（decodeIfPresent）。
     var overlayNotes: [String] = []
+    var coverage: Coverage?
+    var coverageComplete: Bool { coverage?.truncated != true }
     enum CodingKeys: String, CodingKey {
         case url, title, text, elements
         case overlayNotes = "overlays"
+        case coverage
     }
-    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = []) {
-        self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes
+    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = [], coverage: Coverage? = nil) {
+        self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes; self.coverage = coverage
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -58,14 +72,19 @@ struct PageState: Codable {
         text = try c.decode(String.self, forKey: .text)
         elements = try c.decode([PageElement].self, forKey: .elements)
         overlayNotes = try c.decodeIfPresent([String].self, forKey: .overlayNotes) ?? []
+        coverage = try c.decodeIfPresent(Coverage.self, forKey: .coverage)
     }
 }
 enum PageScript {
     static let extract = #"""
     (() => {
-      if(!document.body){return JSON.stringify({url:location.href,title:document.title||'',text:'',elements:[]});}
-      document.querySelectorAll('[data-mika-idx]').forEach(e=>e.removeAttribute('data-mika-idx'));
-      const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'};
+      // 与 PageState.swift ExtractionBudget 同值；名称读取采用已命名元素数上限 512。
+      const MAX_VISITED=2000,MAX_CANDIDATES=256,MAX_NAMED=512;
+      let visited=0,truncated=false,named=0;
+      if(!document.body){return JSON.stringify({url:location.href,title:document.title||'',text:'',elements:[],coverage:{visited,truncated}});}
+      const geometry=new WeakMap();
+      const geo=e=>{let g=geometry.get(e);if(!g){g={rect:e.getBoundingClientRect(),style:getComputedStyle(e),rects:e.getClientRects()};geometry.set(e,g);}return g;};
+      const visible=e=>{const g=geo(e);return g.rect.width>0&&g.rect.height>0&&g.style.visibility!=='hidden'&&g.style.display!=='none'};
       // 可达名称解析（WECHAT-EDITOR-NAV A1）：公众号编辑器一类的入口常是
       // 无文本图标控件（只有 aria-label／title／alt／背景图），旧抽取只认
       // innerText 一路，无名即丢弃——模型看不见入口、只能报「无可操作
@@ -74,11 +93,12 @@ enum PageScript {
       // （url(.../cover-entry.png)→「cover entry」）；全无则 source=none。
       // name 切 300 字与快照 text 口径一致。
       const nameOf=e=>{
-        const t=(e.innerText||'').trim();if(t)return{name:t.slice(0,300),source:'text'};
+        if(named<MAX_NAMED){named++;if(named===MAX_NAMED)truncated=true;const t=(e.innerText||'').trim();if(t)return{name:t.slice(0,300),source:'text'};}
+        else truncated=true;
         const aria=(e.getAttribute('aria-label')||'').trim();if(aria)return{name:aria.slice(0,300),source:'aria-label'};
         const title=(e.title||'').trim();if(title)return{name:title.slice(0,300),source:'title'};
         const alt=(e.getAttribute('alt')||'').trim();if(alt)return{name:alt.slice(0,300),source:'alt'};
-        const labs=[...(e.labels||[])].map(l=>(l.innerText||'').trim()).filter(Boolean).join(' ');if(labs)return{name:labs.slice(0,300),source:'label'};
+        const labs=[...(e.labels||[])].map(l=>{if(named>=MAX_NAMED){truncated=true;return '';}named++;if(named===MAX_NAMED)truncated=true;return(l.innerText||'').trim();}).filter(Boolean).join(' ');if(labs)return{name:labs.slice(0,300),source:'label'};
         const ph=(e.placeholder||'').trim();if(ph)return{name:ph.slice(0,300),source:'placeholder'};
         if((e.tagName==='INPUT'||e.tagName==='BUTTON')&&e.value){const v=String(e.value).trim();if(v)return{name:v.slice(0,300),source:'value'};}
         // 图标名推导（EDITOR-ENTRY-BIND）：只有内嵌 svg 的图标控件
@@ -96,7 +116,7 @@ enum PageScript {
           const sc=((svg.getAttribute('class')||'').trim().split(/\s+/)[0]||'').replace(/^icon[-_]?/i,'').replace(/[-_]+/g,' ').trim();
           if(sc)return{name:sc.slice(0,300),source:'icon'};
         }
-        const bg=(getComputedStyle(e).backgroundImage||'');
+        const bg=(geo(e).style.backgroundImage||'');
         const m=bg.match(/url\(["']?([^"')]+)["']?\)/);
         // data:/blob: 背景图没有文件名可读（data URI 的内容段会被误当名），
         // 只记名源 bg、名留空——元素仍在清单里，不编假名。
@@ -110,10 +130,16 @@ enum PageScript {
       // 无矩形时回落包围盒——此法改编自 browser-use 的
       // isInExpandedViewport（buildDomTree.js，MIT License，
       // Copyright (c) 2024 Gregor Zunic；轮子盘点见本单案卷）。
-      const inViewOf=e=>{const hit=r=>r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;const rs=e.getClientRects();for(const r of rs){if(hit(r))return true;}return rs.length?false:hit(e.getBoundingClientRect());};
+      const inViewOf=e=>{const hit=r=>r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth;const g=geo(e);for(const r of g.rects){if(hit(r))return true;}return g.rects.length?false:hit(g.rect);};
       const semSel='a,button,input,textarea,select,[role="button"],[contenteditable="true"]';
       const roleSel='[role="tab"],[role="link"],[role="menuitem"],[role="option"],[role="switch"],[role="checkbox"],[role="treeitem"],[onclick]';
-      const baseSet=new Set(document.querySelectorAll(semSel+','+roleSel));
+      const baseSet=new Set();
+      for(const e of document.querySelectorAll(semSel+','+roleSel)){
+        if(visited>=MAX_VISITED||baseSet.size>=MAX_CANDIDATES){truncated=true;break;}
+        visited++;
+        if(visible(e)||(e.tagName==='INPUT'&&e.type==='file'))baseSet.add(e);
+      }
+      if(visited>=MAX_VISITED||baseSet.size>=MAX_CANDIDATES)truncated=true;
       // 非语义可点元素补盲（RESOURCEFULNESS）：活动页一类的「发微头条／写文章／拍视频」
       // 入口常是 div/span＋JS 绑定的非语义元素，不在语义选择器内——模型看不见、
       // 只能请用户手动点。补入判据（须同时满足，防噪声）：不在语义元素内部、
@@ -126,17 +152,19 @@ enum PageScript {
       // 的主因；全无名源又无背景图无事件属性的透明热区无从指认，仍不入
       // （防噪声）。
       // 同类嵌套只留最内层（点击事件冒泡到父级处理器，点内层等效）。
-      // 补入上限 200 条（去重前），语义元素不受任何新门槛影响。
+      // 补入仍至多 200 条（去重前）；语义与补入共享候选总额。
       const scanSel='div,span,li,td,th,p,i,em,b,strong,img,section,article,nav,header,footer,figure,figcaption,dd,dt';
-      const rawExtras=[];
+      const inViewExtras=[],outViewExtras=[],names=new Map();
+      const extraLimit=Math.min(200,MAX_CANDIDATES-baseSet.size);
       for(const e of document.querySelectorAll(scanSel)){
-        if(rawExtras.length>=200)break;
+        if(visited>=MAX_VISITED||inViewExtras.length>=extraLimit){truncated=true;break;}
+        visited++;
         if(baseSet.has(e))continue;
         if(e.closest(semSel)||e.querySelector(semSel))continue;
         const cheap=(e.textContent||'').trim();
         if(cheap.length>120)continue;
         if(!visible(e))continue;
-        const r=e.getBoundingClientRect();
+        const r=geo(e).rect;
         if(r.width<12||r.height<12)continue;
         // 交互证据（改编自 browser-use isInteractiveElement 的事件属性
         // 回退分支，buildDomTree.js，MIT License，Copyright (c) 2024
@@ -146,7 +174,7 @@ enum PageScript {
         // 只认光标会整类漏掉。它们的 getEventListeners 检测在
         // WKWebView 页面世界不可用（其源码注释亦承认），不移植。
         const hasEvt=e.hasAttribute('onclick')||typeof e.onclick==='function'||e.hasAttribute('onmousedown')||typeof e.onmousedown==='function'||e.hasAttribute('onmouseup')||typeof e.onmouseup==='function';
-        if(getComputedStyle(e).cursor!=='pointer'&&!hasEvt)continue;
+        if(geo(e).style.cursor!=='pointer'&&!hasEvt)continue;
         const nm=nameOf(e);
         // 图标准入（EDITOR-ENTRY-BIND）：内嵌 svg/img 图标本身就是
         // 形态证据——名字推导不出来（source=none）也入清单，模型与
@@ -156,17 +184,22 @@ enum PageScript {
         const hasIcon=!!e.querySelector('svg,img');
         if(!nm.name&&nm.source!=='bg'&&!hasEvt&&!hasIcon)continue;
         if(nm.name.length>120)continue;
-        rawExtras.push(e);
+        if(inViewOf(e)){
+          inViewExtras.push(e);names.set(e,nm);
+          if(inViewExtras.length+outViewExtras.length>extraLimit){names.delete(outViewExtras.pop());truncated=true;}
+        }else if(inViewExtras.length+outViewExtras.length<extraLimit){outViewExtras.push(e);names.set(e,nm);}
+        else truncated=true;
       }
+      if(visited>=MAX_VISITED||baseSet.size+inViewExtras.length+outViewExtras.length>=MAX_CANDIDATES||inViewExtras.length+outViewExtras.length>=200)truncated=true;
+      const rawExtras=[...inViewExtras,...outViewExtras];
       const extraSet=new Set(rawExtras.filter(e=>!rawExtras.some(o=>o!==e&&e.contains(o))));
       const merged=[...baseSet,...extraSet].sort((x,y)=>{const p=x.compareDocumentPosition(y);return (p&4)?-1:(p&2)?1:0;});
       // 文件控件例外（F1）：input[type=file] 常被站点隐藏（display:none）再用
       // label/按钮冒充上传入口，可见性过滤会把上传点本身滤掉——文件控件
       // 数量天然稀少（通常 0–1 个），一律保留进清单，upload_file 据此定位。
-      const elements=merged.filter(e=>visible(e)||(e.tagName==='INPUT'&&e.type==='file')).map((e,index)=>{
-        e.setAttribute('data-mika-idx',index);
-        const nm=nameOf(e);
-        const labelText=[...(e.labels||[])].map(l=>l.innerText||'').join(' ');
+      const elements=merged.map((e,index)=>{
+        const nm=names.get(e)||nameOf(e);
+        const labelText=[...(e.labels||[])].map(l=>{if(named>=MAX_NAMED){truncated=true;return '';}named++;if(named===MAX_NAMED)truncated=true;return l.innerText||'';}).join(' ');
         const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.getAttribute('alt'),e.autocomplete,labelText].join(' ');
         return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:nm.name,placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',nameSource:nm.source,inView:inViewOf(e),sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
       });
@@ -180,12 +213,17 @@ enum PageScript {
       // 这里就是空——空本身也是诊断结论，步流据此落 playbook 的
       // 固定布局坐标打法。只记结构与文本，不改元素清单。
       const overlayScan=()=>{const out=[];let nodes=[];try{nodes=Array.from(document.querySelectorAll('[role="menu"],[class*="menu"],[class*="Menu"],[class*="popover"],[class*="dropdown"],[class*="popup"],[class*="Popup"]'));}catch(e){}
-        for(const nd of nodes){if(out.length>=4)break;const cs=getComputedStyle(nd);if(cs.display==='none'||cs.visibility==='hidden')continue;const r=nd.getBoundingClientRect();if(r.width===0||r.height===0)continue;
+        for(const nd of nodes){if(out.length>=4)break;const g=geo(nd);if(g.style.display==='none'||g.style.visibility==='hidden')continue;const r=g.rect;if(r.width===0||r.height===0)continue;
           const items=[];nd.querySelectorAll('li,a,button,[role="menuitem"],div,span').forEach(it=>{if(items.length>=8)return;if(it.children.length>0)return;const t=(it.textContent||'').trim().replace(/\s+/g,' ');if(t&&t.length<=24&&!items.includes(t))items.push(t);});
           const own=(nd.textContent||'').trim().replace(/\s+/g,' ').slice(0,80);
           out.push('主文档 frame·'+((nd.getAttribute('class')||nd.tagName||'').slice(0,50))+' → '+(items.length?items.join('／'):own));}
         return out;};
-      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements,overlays:overlayScan()});
+      const overlays=overlayScan();
+      // 所有名称、几何、样式与正文读取完成后，统一更新索引；相同值不写。
+      const indexed=document.querySelectorAll('[data-mika-idx]'),mergedSet=new Set(merged);
+      for(const e of indexed){if(!mergedSet.has(e))e.removeAttribute('data-mika-idx');}
+      merged.forEach((e,index)=>{const value=String(index);if(e.getAttribute('data-mika-idx')!==value)e.setAttribute('data-mika-idx',value);});
+      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements,overlays,coverage:{visited,truncated}});
     })()
     """#
 }
@@ -213,10 +251,16 @@ struct ElementDescriptor {
 /// 按稳定描述在一份新快照里重找目标。原则：宁可找不到（交引擎走策略切换），不可认错人。
 /// 1) 原 index 处元素与模型所见逐字段相等 → 就是它（无漂移快路径）；
 /// 2) 候选池硬过滤：tag 相同；描述是 contenteditable 编辑器时，候选也必须是编辑器；
-///    池里只有一个候选 → 就是它；
+///    池里只有一个候选且快照完整 → 就是它；截断快照须有强身份匹配；
 /// 3) 多候选时打分（文案／无障碍名／href／name／placeholder 全等加权，index 相同与
 ///    类型相同小加权），须唯一最高分且 ≥4 分，并列或低分一律判找不到。
-func resolveTarget(descriptor d: ElementDescriptor, original: PageElement, in elements: [PageElement]) -> PageElement? {
+enum TargetResolutionPolicy {
+    static func acceptsLoneCandidate(coverageComplete: Bool, strongMatch: Bool) -> Bool {
+        coverageComplete || strongMatch
+    }
+}
+
+func resolveTarget(descriptor d: ElementDescriptor, original: PageElement, in elements: [PageElement], coverageComplete: Bool) -> PageElement? {
     if d.index >= 0, d.index < elements.count, elements[d.index] == original {
         return elements[d.index]
     }
@@ -226,7 +270,16 @@ func resolveTarget(descriptor d: ElementDescriptor, original: PageElement, in el
         return true
     }
     guard !pool.isEmpty else { return nil }
-    if pool.count == 1 { return pool[0] }
+    if pool.count == 1 {
+        let e = pool[0]
+        func same(_ lhs: String, _ rhs: String) -> Bool {
+            !lhs.isEmpty && ElementDescriptor.norm(lhs) == ElementDescriptor.norm(rhs)
+        }
+        let strongMatch = same(d.text, e.text) || same(d.ariaLabel, e.ariaLabel)
+            || same(d.placeholder, e.placeholder) || same(d.name, e.name)
+            || (!d.href.isEmpty && d.href == e.href)
+        return TargetResolutionPolicy.acceptsLoneCandidate(coverageComplete: coverageComplete, strongMatch: strongMatch) ? e : nil
+    }
     func score(_ e: PageElement) -> Int {
         var s = 0
         if e.index == d.index { s += 2 }

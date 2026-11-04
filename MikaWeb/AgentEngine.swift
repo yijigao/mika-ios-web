@@ -1772,7 +1772,7 @@ struct OpenStall {
             guard page.url == saved.2 else { throw MikaError("确认期间页面目标已变化，请重新开始或继续") }
             var confirmedTarget = page.elements.first(where: { $0.index == saved.1.index && $0 == saved.1 })
             if confirmedTarget == nil {
-                confirmedTarget = resolveTarget(descriptor: ElementDescriptor(saved.1), original: saved.1, in: page.elements)
+                confirmedTarget = resolveTarget(descriptor: ElementDescriptor(saved.1), original: saved.1, in: page.elements, coverageComplete: page.coverageComplete)
             }
             guard let target = confirmedTarget else { throw MikaError("确认期间页面目标已变化，请重新开始或继续") }
             if SafetyPolicy.check(saved.0, target) == .manual {
@@ -1849,7 +1849,7 @@ struct OpenStall {
         for attempt in 0...1 {
             try await checkpoint(token)
             if snapshot.url == modelPage.url {
-                target = resolveTarget(descriptor: descriptor, original: original, in: snapshot.elements)
+                target = resolveTarget(descriptor: descriptor, original: original, in: snapshot.elements, coverageComplete: snapshot.coverageComplete)
             }
             if let found = target, found.tag == "input", found.inputType.lowercased() == "file" { break }
             target = nil
@@ -2094,7 +2094,7 @@ struct OpenStall {
             try await checkpoint(token)
             // 已导航离开模型所见页面：不在新页上按描述认人（同名按钮会认错），判本轮定位失败
             let target = snapshot.url == modelPage.url
-                ? resolveTarget(descriptor: descriptor, original: original, in: snapshot.elements)
+                ? resolveTarget(descriptor: descriptor, original: original, in: snapshot.elements, coverageComplete: snapshot.coverageComplete)
                 : nil
             guard let target else {
                 if refinds < 2 {
