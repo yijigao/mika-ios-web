@@ -1582,7 +1582,7 @@ struct OpenStall {
                                 record(action)
                                 if action.action == "type" {
                                     let trace = web.takeEditorTypeTrace()
-                                    if trace.count >= 2 { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+                                    if !trace.isEmpty { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
                                 }
                                 if action.action == "click" { appendStep("effect", clickEffectDescription()) }
                                 // 卡点逐项验收记账（LADDER-FIX F2）：真实
@@ -1822,7 +1822,7 @@ struct OpenStall {
             record(saved.0)
             if saved.0.action == "type" {
                 let trace = web.takeEditorTypeTrace()
-                if trace.count >= 2 { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+                if !trace.isEmpty { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
             }
             if saved.0.action == "click" { appendStep("effect", clickEffectDescription()) }
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确

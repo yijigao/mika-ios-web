@@ -1,6 +1,10 @@
 import Foundation
 
 enum TypeVerifyPolicy {
+    static func useEditorPath(baselineFound: Bool, expectedEditable: Bool, locatedByIndex: Bool, textLength: Int) -> Bool {
+        baselineFound && (expectedEditable || locatedByIndex || textLength >= 200)
+    }
+
     enum Verdict: Equatable {
         case pass
         case failFrozen(Int)
@@ -9,10 +13,10 @@ enum TypeVerifyPolicy {
     }
 
     /// expectedCount is needed to compare the editor count with the text being typed.
-    static func verdict(baselineCount: Int?, postCount: Int?, textOK: Bool, expectedCount: Int) -> Verdict {
+    static func verdict(baselineCount: Int?, postCount: Int?, textOK: Bool, expectedCount: Int, longForm: Bool) -> Verdict {
         guard textOK else { return .failDomMissing }
         guard let postCount else {
-            return baselineCount == nil ? .pass : .failSignalLost
+            return baselineCount == nil && !longForm ? .pass : .failSignalLost
         }
         return countConsistent(postCount, expected: expectedCount, baseline: baselineCount)
             ? .pass : .failFrozen(postCount)

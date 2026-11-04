@@ -2149,8 +2149,8 @@ enum TCProbeLogStore {
     }
 
     /// 探针：定位 contenteditable 编辑器（先按 data-mika-idx，再退首个可见编辑器），
-    /// 在编辑器的祖先作用域内（由近及远）找短文案里的字数与保存状态；祖先里没有
-    /// 才扫全页。编辑器自身内容不参与匹配；「保存中」优先于「已保存」（保存进行
+    /// 在编辑器作用域内找短文案里的字数与保存状态；字数未命中时限量扫全页，
+    /// 按到最近共同祖先的上行步数选最近计数。编辑器自身内容不参与匹配；「保存中」优先于「已保存」（保存进行
     /// 时旧的已保存标签可能同时在场，活动状态说了算）。
     private func probeEditorSignals(action: AgentAction, tab: BrowserTab) async throws -> EditorSignals {
         let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "epoch": tab.documentEpoch])
@@ -2172,6 +2172,25 @@ enum TCProbeLogStore {
         const cands=nodes.filter(vis).map(x=>(x.innerText||'').trim()).filter(t=>t&&t.length<=40);
         let count=null;
         for(const t of cands){const m=t.match(countRe);if(m){count=parseInt(m[1],10);break;}}
+        if(count===null){
+            const editorSteps=new Map();let depth=0;
+            for(let p=ed;p;p=p.parentElement)editorSteps.set(p,depth++);
+            let nearest=null,nearestDistance=Infinity,visited=0;
+            for(const x of document.querySelectorAll('*')){
+                if(++visited>3000)break;
+                if(ed.contains(x)||x.contains(ed))continue;
+                const rawText=x.textContent||'';
+                if(rawText.length>20)continue;
+                const t=rawText.trim();
+                const m=t.match(countRe);if(!m)continue;
+                let up=0,p=x;
+                while(p&&!editorSteps.has(p)){p=p.parentElement;up++;}
+                if(!p)continue;
+                const distance=up+editorSteps.get(p);
+                if(distance<nearestDistance){nearestDistance=distance;nearest=parseInt(m[1],10);}
+            }
+            count=nearest;
+        }
         let saveState=null;
         if(cands.some(t=>savingRe.test(t)))saveState='saving';
         else if(cands.some(t=>savedRe.test(t)))saveState='saved';
@@ -2202,16 +2221,20 @@ enum TCProbeLogStore {
         return last
     }
 
-    /// type 总流程分发：基线探针找到编辑器，且目标标为 editable 或按 idx
-    /// 命中编辑器时走状态校验；表单字段与探针落空走原样 Legacy。
+    /// type 总流程分发：基线找到编辑器，且目标可编辑、idx 命中或正文达 200 字
+    /// 时走状态校验；其余走 Legacy。
     private func performType(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
-        guard let expected else { throw MikaError("缺少已检查的目标元素") }
         lastEditorTypeTrace = []
-        if let baseline = try? await probeEditorSignals(action: action, tab: tab), baseline.found,
-           (expected.editable || baseline.locatedByIndex) {
+        guard let expected else { throw MikaError("缺少已检查的目标元素") }
+        let baseline = try? await probeEditorSignals(action: action, tab: tab)
+        if let baseline, TypeVerifyPolicy.useEditorPath(
+            baselineFound: baseline.found, expectedEditable: expected.editable,
+            locatedByIndex: baseline.locatedByIndex, textLength: Self.normalizedLength(action.text)) {
+            lastEditorTypeTrace = ["path=editor,idx=\(baseline.locatedByIndex),基线字数=\(baseline.count.map(String.init) ?? "无")"]
             try await performTypeInEditor(action: action, expected: expected, approved: approved, baseline: baseline, tab: tab)
             return
         }
+        lastEditorTypeTrace = ["path=legacy"]
         try await performTypeLegacy(action: action, expected: expected, approved: approved, tab: tab)
     }
 
@@ -2258,6 +2281,7 @@ enum TCProbeLogStore {
             ? ["paste", "events", "chunks", "exec", "range"]
             : ["exec", "events", "chunks", "range"]
         var trace: [String] = []
+        defer { lastEditorTypeTrace.append(contentsOf: trace) }
         var failure: EditorWriteFailure = .domMissing
         for (i, path) in strategies.enumerated() {
             let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, strict: i == 0, tab: tab)
@@ -2273,7 +2297,8 @@ enum TCProbeLogStore {
             }
             let signals = try? await probeEditorSignals(action: action, tab: tab)
             switch TypeVerifyPolicy.verdict(baselineCount: baseline.count, postCount: signals?.count,
-                                            textOK: v.textOK, expectedCount: expectedLen) {
+                                            textOK: v.textOK, expectedCount: expectedLen,
+                                            longForm: expectedLen >= 200) {
             case .failDomMissing:
                 trace.append("\(path)=dom-missing")
                 failure = .domMissing
@@ -2313,7 +2338,6 @@ enum TCProbeLogStore {
                 await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
                 throw MikaError("文字已输入，但「\(v.submits[0].text)」按钮仍是灰的（禁用状态），没能发布")
             }
-            if trace.count >= 2 { lastEditorTypeTrace = trace }
             return
         }
         await captureFailureSnapshot(context: "type 编辑器状态校验失败：\(action.reason)｜\(trace.joined(separator: "；"))", tab: tab)

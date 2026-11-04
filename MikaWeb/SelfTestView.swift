@@ -288,6 +288,11 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active)
             Text("自检四十预期：置顶与普通会话各自按最近活跃时间倒序；旧索引缺 pinned 时默认不置顶；临时元数据的置顶状态可往返。抽屉宽度、手势和实际置顶需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检四十一：type 编辑器分发与字数判定") {
+                runTypePathTest()
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检四十一预期：分发真值表及 199/200 字边界、长文双 nil 失败与短文双 nil 宽容均通过；真实知乎编辑器需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -474,7 +479,7 @@ struct SelfTestView: View {
         typealias Verdict = TypeVerifyPolicy.Verdict
         func verdict(_ baseline: Int?, _ post: Int?, _ textOK: Bool) -> Verdict {
             TypeVerifyPolicy.verdict(baselineCount: baseline, postCount: post,
-                                     textOK: textOK, expectedCount: 1236)
+                                     textOK: textOK, expectedCount: 1236, longForm: false)
         }
         check(verdict(0, nil, true) == .failSignalLost, "基线 0、写后无信号：failSignalLost")
         check(verdict(nil, nil, true) == .pass, "前后都无信号：pass")
@@ -491,6 +496,33 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十七：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十七结论：全部通过（\(lines.count) 项）" : "自检三十七结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runTypePathTest() {
+        conversation.localFeedback("自检四十一：开始——type 编辑器分发与字数判定（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) { lines.append("\(passed ? "✓" : "✗") \(note)") }
+        let route = TypeVerifyPolicy.useEditorPath
+        for editable in [false, true] {
+            for located in [false, true] {
+                for length in [199, 200] {
+                    check(!route(false, editable, located, length), "未找到编辑器：editable=\(editable),idx=\(located),字数=\(length) → Legacy")
+                }
+            }
+        }
+        check(route(true, true, false, 199), "目标可编辑 → 编辑器流程")
+        check(route(true, false, true, 199), "idx 命中 → 编辑器流程")
+        check(!route(true, false, false, 199), "三条件皆假，199 字 → Legacy")
+        check(route(true, false, false, 200), "200 字边界 → 编辑器流程")
+        check(TypeVerifyPolicy.verdict(baselineCount: nil, postCount: nil, textOK: true,
+                                       expectedCount: 200, longForm: true) == .failSignalLost,
+              "长文前后无字数信号 → failSignalLost")
+        check(TypeVerifyPolicy.verdict(baselineCount: nil, postCount: nil, textOK: true,
+                                       expectedCount: 199, longForm: false) == .pass,
+              "短文前后无字数信号 → pass")
+        for line in lines { conversation.localFeedback("自检四十一：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检四十一结论：全部通过（\(lines.count) 项）" : "自检四十一结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runBrowserChromeTest() {
