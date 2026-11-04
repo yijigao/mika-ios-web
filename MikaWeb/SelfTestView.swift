@@ -283,10 +283,42 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || browserChromeTestRunning)
             Text("自检三十九预期：临时 DockStateStore 的 fullScreen 发布 false→true→false；背景与 header 材质在小窗为 false、全屏为 true。实际界面仍需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检四十：抽屉置顶与旧索引兼容") {
+                runDrawerPinTest()
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检四十预期：置顶与普通会话各自按最近活跃时间倒序；旧索引缺 pinned 时默认不置顶；临时元数据的置顶状态可往返。抽屉宽度、手势和实际置顶需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
         }.navigationTitle("本地自检")
+    }
+
+    private func runDrawerPinTest() {
+        conversation.localFeedback("自检四十：开始——抽屉置顶与旧索引兼容（不调用模型、不动生产会话）")
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let pinnedOld = SessionMeta(id: UUID(), title: "置顶旧", createdAt: base, lastActiveAt: base, status: "idle", pinned: true)
+        let restNew = SessionMeta(id: UUID(), title: "普通新", createdAt: base, lastActiveAt: base.addingTimeInterval(30), status: "idle")
+        let pinnedNew = SessionMeta(id: UUID(), title: "置顶新", createdAt: base, lastActiveAt: base.addingTimeInterval(20), status: "idle", pinned: true)
+        let restOld = SessionMeta(id: UUID(), title: "普通旧", createdAt: base, lastActiveAt: base.addingTimeInterval(10), status: "idle")
+        let ordered = DrawerSessionOrdering.split([pinnedOld, restNew, pinnedNew, restOld])
+        let oldJSON = Data(#"{"id":"00000000-0000-0000-0000-000000000001","title":"旧会话","createdAt":0,"lastActiveAt":0,"status":"idle"}"#.utf8)
+        let legacy = try? JSONDecoder().decode(SessionMeta.self, from: oldJSON)
+        var temporary = restOld
+        temporary.pinned.toggle()
+        let pinnedAfterFirstToggle = temporary.pinned
+        temporary.pinned.toggle()
+        let checks: [(String, Bool)] = [
+            ("置顶组只含置顶且按活跃时间倒序", ordered.pinned.map(\.id) == [pinnedNew.id, pinnedOld.id]),
+            ("普通组不含置顶且按活跃时间倒序", ordered.rest.map(\.id) == [restNew.id, restOld.id]),
+            ("旧索引条目缺 pinned 字段仍解码为 false", legacy?.pinned == false && legacy?.title == "旧会话"),
+            ("临时元数据置顶翻转两次回到初值", pinnedAfterFirstToggle && temporary.pinned == false)
+        ]
+        for (note, passed) in checks {
+            conversation.localFeedback("自检四十：\(passed ? "✓" : "✗") \(note)")
+        }
+        let failed = checks.filter { !$0.1 }.count
+        conversation.localFeedback(failed == 0 ? "自检四十结论（Tier A）：全部通过（4 项）；Tier B 真机待复测" : "自检四十结论（Tier A）：\(failed)/4 项未通过，见逐条记录")
     }
 
     private func runExtractionBudgetTest() {

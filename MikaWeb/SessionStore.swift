@@ -41,6 +41,30 @@ struct SessionMeta: Codable, Identifiable {
     var lastActiveAt: Date
     /// 会话状态的人读标记（active＝当前会话；archived 等后续形态由 M1 定义）
     var status: String
+    var pinned: Bool
+
+    init(id: UUID, title: String, createdAt: Date, lastActiveAt: Date, status: String, pinned: Bool = false) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.lastActiveAt = lastActiveAt
+        self.status = status
+        self.pinned = pinned
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, createdAt, lastActiveAt, status, pinned
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        lastActiveAt = try container.decode(Date.self, forKey: .lastActiveAt)
+        status = try container.decode(String.self, forKey: .status)
+        pinned = try container.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
+    }
 }
 
 // M1 起实现 ObservableObject：会话列表 UI 需要观察索引与当前会话指针
@@ -161,6 +185,12 @@ final class SessionStore: ObservableObject {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         sessions[index].title = trimmed
+        persistIndex()
+    }
+
+    func togglePin(id: UUID) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        sessions[index].pinned.toggle()
         persistIndex()
     }
 

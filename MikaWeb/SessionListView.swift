@@ -43,8 +43,14 @@ struct SessionListView: View {
                         Text(anomaly).font(.caption).foregroundStyle(.orange)
                     }
                 }
+                let ordered = DrawerSessionOrdering.split(visibleSessions)
+                if !ordered.pinned.isEmpty {
+                    Section("置顶") {
+                        ForEach(ordered.pinned) { meta in row(meta) }
+                    }
+                }
                 ForEach(SessionTimeGroup.allCases, id: \.self) { group in
-                    let items = visibleSessions.filter { group.contains($0.lastActiveAt) }
+                    let items = ordered.rest.filter { group.contains($0.lastActiveAt) }
                     if !items.isEmpty {
                         Section(group.title) {
                             ForEach(items) { meta in row(meta) }
@@ -91,7 +97,7 @@ struct SessionListView: View {
     }
 
     private var visibleSessions: [SessionMeta] {
-        store.sessions.sorted { $0.lastActiveAt > $1.lastActiveAt }
+        store.sessions
     }
 
     private var renamePresented: Binding<Bool> {
@@ -106,7 +112,14 @@ struct SessionListView: View {
     private func row(_ meta: SessionMeta) -> some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(meta.title).font(.body)
+                HStack(spacing: 4) {
+                    Text(meta.title).font(.body)
+                    if meta.pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
                 HStack(spacing: 6) {
                     if meta.id == store.currentSessionID {
                         badge("当前", .blue)
@@ -143,8 +156,15 @@ struct SessionListView: View {
                 renameText = meta.title
             }
             .tint(.blue)
+            Button(meta.pinned ? "取消置顶" : "置顶") { store.togglePin(id: meta.id) }
+                .tint(.orange)
+        }
+        .swipeActions(edge: .leading) {
+            Button(meta.pinned ? "取消置顶" : "置顶") { store.togglePin(id: meta.id) }
+                .tint(.orange)
         }
         .contextMenu {
+            Button(meta.pinned ? "取消置顶" : "置顶") { store.togglePin(id: meta.id) }
             Button("重命名") { renameTarget = meta.id; renameText = meta.title }
             if canDelete(meta) { Button("删除", role: .destructive) { deleteTarget = meta } }
         }

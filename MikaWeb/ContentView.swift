@@ -124,7 +124,7 @@ struct ContentView: View {
                                         onClose: { withAnimation { showSessions = false } },
                                         onSessionEntered: { requestBottom() },
                                         onNewSessionFocus: { chatInputFocused = true })
-                            .frame(width: min(UIScreen.main.bounds.width * 0.86, 360))
+                            .frame(width: min(UIScreen.main.bounds.width * 0.75, 320))
                             .background(.regularMaterial)
                             .transition(.move(edge: .leading))
                     }
