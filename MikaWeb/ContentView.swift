@@ -6,6 +6,7 @@ struct ContentView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var conversation: AgentConversationStore
     @ObservedObject var diagnostics: DiagnosticStore
+    @ObservedObject private var dock: DockStateStore
     @ObservedObject private var sessionStore = SessionStore.shared
     @ObservedObject private var pending = PendingTaskStore.shared
     /// 对话输入框焦点（键盘修复，案卷 CHAT-KEYBOARD-FIX-2026-11-02.md）：在此持有，
@@ -41,6 +42,15 @@ struct ContentView: View {
     /// 区是全出血坐标，含 Home 指示条区）＋8pt 余量。对应关系与旧写死常量 148 的
     /// 区别见案卷问题 3 一节（旧常量护的是输入行＋按钮行两行区，新层级只护输入栏）。
     private var dockBottomReserve: CGFloat { inputBarHeight + 42 }
+    init(web: WebController, settings: SettingsStore, engine: AgentEngine,
+         conversation: AgentConversationStore, diagnostics: DiagnosticStore) {
+        self.web = web
+        self.settings = settings
+        self.engine = engine
+        self.conversation = conversation
+        self.diagnostics = diagnostics
+        _dock = ObservedObject(wrappedValue: web.dockState)
+    }
     var body: some View {
         NavigationStack {
             // 布局层（悬浮窗改造，2026-11-02，案卷 FLOATING-UI-IMPL-2026-11-02.md；
@@ -65,7 +75,7 @@ struct ContentView: View {
                               bottomInset: inputBarHeight)
                     .zIndex(InterventionZOrder.chat(browserRaised: interventionBrowserRaised))
                 BrowserDockView(web: web, engine: engine, chatInputFocus: $chatInputFocused,
-                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: web.dockState,
+                                bottomReserve: dockBottomReserve, expandRequest: dockExpandRequest, dock: dock,
                                 onReturnToExecution: { returnToExecution() })
                     .zIndex(InterventionZOrder.dock(browserRaised: interventionBrowserRaised))
                 if showsInterventionPrompt {
@@ -87,8 +97,8 @@ struct ContentView: View {
                         .padding(.bottom, inputBarHeight + 6)
                         .zIndex(InterventionZOrder.card(browserRaised: interventionBrowserRaised))
                 }
-                if !web.dockState.fullScreen {
-                    ChatInputBar(engine: engine, conversation: conversation, dock: web.dockState,
+                if !dock.fullScreen {
+                    ChatInputBar(engine: engine, conversation: conversation, dock: dock,
                                  inputFocus: $chatInputFocused, followLatest: $followLatest,
                                  onSendJumpToBottom: { requestBottom() })
                     .transition(.move(edge: .bottom).combined(with: .opacity))

@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 struct SelfTestView: View {
     @ObservedObject var engine: AgentEngine
     @ObservedObject var settings: SettingsStore
@@ -31,6 +32,7 @@ struct SelfTestView: View {
     @State private var readbackRegistryTestRunning = false
     @State private var typeVerifyTestRunning = false
     @State private var drawerDismissTestRunning = false
+    @State private var browserChromeTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -274,6 +276,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || drawerDismissTestRunning)
             Text("自检三十八预期：遮罩左滑超过 60 点才关闭抽屉；边界、零位和右滑均不关闭。行左滑与遮罩命中范围需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十九：全屏切换与浏览器 chrome") {
+                guard !browserChromeTestRunning else { return }
+                browserChromeTestRunning = true
+                runBrowserChromeTest()
+                dismiss()
+            }.disabled(!engine.active || browserChromeTestRunning)
+            Text("自检三十九预期：临时 DockStateStore 的 fullScreen 发布 false→true→false；背景与 header 材质在小窗为 false、全屏为 true。实际界面仍需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -450,6 +459,27 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十七：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十七结论：全部通过（\(lines.count) 项）" : "自检三十七结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runBrowserChromeTest() {
+        defer { browserChromeTestRunning = false }
+        conversation.localFeedback("自检三十九：开始——状态发布与样式真值表（不调用模型）")
+        let testDock = DockStateStore()
+        var published: [Bool] = []
+        let subscription = testDock.$fullScreen.sink { published.append($0) }
+        testDock.showFullScreen()
+        testDock.leaveFullScreen()
+        subscription.cancel()
+        let checks: [(String, Bool)] = [
+            ("临时坞发布 false→true→false", published == [false, true, false]),
+            ("小窗背景与 header 均关闭", !BrowserChromeStyle.opaqueBackground(fullScreen: false) && !BrowserChromeStyle.headerMaterial(fullScreen: false)),
+            ("全屏背景与 header 均开启", BrowserChromeStyle.opaqueBackground(fullScreen: true) && BrowserChromeStyle.headerMaterial(fullScreen: true))
+        ]
+        for (note, passed) in checks {
+            conversation.localFeedback("自检三十九：\(passed ? "✓" : "✗") \(note)")
+        }
+        let failed = checks.filter { !$0.1 }.count
+        conversation.localFeedback(failed == 0 ? "自检三十九结论：全部通过（3 项）" : "自检三十九结论：\(failed)/3 项未通过，见逐条记录")
     }
 
     private func runDrawerDismissTest() {
