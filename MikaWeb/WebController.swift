@@ -953,6 +953,8 @@ enum TCProbeLogStore {
     /// 不走 ready／state 通道，不受此标记影响。
     var agentWorkSuspended = false
     var contentProcessTerminationHandler: ((BrowserTab) -> Void)?
+    var agentPopupCreated: ((UUID, UUID) -> Void)?
+    var tabClosed: ((UUID) -> Void)?
     private var tabCancellables: [UUID: AnyCancellable] = [:]
 
     override init() {
@@ -1213,6 +1215,7 @@ enum TCProbeLogStore {
         closing.webView.navigationDelegate = nil
         closing.webView.uiDelegate = nil
         if executionTabID == id { executionTabID = nil }
+        tabClosed?(id)
         let siblings = tabs.filter { $0.sessionID == owner }
         if siblings.isEmpty {
             let fresh = BrowserTab(sessionID: owner)
@@ -1251,6 +1254,26 @@ enum TCProbeLogStore {
     }
     /// 任务终结／停止：解除绑定（state／execute 回落当前页）。
     func endExecution() { executionTabID = nil; executionSessionID = nil }
+    /// Rebind before recycling an execution tab. Never choose another registered temporary tab.
+    func restoreExecutionBinding(preferred sourceID: UUID, excluding excluded: Set<UUID>) -> Bool {
+        guard let owner = executionSessionID else { return false }
+        let target = tabs.first { $0.id == sourceID && $0.sessionID == owner && !excluded.contains($0.id) }
+            ?? tabs.first { $0.sessionID == owner && !excluded.contains($0.id) }
+        guard let target else { return false }
+        executionTabID = target.id
+        return true
+    }
+    /// A failed or incomplete extraction means the page may contain unsaved edits.
+    func readbackTabMayContainEdits(_ id: UUID) async -> Bool {
+        guard let tab = tabs.first(where: { $0.id == id }), !tab.isPinned,
+              tab.pendingRestoreURL == nil, tab.terminatedAt == nil,
+              !tab.webView.isLoading else { return true }
+        guard let page = try? await state(in: tab, forCapture: true), page.coverageComplete else { return true }
+        return page.elements.contains { element in
+            element.editable || element.tag == "textarea" || element.tag == "select" ||
+            (element.tag == "input" && !["button", "submit", "reset", "checkbox", "radio", "hidden"].contains(element.inputType.lowercased()))
+        }
+    }
     /// 执行页重载（引擎在页面瞬时失败连败时用）：作用于执行页而非当前页，用户切页不串。
     func reloadExecutionTab() { executionTab.reload() }
 
@@ -1675,12 +1698,14 @@ enum TCProbeLogStore {
         // 新标签继承 opener 所在会话（M1）：opener 在隐藏的执行会话里时，
         // 新页同归该会话且不抢查看会话的当前页；opener 是当前页时与旧行为
         // 一致（切换过去）。
-        let owner = tabs.first(where: { $0.webView === webView })?.sessionID ?? displayedSessionID
+        let opener = tabs.first(where: { $0.webView === webView })
+        let owner = opener?.sessionID ?? displayedSessionID
         let tab = BrowserTab(configuration: configuration, loadStartPage: false, sessionID: owner)
         tabs.append(tab)
         adopt(tab)
         lastActiveTabBySession[owner] = tab.id
         if owner == displayedSessionID { activeTabID = tab.id }
+        if let opener { agentPopupCreated?(tab.id, opener.id) }
         return tab.webView
     }
 

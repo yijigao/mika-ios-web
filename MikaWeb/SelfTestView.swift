@@ -28,6 +28,7 @@ struct SelfTestView: View {
     @State private var sessionUXTestRunning = false
     @State private var recoveryBudgetTestRunning = false
     @State private var thermalGateTestRunning = false
+    @State private var readbackRegistryTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -250,6 +251,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || thermalGateTestRunning)
             Text("自检三十五预期：不调用模型、不占用标签页；验证四态准入 12 格、30 秒冷却与再升温、从未锁过可恢复、状态相等。真机热态通知与亮屏行为需复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十六：回读页登记（READBACK-TAB-REGISTRY）") {
+                guard !readbackRegistryTestRunning else { return }
+                readbackRegistryTestRunning = true
+                runReadbackRegistryTest()
+                dismiss()
+            }.disabled(!engine.active || readbackRegistryTestRunning)
+            Text("自检三十六预期：纯状态机核对同任务单回读页、跨任务隔离、popup 不回收、终局清理与单页注销；真实页面保护和绑定恢复需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -399,6 +407,37 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十五：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十五结论：全部通过（\(lines.count) 项）" : "自检三十五结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runReadbackRegistryTest() {
+        defer { readbackRegistryTestRunning = false }
+        conversation.localFeedback("自检三十六：开始——回读页登记纯状态机（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) { lines.append("\(passed ? "✓" : "✗") \(note)") }
+        let taskA = UUID(), taskB = UUID(), source = UUID()
+        let first = UUID(), second = UUID(), popup = UUID(), other = UUID()
+        var registry = ReadbackTabRegistry()
+        check(registry.register(tabID: first, ownerTaskID: taskA, sourceTabID: source, purpose: "readback") == nil,
+              "首个回读页无待回收页")
+        check(registry.register(tabID: popup, ownerTaskID: taskA, sourceTabID: source, purpose: "popup") == nil &&
+              registry.readbackTab(forTask: taskA) == first && registry.tabsToRecycle(forTask: taskA) == [first],
+              "被动 popup 记账但不占回读名额，也不自动回收")
+        check(registry.register(tabID: other, ownerTaskID: taskB, sourceTabID: source, purpose: "readback") == nil &&
+              registry.readbackTab(forTask: taskA) == first && registry.tabsToRecycle(forTask: taskB) == [other],
+              "任务 B 登记不影响任务 A")
+        check(registry.register(tabID: second, ownerTaskID: taskA, sourceTabID: source, purpose: "readback") == first &&
+              registry.readbackTab(forTask: taskA) == second && registry.tabsToRecycle(forTask: taskA) == [second],
+              "同任务第二页返回旧 ID，登记仅保留新回读页")
+        registry.unregister(tabID: popup)
+        check(registry.entries[popup] == nil && registry.readbackTab(forTask: taskA) == second,
+              "unregister 只清指定页")
+        registry.endTask(taskA)
+        check(registry.readbackTab(forTask: taskA) == nil && registry.tabsToRecycle(forTask: taskA).isEmpty &&
+              registry.readbackTab(forTask: taskB) == other,
+              "endTask 清任务 A，任务 B 不受影响")
+        for line in lines { conversation.localFeedback("自检三十六：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检三十六结论：全部通过（\(lines.count) 项）" : "自检三十六结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runSessionUXTest() {

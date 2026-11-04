@@ -707,6 +707,8 @@ struct OpenStall {
     /// （活跃期锁定展开工作尺寸，见 AGENT-VIEWPORT-FIX 的视口状态迁移表）。
     @Published private(set) var sessionActive = false
     private let web: WebController
+    private var readbackTabs = ReadbackTabRegistry()
+    private var replacedReadbackTabIDs: Set<UUID> = []
     private let settings: SettingsStore
     private var worker: Task<Void, Never>?
     private var generation = UUID()
@@ -909,6 +911,12 @@ struct OpenStall {
         web.contentProcessTerminationHandler = { [weak self] tab in
             self?.noteContentProcessTermination(tab)
         }
+        web.agentPopupCreated = { [weak self] tabID, sourceTabID in
+            guard let self, case .running = self.status, let taskID = self.conversationTaskID else { return }
+            guard sourceTabID == self.web.executionTabID || self.readbackTabs.entries[sourceTabID]?.ownerTaskID == taskID else { return }
+            _ = self.readbackTabs.register(tabID: tabID, ownerTaskID: taskID, sourceTabID: sourceTabID, purpose: "popup")
+        }
+        web.tabClosed = { [weak self] tabID in self?.readbackTabs.unregister(tabID: tabID) }
         settingsCancellable = settings.$keepScreenAwakeDuringTask.sink { [weak self] _ in
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
@@ -955,6 +963,8 @@ struct OpenStall {
     /// （旧会话已暂停任务的快照留在它自己的目录里，切回时可恢复）。
     private func startInSession(_ sessionID: UUID, local: String?, task: String?) {
         stop()
+        if let oldTaskID = conversationTaskID { readbackTabs.endTask(oldTaskID) }
+        replacedReadbackTabIDs.removeAll()
         runSessionID = sessionID
         guard active else { status = .paused("任务只能在前台执行"); return }
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
@@ -984,6 +994,7 @@ struct OpenStall {
     }
     func stop() {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        scheduleReadbackRecycling()
         thermalPaused = false
         discardPendingUpload()
         runStartedAt = nil; activeRunContext = nil
@@ -1012,6 +1023,7 @@ struct OpenStall {
     func finishTask() {
         guard busy else { return }
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        scheduleReadbackRecycling()
         thermalPaused = false
         discardPendingUpload()
         runStartedAt = nil; activeRunContext = nil
@@ -1474,6 +1486,7 @@ struct OpenStall {
                             status = .done(action.summary + pendingNote)
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
+                            await recycleReadbackTabs(for: conversationTaskID, expectedGeneration: token)
                             web.endExecution(); clearSnapshot(); resumeNote = nil
                             // 执行权在此真正空出（M1 串行队列的推进点之一）：
                             // 队首任务（若有）在它自己的会话里接着启动
@@ -1530,7 +1543,16 @@ struct OpenStall {
                             guard thermalGate.allowsHeavyWork() else { throw MikaError("设备发热严重，已暂停新建页面") }
                             // 在新标签页打开指定网址：新页成为当前页且执行绑定随之移过去，后续动作作用于新页
                             executionSerial += 1
-                            _ = try web.openTabForExecution(urlString: action.url)
+                            let previous = conversationTaskID.flatMap { readbackTabs.readbackTab(forTask: $0) }.flatMap { readbackTabs.entries[$0] }
+                            let sourceID = web.executionTab.id
+                            let tab = try web.openTabForExecution(urlString: action.url)
+                            if let taskID = conversationTaskID {
+                                if let oldID = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "readback"),
+                                   let previous, previous.tabID == oldID {
+                                    replacedReadbackTabIDs.insert(oldID)
+                                    await recycleReadbackTab(previous, for: taskID, expectedGeneration: token, excluding: [tab.id])
+                                }
+                            }
                             try await checkpoint(token)
                             record(action)
                             loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.url, outcome: "ok")
@@ -1662,6 +1684,7 @@ struct OpenStall {
                                 appendStep("loop", "循环熔断：同一动作已重复 \(verdict.count) 次且页面结果没有变化，已停下等你决定")
                                 status = .paused("检测到在同一处反复打转：同一动作重复了 \(verdict.count) 次、页面没有变化。点「继续」可让它再试，或换个说法重新开始")
                                 persistSnapshot()
+                                scheduleReadbackRecycling()
                                 return
                             case .severe:
                                 appendStep("loop", "循环严重提醒：同一动作已重复 \(verdict.count) 次，下一步提示已下达最后换路指令（无路可换时在 ask_user 里如实交代卡点与已试路径，引擎走绕行梯/失败结案），再重复将自动停下")
@@ -1748,11 +1771,13 @@ struct OpenStall {
                     status = .paused("已达最大 \(limit) 步，请检查结果或重新开始")
                 }
                 persistSnapshot()
+                scheduleReadbackRecycling()
             } catch {
                 guard token == generation else { return }
                 if error is ThermalPause { return }
                 sessionActive = false; applyIdleTimerPolicy()
                 endBackgroundGrace(); completeContinuedProcessing(success: false)
+                await recycleReadbackTabs(for: conversationTaskID, expectedGeneration: token)
                 web.endExecution(); clearSnapshot(); resumeNote = nil
                 if error is CancellationError { status = .paused("已取消") }
                 else { status = .failed(error.localizedDescription); advanceQueue() }
@@ -3293,6 +3318,7 @@ struct OpenStall {
         sessionActive = false; applyIdleTimerPolicy()
         endBackgroundGrace(); completeContinuedProcessing(success: false)
         persistSnapshot()
+        scheduleReadbackRecycling()
     }
     private struct ThermalPause: Error {}
 
@@ -3324,6 +3350,48 @@ struct OpenStall {
         endBackgroundGrace()
         completeContinuedProcessing(success: false)
         persistSnapshot()
+        scheduleReadbackRecycling()
+    }
+    private func scheduleReadbackRecycling() {
+        guard let taskID = conversationTaskID, readbackTabs.readbackTab(forTask: taskID) != nil else { return }
+        let token = generation
+        Task { [weak self] in await self?.recycleReadbackTabs(for: taskID, expectedGeneration: token) }
+    }
+
+    private func recycleReadbackTabs(for taskID: UUID?, expectedGeneration: UUID) async {
+        guard let taskID, generation == expectedGeneration else { return }
+        let entries = readbackTabs.tabsToRecycle(forTask: taskID).compactMap { readbackTabs.entries[$0] }
+        for entry in entries {
+            await recycleReadbackTab(entry, for: taskID, expectedGeneration: expectedGeneration)
+        }
+        guard generation == expectedGeneration else { return }
+        readbackTabs.endTask(taskID)
+        if conversationTaskID == taskID { replacedReadbackTabIDs.removeAll() }
+    }
+
+    private func recycleReadbackTab(_ entry: ReadbackTabRegistry.Entry, for taskID: UUID, expectedGeneration: UUID, excluding extraExcluded: Set<UUID> = []) async {
+        guard conversationTaskID == taskID, generation == expectedGeneration,
+              let tab = web.tabs.first(where: { $0.id == entry.tabID }), !tab.isPinned else {
+            if conversationTaskID == taskID { appendStep("note", "回读页受保护或已不存在，已保留未关") }
+            return
+        }
+        if web.executionTabID == entry.tabID {
+            let excluded = Set(readbackTabs.entries.keys).union(replacedReadbackTabIDs).union(extraExcluded).union([entry.tabID])
+            guard web.restoreExecutionBinding(preferred: entry.sourceTabID, excluding: excluded) else {
+                appendStep("note", "回读页没有可恢复的用户页执行绑定，已保留未关")
+                return
+            }
+        }
+        if await web.readbackTabMayContainEdits(entry.tabID) {
+            guard conversationTaskID == taskID, generation == expectedGeneration else { return }
+            appendStep("note", "回读页可能含未保存内容，已保留未关")
+            return
+        }
+        guard conversationTaskID == taskID, generation == expectedGeneration else { return }
+        web.closeTab(entry.tabID)
+        if web.tabs.contains(where: { $0.id == entry.tabID }) {
+            appendStep("note", "回读页未通过标签关闭保护，已保留未关")
+        }
     }
     private func writeDiagnostic(types: [String], payload: [String: Any]) {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
