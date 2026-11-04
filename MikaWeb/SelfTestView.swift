@@ -30,6 +30,7 @@ struct SelfTestView: View {
     @State private var thermalGateTestRunning = false
     @State private var readbackRegistryTestRunning = false
     @State private var typeVerifyTestRunning = false
+    @State private var drawerDismissTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -266,6 +267,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || typeVerifyTestRunning)
             Text("自检三十七预期：字数信号丢失、无信号宽容、冻结、目标量级、基线增长兜底、DOM 缺失及旧探针 JSON 解码兼容均通过；真实编辑器需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十八：抽屉关闭手势（DRAWER-DISMISS）") {
+                guard !drawerDismissTestRunning else { return }
+                drawerDismissTestRunning = true
+                runDrawerDismissTest()
+                dismiss()
+            }.disabled(!engine.active || drawerDismissTestRunning)
+            Text("自检三十八预期：遮罩左滑超过 60 点才关闭抽屉；边界、零位和右滑均不关闭。行左滑与遮罩命中范围需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -442,6 +450,19 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十七：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十七结论：全部通过（\(lines.count) 项）" : "自检三十七结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runDrawerDismissTest() {
+        defer { drawerDismissTestRunning = false }
+        conversation.localFeedback("自检三十八：开始——抽屉关闭手势真值表（不调用模型）")
+        let cases: [(CGFloat, Bool)] = [(-61, true), (-60, false), (0, false), (80, false), (-200, true)]
+        var failed = 0
+        for (translation, expected) in cases {
+            let actual = DrawerDismissPolicy.shouldDismiss(translationWidth: translation)
+            if actual != expected { failed += 1 }
+            conversation.localFeedback("自检三十八：\(actual == expected ? "✓" : "✗") \(translation) → \(expected)")
+        }
+        conversation.localFeedback(failed == 0 ? "自检三十八结论：全部通过（5 项）" : "自检三十八结论：\(failed)/5 项未通过，见逐条记录")
     }
 
     private func runReadbackRegistryTest() {

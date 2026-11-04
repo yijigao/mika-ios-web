@@ -105,6 +105,11 @@ struct ContentView: View {
                     ZStack(alignment: .leading) {
                         Color.black.opacity(0.32).ignoresSafeArea()
                             .onTapGesture { withAnimation { showSessions = false } }
+                            .gesture(DragGesture().onEnded { value in
+                                if DrawerDismissPolicy.shouldDismiss(translationWidth: value.translation.width) {
+                                    withAnimation { showSessions = false }
+                                }
+                            })
                         SessionListView(engine: engine, conversation: conversation, web: web,
                                         onClose: { withAnimation { showSessions = false } },
                                         onSessionEntered: { requestBottom() },
@@ -112,9 +117,6 @@ struct ContentView: View {
                             .frame(width: min(UIScreen.main.bounds.width * 0.86, 360))
                             .background(.regularMaterial)
                             .transition(.move(edge: .leading))
-                            .simultaneousGesture(DragGesture().onEnded { value in
-                                if abs(value.translation.width) > 60 { withAnimation { showSessions = false } }
-                            })
                     }
                     .zIndex(10)
                 }
