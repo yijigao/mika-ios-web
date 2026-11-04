@@ -26,6 +26,7 @@ struct SelfTestView: View {
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
     @State private var recoveryBudgetTestRunning = false
+    @State private var thermalGateTestRunning = false
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -228,6 +229,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || recoveryBudgetTestRunning)
             Text("自检三十三预期：不调用模型、不占用标签页；验证整任务恢复尝试与加载上限、2/5/10 秒退避、两类计数独立、Codable 往返和默认值相等。真实页面恢复与进程终止需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检三十五：热态门（THERMAL-GATE）") {
+                guard !thermalGateTestRunning else { return }
+                thermalGateTestRunning = true
+                runThermalGateTest()
+                dismiss()
+            }.disabled(!engine.active || thermalGateTestRunning)
+            Text("自检三十五预期：不调用模型、不占用标签页；验证四态准入 12 格、30 秒冷却与再升温、从未锁过可恢复、状态相等。真机热态通知与亮屏行为需复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -263,6 +271,51 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检三十三：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检三十三结论：全部通过（\(lines.count) 项）" : "自检三十三结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
+    }
+
+    private func runThermalGateTest() {
+        defer { thermalGateTestRunning = false }
+        conversation.localFeedback("自检三十五：开始——热态门纯策略（不调用模型）")
+        var lines: [String] = []
+        func check(_ passed: Bool, _ note: String) {
+            lines.append("\(passed ? "✓" : "✗") \(note)")
+        }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let expectations: [(ThermalLevel, Bool, Bool, Bool)] = [
+            (.nominal, true, true, false),
+            (.fair, true, false, false),
+            (.serious, false, false, true),
+            (.critical, false, false, true)
+        ]
+        for (level, heavy, nonEssential, locked) in expectations {
+            var gate = ThermalGate()
+            gate.update(level: level, now: base)
+            check(gate.allowsHeavyWork() == heavy, "\(level) 允许重活 = \(heavy)")
+            check(gate.allowsNonEssential() == nonEssential, "\(level) 允许非必要工作 = \(nonEssential)")
+            check(gate.isLocked == locked, "\(level) 热锁 = \(locked)")
+        }
+        var cooling = ThermalGate()
+        cooling.update(level: .serious, now: base)
+        cooling.update(level: .fair, now: base.addingTimeInterval(10))
+        check(cooling.coolingSince == base.addingTimeInterval(10), "锁定后降 fair：冷却从降温时刻起算")
+        check(!cooling.canResume(now: base.addingTimeInterval(39)), "降温 29 秒仍不可恢复")
+        check(cooling.canResume(now: base.addingTimeInterval(40)), "降温 30 秒可恢复")
+        var reheated = ThermalGate()
+        reheated.update(level: .serious, now: base)
+        reheated.update(level: .fair, now: base.addingTimeInterval(10))
+        reheated.update(level: .serious, now: base.addingTimeInterval(25))
+        check(reheated.coolingSince == nil && !reheated.canResume(now: base.addingTimeInterval(100)), "冷却中再升 serious：计时清空且不可恢复")
+        var neverLocked = ThermalGate()
+        check(neverLocked.canResume(now: base), "从未锁过的 nominal 可恢复")
+        neverLocked.update(level: .fair, now: base)
+        check(neverLocked.canResume(now: base), "从未锁过的 fair 可恢复")
+        var copy = neverLocked
+        check(copy == neverLocked, "Equatable：状态拷贝相等")
+        copy.update(level: .serious, now: base)
+        check(copy != neverLocked, "Equatable：状态变化后不相等")
+        for line in lines { conversation.localFeedback("自检三十五：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检三十五结论：全部通过（\(lines.count) 项）" : "自检三十五结论：\(failed)/\(lines.count) 项未通过，见逐条记录")
     }
 
     private func runSessionUXTest() {

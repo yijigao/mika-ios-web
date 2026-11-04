@@ -3374,6 +3374,9 @@ enum TCProbeLogStore {
     /// agent 操作失败时存一份快照：页面截图（JPEG base64）＋精简 DOM 摘要（候选按钮与禁用状态）。
     /// 全程尽力而为：抓取失败不掩盖原始错误。
     private func captureFailureSnapshot(context: String, tab: BrowserTab) async {
+        var thermalGate = ThermalGate()
+        thermalGate.update(level: ThermalLevel(ProcessInfo.processInfo.thermalState), now: Date())
+        guard thermalGate.allowsNonEssential() else { return }
         let domSummary = (try? await evaluate("""
         (()=>{const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
         const lab=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim().slice(0,40);

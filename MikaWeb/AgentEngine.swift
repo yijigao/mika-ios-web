@@ -750,6 +750,9 @@ struct OpenStall {
     /// 续跑；全任务硬顶（段数 × 每段上限）封住失控成本。
     private var stepBudget = StepBudget(limit: 25)
     private var recoveryBudget = RecoveryBudget()
+    private var thermalGate = ThermalGate()
+    private var thermalPaused = false
+    private var thermalObserver: NSObjectProtocol?
     private var lastTerminationNote: [ObjectIdentifier: Date] = [:]
     /// 当前暂停是否由「本段步数用完」引起（决定 resume 是否开新段；
     /// 随快照落盘，进程重启后口径不变）。
@@ -892,6 +895,11 @@ struct OpenStall {
     private var settingsCancellable: AnyCancellable?
     init(web: WebController, settings: SettingsStore) {
         self.web = web; self.settings = settings
+        thermalGate.update(level: ThermalLevel(ProcessInfo.processInfo.thermalState), now: Date())
+        thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
+                                                                  object: nil, queue: nil) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshThermalState() }
+        }
         web.contentProcessTerminationHandler = { [weak self] tab in
             self?.noteContentProcessTermination(tab)
         }
@@ -901,6 +909,9 @@ struct OpenStall {
         loadOutcomeLedger()
         loadQueue()
         restoreSnapshotIfNeeded()
+    }
+    deinit {
+        if let thermalObserver { NotificationCenter.default.removeObserver(thermalObserver) }
     }
     var taskLimit: Int { limit }
     var busy: Bool {
@@ -943,7 +954,7 @@ struct OpenStall {
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
-        goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
+        goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; thermalPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
         stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
@@ -967,6 +978,7 @@ struct OpenStall {
     }
     func stop() {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        thermalPaused = false
         discardPendingUpload()
         runStartedAt = nil; activeRunContext = nil
         sessionActive = false; applyIdleTimerPolicy()
@@ -994,6 +1006,7 @@ struct OpenStall {
     func finishTask() {
         guard busy else { return }
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        thermalPaused = false
         discardPendingUpload()
         runStartedAt = nil; activeRunContext = nil
         sessionActive = false; applyIdleTimerPolicy()
@@ -1011,6 +1024,7 @@ struct OpenStall {
         active = foreground
         if foreground {
             web.agentWorkSuspended = false
+            // 前后台驻停只归 web 管；热驻停独立，回前台不能清 thermalPaused。
             endBackgroundGrace()
             applyIdleTimerPolicy()
             // 驻停中的循环由 checkpoint 自行醒来续跑，不需要在这里再点火；
@@ -1032,6 +1046,9 @@ struct OpenStall {
     }
     func resume() {
         guard active, !goal.isEmpty else { return }
+        refreshThermalState()
+        guard !thermalPaused || thermalGate.canResume(now: Date()) else { return }
+        guard !thermalGate.isLocked else { pauseForThermal(); return }
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         // 步数检查点恢复（Part C）：因段限暂停的，点「继续」＝开新段
         // 续跑同一任务（检查点即当前全量状态：目标/台账/页面/历史都
@@ -1390,17 +1407,21 @@ struct OpenStall {
             guard let self else { return }
             do {
                 if let saved = confirmed {
+                    try thermalCheckpoint()
                     // 已确认动作只走 runConfirmed：瞬时错误不自动重做该动作本身（安全口径）
                     if try await runConfirmed(saved, token: token) == .halted { return }
                 }
                 while stepBudget.canDecide {
+                    try thermalCheckpoint()
                     // 单轮迭代包在内层 do/catch 里：瞬时错误（页面脚本异常／网页进程
                     // 中断／加载不稳／模型网络抖动）只记一条人话「自动重试」并续跑，
                     // 连续 maxTransientStreak 次才升级为失败；其余错误照旧上抛判失败。
                     do {
                         try await checkpoint(token)
+                        try thermalCheckpoint()
                         let page = try await web.state()
                         try await checkpoint(token)
+                        try thermalCheckpoint()
                         let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                         let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
                         // 一次性提示在本轮组装前消费（组装可能因预算多遍重建，
@@ -1424,6 +1445,7 @@ struct OpenStall {
                         // 引擎注记步与内部子步永不计数
                         stepBudget.consumeDecision()
                         try await checkpoint(token)
+                        try thermalCheckpoint()
                         if action.action == "done" {
                             // done 梯门（LADDER-FIX F2）：有在开卡点且绕行
                             // 梯未尽时 done 不得直接结案——引擎先推进梯
@@ -1499,6 +1521,7 @@ struct OpenStall {
                             }
                             loopFingerprint = LoopDetector.fingerprint(action: "use_skill", target: name, outcome: outcome)
                         } else if action.action == "open_new_tab" {
+                            guard thermalGate.allowsHeavyWork() else { throw MikaError("设备发热严重，已暂停新建页面") }
                             // 在新标签页打开指定网址：新页成为当前页且执行绑定随之移过去，后续动作作用于新页
                             executionSerial += 1
                             _ = try web.openTabForExecution(urlString: action.url)
@@ -1654,7 +1677,11 @@ struct OpenStall {
                         try await advanceLadderIfNeeded(token: token)
                     } catch {
                         guard token == generation else { return }
+                        if error is ThermalPause { throw error }
                         if error is CancellationError { throw error }
+                        if thermalGate.isLocked && (error as? MikaError)?.message == "设备发热严重，已暂停新建页面" {
+                            pauseForThermal(); throw ThermalPause()
+                        }
                         if Self.isContextOverflowError(error), !contextRetryUsed {
                             // 上下文超限受控重试（H1）：只许一次，且重试必须
                             // 是「缩小后」的——折叠升到最紧（forcedFoldLevel
@@ -1692,6 +1719,8 @@ struct OpenStall {
                                     return
                                 }
                                 persistSnapshot()
+                                refreshThermalState()
+                                guard thermalGate.allowsHeavyWork() else { pauseForThermal(); return }
                                 web.reloadExecutionTab() // 连败第 2 次：先重载执行页一次再试
                             }
                             if !active { try await checkpoint(token) } // 后台出的错先驻停、回前台再重试
@@ -1715,6 +1744,7 @@ struct OpenStall {
                 persistSnapshot()
             } catch {
                 guard token == generation else { return }
+                if error is ThermalPause { return }
                 sessionActive = false; applyIdleTimerPolicy()
                 endBackgroundGrace(); completeContinuedProcessing(success: false)
                 web.endExecution(); clearSnapshot(); resumeNote = nil
@@ -2410,6 +2440,7 @@ struct OpenStall {
     private func progressRungsBeyondFirst(token: UUID) async throws {
         while let rung = bypassLadder.nextRung {
             try await checkpoint(token)
+            try thermalCheckpoint()
             switch rung {
             case .existingMeans:
                 // 第 1 级由 completeRung1AndProgress 结级后才进本函数；
@@ -2418,6 +2449,7 @@ struct OpenStall {
             case .directURL:
                 let targetTitle = DirectTargetHarvest.extractTargetTitle(goal: goal, stuck: openStall?.stuck ?? "")
                 let outcome = await web.harvestDirectTargets(memoryTemplate: bypassLadder.harvestTemplate, targetTitle: targetTitle)
+                try thermalCheckpoint()
                 let pageURL = (try? await web.state())?.url ?? ""
                 bypassLadder.noteHarvest(template: outcome.facts.editTemplate, templateFrom: outcome.facts.editTemplate == nil ? nil : pageURL, fact: outcome.facts.line)
                 if let harvest = outcome.result {
@@ -2443,6 +2475,7 @@ struct OpenStall {
                 appendStep("bypass", "绕行梯第 2 级「直达 URL」落空：\(outcome.facts.line)，推进下一级")
             case .dialogNavBypass:
                 let outcome = await attemptDialogNavBypass(token: token)
+                if thermalPaused { throw ThermalPause() }
                 bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
                 appendStep("bypass", "绕行梯第 3 级「弹窗导航绕行」：\(outcome.note)")
                 if outcome.success {
@@ -2622,6 +2655,11 @@ struct OpenStall {
         if !isEditor {
             guard recoveryBudget.reserveLoad() else { return (false, "非编辑页需要重载但整任务重载预算已用完，此级失败") }
             persistSnapshot()
+            refreshThermalState()
+            guard thermalGate.allowsHeavyWork() else {
+                pauseForThermal()
+                return (false, "设备发热严重，已暂停自动重载")
+            }
             web.reloadExecutionTab()
             try? await Task.sleep(for: .milliseconds(800))
             _ = await web.settledCapture()
@@ -3225,6 +3263,8 @@ struct OpenStall {
     /// 瞬时错误留证：与 WebController 的操作失败快照同目录、同信封格式，诊断页
     /// （设置 → 崩溃报告）可见；裸错误原文只落在这里，不作对话标题展示。
     private func writeTransientDiagnostic(kind: TransientKind, error: Error, streak: Int) {
+        refreshThermalState()
+        guard thermalGate.allowsNonEssential() else { return }
         let ns = error as NSError
         writeDiagnostic(types: ["引擎瞬时错误"], payload: ["kind": "agent-transient-error", "transientKind": String(describing: kind),
                                                            "streak": streak, "domain": ns.domain, "code": ns.code,
@@ -3251,6 +3291,37 @@ struct OpenStall {
         status = .paused(message)
         sessionActive = false; applyIdleTimerPolicy()
         endBackgroundGrace(); completeContinuedProcessing(success: false)
+        persistSnapshot()
+    }
+    private struct ThermalPause: Error {}
+
+    private func refreshThermalState() {
+        thermalGate.update(level: ThermalLevel(ProcessInfo.processInfo.thermalState), now: Date())
+    }
+
+    private func thermalCheckpoint() throws {
+        refreshThermalState()
+        if thermalGate.isLocked {
+            pauseForThermal()
+            throw ThermalPause()
+        }
+        if thermalPaused {
+            guard thermalGate.canResume(now: Date()) else { throw ThermalPause() }
+            thermalPaused = false
+            appendStep("note", "设备温度已回落，恢复执行")
+        }
+    }
+
+    private func pauseForThermal() {
+        guard !thermalPaused else { return }
+        let message = "设备发热严重，任务已暂停降温，进度已存；温度降下来后点「继续」接着跑"
+        thermalPaused = true
+        appendStep("pause", message)
+        status = .paused(message)
+        sessionActive = false
+        applyIdleTimerPolicy()
+        endBackgroundGrace()
+        completeContinuedProcessing(success: false)
         persistSnapshot()
     }
     private func writeDiagnostic(types: [String], payload: [String: Any]) {
