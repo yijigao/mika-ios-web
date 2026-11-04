@@ -24,6 +24,7 @@ struct SessionListView: View {
     @State private var renameTarget: UUID?
     @State private var renameText = ""
     @State private var deleteTarget: SessionMeta?
+    @State private var lastSessionNotice = false
     @State private var searchText = ""
 
     var body: some View {
@@ -93,6 +94,11 @@ struct SessionListView: View {
             } message: {
                 Text("会话「\(deleteTarget?.title ?? "")」的对话记录、标签与未完成任务将一并删除，不可恢复。")
             }
+            .alert("不能删除", isPresented: $lastSessionNotice) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text("只剩一个会话时不能删除，先新建一个会话再删这个。")
+            }
         }
     }
 
@@ -148,8 +154,8 @@ struct SessionListView: View {
             onClose()
         }
         .swipeActions(edge: .trailing) {
-            if canDelete(meta) {
-                Button("删除", role: .destructive) { deleteTarget = meta }
+            Button("删除", role: .destructive) {
+                if canDelete(meta) { deleteTarget = meta } else { lastSessionNotice = true }
             }
             Button("改名") {
                 renameTarget = meta.id
@@ -166,7 +172,9 @@ struct SessionListView: View {
         .contextMenu {
             Button(meta.pinned ? "取消置顶" : "置顶") { store.togglePin(id: meta.id) }
             Button("重命名") { renameTarget = meta.id; renameText = meta.title }
-            if canDelete(meta) { Button("删除", role: .destructive) { deleteTarget = meta } }
+            Button("删除", role: .destructive) {
+                if canDelete(meta) { deleteTarget = meta } else { lastSessionNotice = true }
+            }
         }
     }
 
