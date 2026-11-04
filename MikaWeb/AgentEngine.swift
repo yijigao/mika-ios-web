@@ -3283,6 +3283,9 @@ struct OpenStall {
     }
     private func noteTypedContent(action: AgentAction, element: PageElement) {
         guard !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let target = [element.text, element.ariaLabel, element.placeholder, element.name]
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? "（目标未名）"
+        stateCard.addWrite(target: target, body: action.text)
         let isEditor = element.editable || element.tag == "textarea"
         recentTyped.append((text: action.text, isEditor: isEditor))
         if recentTyped.count > 5 { recentTyped.removeFirst(recentTyped.count - 5) }
@@ -3544,6 +3547,52 @@ struct OpenStall {
     }
 
     func verifyClickEffectClassification() -> [String] { web.verifyClickEffectClassification() }
+
+    /// 自检二十九（KNIFE3-WRITES）：写入记账、FIFO、旧快照兼容与
+    /// 最紧历史折叠时的状态卡注入。不调用模型、不占用页面。
+    func verifyWrittenContentCard() -> [String] {
+        var lines: [String] = []
+        var card = TaskStateCard(goal: "自检二十九合成目标")
+        card.addWrite(target: "正文编辑器", body: "甲乙丙丁")
+        card.addWrite(target: "", body: String(repeating: "文", count: 30))
+        let first = card.writes ?? []
+        lines.append("\(first.count == 2 && first[0] == "正文编辑器←甲乙丙丁（4字）" && first[1] == "（目标未名）←\(String(repeating: "文", count: 24))（30字）" ? "✓" : "✗") 写入格式：目标、正文前24字、原文字数及无名目标回退")
+        for number in 0..<8 { card.addWrite(target: "目标\(number)", body: "内容\(number)") }
+        let retained = card.writes ?? []
+        lines.append("\(retained.count == 8 && retained.first?.hasPrefix("目标0←") == true && retained.last?.hasPrefix("目标7←") == true ? "✓" : "✗") FIFO 封顶：第9、10次写入后只留最近8条")
+
+        let snapshot = SessionSnapshot(savedAt: Date(), goal: card.goal, limit: 25, stepSeq: 0, steps: [],
+                                       statusKind: "paused", statusText: "", pendingActionJSON: nil, pendingElement: nil,
+                                       pendingURL: nil, waiting: nil, answersJSON: "[]", skillNames: nil,
+                                       taskID: nil, tabURLs: nil, activeTabIndex: nil, executionTabIndex: nil,
+                                       outcomes: nil, stateCard: card, sessionID: nil)
+        if let data = try? JSONEncoder().encode(snapshot),
+           let decoded = try? JSONDecoder().decode(SessionSnapshot.self, from: data) {
+            lines.append("\(decoded.stateCard?.writes == retained ? "✓" : "✗") 快照往返：writes 八条逐字保留")
+            if var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               var oldCard = object["stateCard"] as? [String: Any] {
+                oldCard.removeValue(forKey: "writes")
+                object["stateCard"] = oldCard
+                let legacyData = try? JSONSerialization.data(withJSONObject: object)
+                let legacy = legacyData.flatMap { try? JSONDecoder().decode(SessionSnapshot.self, from: $0) }
+                lines.append("\(legacy?.stateCard?.goal == card.goal && legacy?.stateCard?.writes == nil ? "✓" : "✗") 旧快照：无 writes 键仍可解码")
+            } else {
+                lines.append("✗ 旧快照：无法构造缺 writes 键样本")
+            }
+        } else {
+            lines.append("✗ 快照往返：状态卡编码或解码失败")
+            lines.append("✗ 旧快照：缺 writes 键兼容性未验证")
+        }
+
+        let savedCard = stateCard
+        let savedSteps = steps
+        stateCard = card
+        steps = (1...45).map { AgentStep(id: $0, action: "type", reason: "旧步长文本-\($0)-" + String(repeating: "折", count: 80)) }
+        defer { stateCard = savedCard; steps = savedSteps }
+        let prompt = buildPrompt(pageJSON: "{}", answersJSON: "[]", foldLevel: 3, loopHint: nil, outcomeHint: nil)
+        lines.append("\(retained.allSatisfy { prompt.contains("· " + $0) } && prompt.contains("【已写入页面的内容】") && !prompt.contains("旧步长文本-1-" + String(repeating: "折", count: 80)) ? "✓" : "✗") level 3 折叠：旧步长文本被折、writes 段与八条原文仍全文在 prompt 中")
+        return lines
+    }
 
     /// 自检六只读口径：台账条数与最近一条的人读摘要。
     var outcomeLedgerCount: Int { outcomeLedger.count }

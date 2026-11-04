@@ -23,6 +23,8 @@ struct TaskStateCard: Codable, Equatable {
     var openQuestions: [String] = []
     /// 成果台账引用（人读短行；台账详情与定力口径仍由台账注入段承担）
     var outcomeRefs: [String] = []
+    /// 成功写入页面的短记录；可选键使旧状态卡快照照常解码。
+    var writes: [String]? = nil
     var updatedAt: Date = Date()
 
     /// 防爆值：已完成里程碑滚动保留最近 30 条（更早的里程碑仍在原始步流
@@ -30,6 +32,7 @@ struct TaskStateCard: Codable, Equatable {
     static let completedCap = 30
     /// 防爆值：关键事实去重后超过 50 条才丢最旧（见文件头口径）。
     static let pinnedCap = 50
+    static let writesCap = 8
 
     mutating func addCompleted(_ line: String) {
         let trimmed = String(line.trimmingCharacters(in: .whitespacesAndNewlines).prefix(100))
@@ -47,6 +50,17 @@ struct TaskStateCard: Codable, Equatable {
         updatedAt = Date()
     }
 
+    mutating func addWrite(target: String, body: String) {
+        let label = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = String(body.prefix(24)).map { $0.isNewline ? " " : String($0) }.joined()
+        let line = "\(label.isEmpty ? "（目标未名）" : label)←\(preview)（\(body.count)字）"
+        var entries = writes ?? []
+        entries.append(line)
+        if entries.count > Self.writesCap { entries.removeFirst(entries.count - Self.writesCap) }
+        writes = entries
+        updatedAt = Date()
+    }
+
     /// prompt 注入形态：只列非空段；目标为空（无任务）返回空串不注入。
     /// 「关键事实」段带不可丢弃声明——它与历史折叠相互独立，折叠级别
     /// 再高也不会动这一段（自检八对此有断言）。
@@ -59,6 +73,7 @@ struct TaskStateCard: Codable, Equatable {
         if !pinnedFacts.isEmpty { lines.append("关键事实（不可丢弃）：" + pinnedFacts.joined(separator: "；")) }
         if !openQuestions.isEmpty { lines.append("未决问题：" + openQuestions.joined(separator: "；")) }
         if !outcomeRefs.isEmpty { lines.append("成果台账引用：" + outcomeRefs.joined(separator: "；")) }
+        if let writes, !writes.isEmpty { lines.append("【已写入页面的内容】\n" + writes.map { "· " + $0 }.joined(separator: "\n")) }
         return lines.joined(separator: "\n")
     }
 }

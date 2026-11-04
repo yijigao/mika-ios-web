@@ -22,6 +22,7 @@ struct SelfTestView: View {
     @State private var editorEntryBindTestRunning = false
     @State private var finalClaimAuditTestRunning = false
     @State private var clickEffectTestRunning = false
+    @State private var writtenContentTestRunning = false
     @State private var floatingVisibilityTestRunning = false
     @State private var sessionUXTestRunning = false
     var body: some View {
@@ -212,6 +213,13 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active || clickEffectTestRunning)
             Text("自检二十八预期（刀2，不调用模型、不占用标签页）：纯函数真值表覆盖 URL 变化、文本变化、元素数变化、都不变与点前签名缺失。真实点击回读的时序与页面效果需在真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检二十九：页面写入入账（KNIFE3-WRITES）") {
+                guard !writtenContentTestRunning else { return }
+                writtenContentTestRunning = true
+                runWrittenContentTest()
+                dismiss()
+            }.disabled(!engine.active || writtenContentTestRunning)
+            Text("自检二十九预期（刀3，不调用模型、不占用标签页）：写入条目含目标、正文前24字与字数；无名目标回退；十次写入只留最近八条；状态卡随快照往返且旧快照缺 writes 键仍可解码；level 3 折叠时写入段及八条原文仍全文在 prompt 中。真实页面 type 成功路径需真机复测。").font(.caption).foregroundStyle(.secondary)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -348,6 +356,15 @@ struct SelfTestView: View {
         for line in lines { conversation.localFeedback("自检二十八：\(line)") }
         let failed = lines.filter { $0.hasPrefix("✗") }.count
         conversation.localFeedback(failed == 0 ? "自检二十八结论：全部通过——五种签名分类成立" : "自检二十八结论：\(failed) 项未通过，见逐条记录")
+    }
+
+    private func runWrittenContentTest() {
+        defer { writtenContentTestRunning = false }
+        conversation.localFeedback("自检二十九：开始——页面写入入账核查（不调用模型）")
+        let lines = engine.verifyWrittenContentCard()
+        for line in lines { conversation.localFeedback("自检二十九：\(line)") }
+        let failed = lines.filter { $0.hasPrefix("✗") }.count
+        conversation.localFeedback(failed == 0 ? "自检二十九结论：全部通过——写入格式、FIFO、快照兼容与最紧折叠注入成立" : "自检二十九结论：\(failed) 项未通过，见逐条记录")
     }
 
     /// 自检十七 Tier A 编排（UI-LEGIBILITY）：浮层可读性的结构断言
