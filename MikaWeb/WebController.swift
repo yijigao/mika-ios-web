@@ -55,6 +55,21 @@ enum SettleLoopPolicy {
     }
 }
 
+/// Only used by self-test 42 readiness probes; a stalled WebContent process cannot
+/// hold the self-test beyond its binding deadline. Completion and timeout race once.
+@MainActor private final class Type4BindingProbeGate {
+    private var continuation: CheckedContinuation<String, Error>?
+    var timeout: Task<Void, Never>?
+    init(_ continuation: CheckedContinuation<String, Error>) { self.continuation = continuation }
+    func finish(_ result: Result<String, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        timeout?.cancel()
+        timeout = nil
+        continuation.resume(with:result)
+    }
+}
+
 /// 弹窗 frame 探针的消息中枢（WECHAT-COVER-FIX）：探针脚本注入在每个
 /// frame 里，各 frame 的回報（probe-report／click-report）经消息处理器
 /// 到达这里；按（webView 身份＋本次探查 token）匹配正在等待的收集者，
@@ -186,6 +201,8 @@ enum SiteMode: String {
     @Published var pageError: String?
     private(set) var revision = 0
     private(set) var documentEpoch = 0
+    /// Observational only: self-test waits for didFinish of the current document.
+    private(set) var finishedDocumentEpoch: Int?
     private var observations: [NSKeyValueObservation] = []
     /// 网页进程终止时 webView.url 可能已被清空，保留最后已知地址供后续导航使用。
     private var lastKnownURL: URL?
@@ -745,9 +762,10 @@ enum SiteMode: String {
         return true
     }
 
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { revision += 1; pageError = nil; update() }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { finishedDocumentEpoch = nil; revision += 1; pageError = nil; update() }
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) { documentEpoch += 1 }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        finishedDocumentEpoch = documentEpoch
         update()
         // Cookie 备份／回注（ADOPTION-TOP3 第 1 条）：真实导航完成即记访问（老化
         // 时钟）并节流同步一次——用户手动建立的登录态及时入备份，ITP 静默清除
@@ -2093,14 +2111,100 @@ enum TCProbeLogStore {
         func js(_ value: String) -> String { String(decoding: try! JSONEncoder().encode(value), as: UTF8.self) }
         func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
         func bool(_ script: String) async throws -> Bool { (try await evaluate(script, on: tab)) as? Bool == true }
-        func prepare(_ text: String, slot: String = "primary") async throws -> (AgentAction, PageElement) {
-            let page = try await state(in: tab)
-            guard let indexText = try await evaluate("document.querySelector('[data-mika-slot=\"\(slot)\"]').getAttribute('data-mika-idx')", on: tab) as? String,
-                  let index = Int(indexText), let expected = page.elements.first(where: { $0.index == index && $0.editable }) else {
-                throw MikaError("Self-test host binding failed: \(slot)")
+        // This view is deliberately outside the browser UI. A zero frame gives the document
+        // a zero viewport and the unchanged production extractor removes its host index.
+        tab.webView.frame = CGRect(x:0, y:0, width:1024, height:768)
+        tab.webView.layoutIfNeeded()
+        @MainActor func bindingProbe(_ script: String, deadline: TimeInterval) async throws -> String {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                let gate = Type4BindingProbeGate(continuation)
+                gate.timeout = Task { @MainActor in
+                    do { try await Task.sleep(for:.milliseconds(max(1, Int((deadline - ProcessInfo.processInfo.systemUptime) * 1000)))) }
+                    catch { return }
+                    gate.finish(.failure(MikaError("Self-test host probe exceeded binding deadline")))
+                }
+                tab.webView.evaluateJavaScript(script) { value, error in
+                    Task { @MainActor in
+                        if let error { gate.finish(.failure(error)) }
+                        else if let value = value as? String { gate.finish(.success(value)) }
+                        else { gate.finish(.failure(MikaError("Self-test host probe returned non-JSON result"))) }
+                    }
+                }
             }
-            let data = try JSONSerialization.data(withJSONObject: ["action":"type", "index":index,"text":text,"reason":"自检四十二"])
-            return (try JSONDecoder().decode(AgentAction.self, from: data), expected)
+        }
+        @MainActor func waitForHost(_ slot: String, afterEpoch: Int? = nil, snapshot: Bool) async throws -> PageElement? {
+            let started = ProcessInfo.processInfo.systemUptime, deadline = started + 12
+            var attempts = 0
+            var last: [String: Any] = [:]
+            var first: [String: Any] = [:]
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                try Task.checkCancellation()
+                attempts += 1
+                let nativeReady = !tab.webView.isLoading && tab.finishedDocumentEpoch == tab.documentEpoch &&
+                    (afterEpoch.map { tab.documentEpoch > $0 } ?? true) && tab.webView.url?.lastPathComponent == "test-draft.html"
+                let slotJSON = js(slot), includeSnapshot = snapshot && nativeReady
+                let probe = """
+                (()=>{
+                  const slot=\(slotJSON),matches=[...document.querySelectorAll('[data-mika-slot]')].filter(x=>x.getAttribute('data-mika-slot')===slot);
+                  const host=matches.length===1?matches[0]:null,r=host?.getBoundingClientRect(),style=host?getComputedStyle(host):null;
+                  const ready=document.readyState==='complete'&&window.__ready===true&&!!window.__type4&&!!host&&host.isConnected&&host.isContentEditable&&r.width>0&&r.height>0&&style.display!=='none'&&style.visibility!=='hidden';
+                  const page=ready&&\(includeSnapshot ? "true" : "false")?\(PageScript.extract):null;
+                  return JSON.stringify({href:location.href,documentReady:document.readyState,fixtureReady:window.__ready===true,apiReady:!!window.__type4,slot,matches:matches.length,
+                    viewport:{width:innerWidth,height:innerHeight},host:host?{connected:host.isConnected,editable:host.isContentEditable,width:r.width,height:r.height,display:style.display,visibility:style.visibility,index:host.getAttribute('data-mika-idx')}:null,
+                    ready,index:host?.getAttribute('data-mika-idx')||null,page,errors:window.__type4Errors||[]});
+                })()
+                """
+                last = ["isLoading":tab.webView.isLoading,"documentEpoch":tab.documentEpoch,
+                        "finishedEpoch":tab.finishedDocumentEpoch.map { $0 as Any } ?? NSNull(),"nativeReady":nativeReady,
+                        "frameWidth":Double(tab.webView.bounds.width),"frameHeight":Double(tab.webView.bounds.height),
+                        "pageError":tab.pageError ?? "", "applicationState":UIApplication.shared.applicationState.rawValue]
+                do {
+                    let raw = try await bindingProbe(probe, deadline:deadline)
+                    guard let observation = try JSONSerialization.jsonObject(with:Data(raw.utf8)) as? [String:Any] else {
+                        throw MikaError("Self-test host probe JSON shape invalid")
+                    }
+                    // Do not duplicate a full page snapshot in the binding diagnostics.
+                    last["hostState"] = observation.filter { $0.key != "page" }
+                    if first.isEmpty { first = last }
+                    if nativeReady && observation["ready"] as? Bool == true {
+                        var expected: PageElement?
+                        if snapshot, let pageJSON = observation["page"] as? String {
+                            do {
+                                let page = try JSONDecoder().decode(PageState.self, from:Data(pageJSON.utf8))
+                                last["snapshotElementCount"] = page.elements.count
+                                last["snapshotEditableIndices"] = page.elements.filter { $0.editable }.map { $0.index }
+                                if let indexText = observation["index"] as? String, let index = Int(indexText) {
+                                    expected = page.elements.first(where: { $0.index == index && $0.editable })
+                                }
+                            } catch { last["snapshotDecodeError"] = error.localizedDescription }
+                        }
+                        if !snapshot || expected != nil {
+                            records.append(["case":"host-binding","phase":snapshot ? "prepare" : "load", "slot":slot,
+                                            "status":"ready","waitedMs":Int((ProcessInfo.processInfo.systemUptime-started)*1000),
+                                            "attempts":attempts,"first":first,"last":last])
+                            return expected
+                        }
+                        last["reason"] = "host-not-in-production-snapshot"
+                    }
+                } catch {
+                    if error is CancellationError { throw error }
+                    last["probeError"] = error.localizedDescription
+                    if first.isEmpty { first = last }
+                }
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                if remaining > 0 { try await Task.sleep(for:.milliseconds(min(100, max(1, Int(remaining * 1000))))) }
+            }
+            let waited = Int((ProcessInfo.processInfo.systemUptime-started)*1000)
+            records.append(["case":"host-binding","phase":snapshot ? "prepare" : "load","slot":slot,
+                            "status":"timeout","waitedMs":waited,"attempts":attempts,"first":first,"last":last])
+            let state = String(decoding:try JSONSerialization.data(withJSONObject:last,options:[.sortedKeys]),as:UTF8.self)
+            throw MikaError("Self-test host binding timeout: \(slot), waitedMs=\(waited), attempts=\(attempts), state=\(state)")
+        }
+        @MainActor func prepare(_ text: String, slot: String = "primary") async throws -> (AgentAction, PageElement) {
+            guard let expected = try await waitForHost(slot, snapshot:true) else { throw MikaError("Self-test host binding missing snapshot: \(slot)") }
+            let data = try JSONSerialization.data(withJSONObject: ["action":"type", "index":expected.index,"text":text,"reason":"自检四十二"])
+            return (try JSONDecoder().decode(AgentAction.self, from:data), expected)
         }
         func record(_ name: String, exact: Bool? = nil, required: Bool = false) async throws {
             let raw = try await evaluate("JSON.stringify({attempt:window.__mikaTypeAttempt,faults:window.__faultEvidence,errors:window.__type4Errors})", on: tab) as? String ?? "{}"
@@ -2108,15 +2212,11 @@ enum TCProbeLogStore {
             if let exact { entry["exactCommitted"] = exact }
             records.append(entry)
         }
-        func loadFixture() async throws {
-            // A prior DOM-only/control path may make React unmount unsafe. Reload the document.
-            _ = try? await evaluate("window.__ready=false;true", on:tab)
+        @MainActor func loadFixture() async throws {
+            // Wait for this navigation's didFinish, not the prior document's ready flag.
+            let previousEpoch = tab.documentEpoch
             try tab.loadLocal("test-draft")
-            for _ in 0..<40 {
-                if (try? await bool("window.__ready===true && !!window.__type4")) == true { return }
-                try await Task.sleep(for:.milliseconds(100))
-            }
-            throw MikaError("Draft fixture readiness timeout")
+            _ = try await waitForHost("primary", afterEpoch:previousEpoch, snapshot:false)
         }
         do {
             let longText = String(repeating: "长文完整比较：段落和标点必须保留。\n\n", count: 200)
