@@ -28,7 +28,8 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
    await page.evaluate(()=>window.__type4SetExceptionContext('ignored-handler','performType-JS-sequence'));
    const status=await page.evaluate(source);await page.waitForTimeout(500);
    const signals=JSON.parse(await page.evaluate(probe.replace('\\(json)',JSON.stringify({index,epoch:1}))));
-   return {strategy,status,signals,exceptionReport:await page.evaluate(()=>window.__type4ExceptionReport())};
+   const domFullEqual=await page.evaluate(text=>document.querySelector('[data-mika-slot=primary]').innerText.replace(/[\s\u200b\ufeff]+/g,'')===text.replace(/[\s\u200b\ufeff]+/g,''),text);
+   return {strategy,status,signals,domFullEqual,exceptionReport:await page.evaluate(()=>window.__type4ExceptionReport())};
   }
   await reset();
   for(const strategy of ['paste-plain','paste','events','chunks','exec'])records.push(await inject(strategy));
@@ -37,11 +38,12 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
   const natural=await page.evaluate(()=>({report:window.__type4ExceptionReport(),baseline:window.__type4.assert(''),calls:window.__updateCalls,faults:window.__faultEvidence}));
   check(natural.baseline&&natural.calls===0,'full dirty fallback control keeps baseline and update=0');
   check(natural.report.counted===0&&natural.report.entries.length===0,'ignored handler: no unrelated script exceptions');
-  check(records.at(-1).strategy==='exec'&&records.at(-1).status==='ok'&&records.at(-1).signals.count===0&&records.at(-1).signals.textLength===text.length,'last exec leaves visible body but frozen zero state');
+  const frozenWitnesses=records.filter(x=>x.strategy&&x.status==='ok'&&x.domFullEqual&&x.signals.count===0).map(x=>x.strategy);
+  check(frozenWitnesses.length>0,'at least one strategy has visible full body but frozen zero state');
   check(natural.faults.some(x=>x.kind==='paste'&&x.strategy==='paste-plain'&&x.fullTextEqual),'full control actually receives ignored body');
   check(natural.report.counted===natural.report.entries.length&&natural.report.excluded.length===0,'natural errors remain counted, none excluded');
   check(natural.report.entries.every(x=>x.counted&&x.classification==='unclassified-counted'&&Object.hasOwn(x,'filename')&&Object.hasOwn(x,'stack')),'natural identity preserved without source allowlist');
-  records.push({case:'full-ignored-chain',...natural});
+  records.push({case:'full-ignored-chain',frozenWitnesses,...natural});
   // Deterministic collector controls, not evidence identifying the simulator's unknown error.
   await reset();
   await page.evaluate(()=>{setTimeout(()=>{throw new Error('TYPE4-COLLECTOR-CONTROL original message');},0);

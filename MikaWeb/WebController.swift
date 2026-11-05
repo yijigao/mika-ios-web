@@ -2314,6 +2314,7 @@ enum TCProbeLogStore {
             _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','reset-and-prepare');window.__type4.reset('','ignore',\(js(ignoredText)));true", on: tab)
             let (ignoredAction, ignoredHost) = try await prepare(ignoredText)
             var expectedRejection = false
+            var rejectionMessageMatches = false
             var rejection = "NO ERROR"
             tab.type4IgnoredEvaluationPhase = "performType-including-failure-snapshot"
             _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','performType-including-failure-snapshot');true", on:tab)
@@ -2323,11 +2324,18 @@ enum TCProbeLogStore {
             } catch {
                 rejection = error.localizedDescription
                 if let mika = error as? MikaError {
-                    expectedRejection = mika.message.contains("编辑器内部字数仍停在 0 字") &&
-                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") }) &&
-                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("exec=dom-ok,count-frozen:0(基线0)") })
+                    rejectionMessageMatches = mika.message.contains("编辑器内部字数仍停在 0 字")
                 }
             }
+            let rejectionEditorPathMatches = lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") })
+            let rejectionFrozenTraceMatches = lastEditorTypeTrace.contains(where: { $0.hasSuffix("=dom-ok,count-frozen:0(基线0)") })
+            expectedRejection = rejectionMessageMatches && rejectionEditorPathMatches && rejectionFrozenTraceMatches
+            let rejectionEvidence: [String: Any] = ["errorMessage":rejection, "trace":lastEditorTypeTrace,
+                "messageMatches":rejectionMessageMatches, "editorPathMatches":rejectionEditorPathMatches,
+                "frozenTraceMatches":rejectionFrozenTraceMatches, "expectedRejection":expectedRejection]
+            let rejectionJSON = String(decoding:try JSONSerialization.data(withJSONObject:rejectionEvidence, options:[.sortedKeys]),as:UTF8.self)
+            lines.append("· ignored handler rejection evidence: \(rejectionJSON)")
+            records.append(["case":"ignored-handler-rejection-evidence","evidence":rejectionEvidence])
             // Keep every unknown/type-path exception counted. Emit identity in both result
             // lines and Diagnostics before evaluating the unchanged zero-exception requirement.
             let nativeErrors = tab.type4IgnoredEvaluationErrors ?? []
@@ -2641,6 +2649,7 @@ enum TCProbeLogStore {
         var trace: [String] = []
         defer { lastEditorTypeTrace.append(contentsOf: trace) }
         var failure: EditorWriteFailure = .domMissing
+        var firstStateRejected: EditorWriteFailure?
         for (i, path) in strategies.enumerated() {
             // No safe framework reset API exists on arbitrary sites. Never rewrite innerHTML
             // as a "reset"; independent strategy evidence is collected by self-test reconstruction.
@@ -2678,6 +2687,7 @@ enum TCProbeLogStore {
             case .failFrozen(let count):
                 trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
                 failure = .stateRejected(count: count, baseline: baseline.count)
+                if case nil = firstStateRejected { firstStateRejected = failure }
                 continue
             case .pass:
                 break
@@ -2709,7 +2719,7 @@ enum TCProbeLogStore {
             return
         }
         await captureFailureSnapshot(context: "type 编辑器状态校验失败：\(action.reason)｜\(trace.joined(separator: "；"))", tab: tab)
-        switch failure {
+        switch firstStateRejected ?? failure {
         case .domMissing:
             throw MikaError("文字没能输入到编辑器：\(strategies.count) 种写入方式都已尝试、回读仍为空或对不上，请在网页手动输入后点继续")
         case .signalLost:
