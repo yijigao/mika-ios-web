@@ -25,6 +25,7 @@ enum TypeVerifyPolicy {
     /// Keep the existing count tolerance and baseline growth fallback unchanged.
     static func countConsistent(_ count: Int, expected: Int, baseline: Int?) -> Bool {
         if expected == 0 { return true }
+        if count == 0 { return false }
         let low = max(0, Int(Double(expected) * 0.85) - 5)
         let high = Int(Double(expected) * 1.15) + 10
         if count >= low && count <= high { return true }

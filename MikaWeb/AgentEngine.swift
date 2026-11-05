@@ -2621,6 +2621,12 @@ struct OpenStall {
     // Self-test 42 runs in an isolated WKWebView without model calls.
     func verifyDraftType4() async -> [String] { await web.verifyDraftType4() }
 
+    /// Self-test 45 observes only the current visible tab, with one paste-plain attempt.
+    func verifyRealPageDraftOnce() async -> String {
+        guard !busy else { return #"{"conclusion":"unobservable","reason":"engine busy; no attempt executed","attempts":0}"# }
+        return await web.verifyRealPageDraftOnce()
+    }
+
     func verifyFrameProbe() async -> [String] {
         guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyFrameProbeAndClick()

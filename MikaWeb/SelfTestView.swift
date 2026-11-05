@@ -33,6 +33,9 @@ struct SelfTestView: View {
     @State private var typeVerifyTestRunning = false
     @State private var drawerDismissTestRunning = false
     @State private var browserChromeTestRunning = false
+    @State private var realPageForensicsRunning = false
+    @State private var realPageForensicsJSON: String?
+    @State private var realPageForensicsSummary: String?
     var body: some View {
         List {
             Text("加载本地页面，仍使用真实模型调用；任务在 App 前台内执行。")
@@ -314,6 +317,35 @@ struct SelfTestView: View {
                 conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十四：FAIL，见逐项记录" : "自检四十四：Tier A PASS；worker 交接、模型与 UI 联动待 CI/真机")
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检四十五：真页 Draft 单发取证") {
+                guard !realPageForensicsRunning else { return }
+                realPageForensicsRunning = true
+                Task { @MainActor in
+                    let json = await engine.verifyRealPageDraftOnce()
+                    realPageForensicsJSON = json
+                    if let data = json.data(using:.utf8),
+                       let result = try? JSONSerialization.jsonObject(with:data) as? [String:Any] {
+                        realPageForensicsSummary = "结论：\(result["conclusion"] as? String ?? "unobservable")。\(result["reason"] as? String ?? "证据不足")"
+                    } else {
+                        realPageForensicsSummary = "结论：unobservable。结果 JSON 无法解析"
+                    }
+                    realPageForensicsRunning = false
+                }
+            }.disabled(!engine.active || realPageForensicsRunning)
+            Text("当前可见页面首个 contenteditable；仅一次 paste-plain，不导航、不提交。结果保留在本页，可长按复制完整 JSON。")
+                .font(.caption).foregroundStyle(.secondary)
+            if realPageForensicsRunning { ProgressView("真页取证中") }
+            if let realPageForensicsSummary { Text(realPageForensicsSummary).font(.subheadline) }
+            if let realPageForensicsJSON {
+                ScrollView {
+                    Text(realPageForensicsJSON)
+                        .font(.system(.caption, design:.monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth:.infinity, alignment:.leading)
+                }
+                .frame(height:320)
+                .accessibilityLabel("自检四十五完整 JSON")
+            }
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
@@ -505,6 +537,10 @@ struct SelfTestView: View {
         check(verdict(0, nil, true) == .failSignalLost, "基线 0、写后无信号：failSignalLost")
         check(verdict(nil, nil, true) == .pass, "前后都无信号：pass")
         check(verdict(0, 0, true) == .failFrozen(0), "字数冻结在 0：failFrozen")
+        check(TypeVerifyPolicy.verdict(baselineCount: 0, postCount: 0, textOK: true,
+                                       expectedCount: 1, longForm: false) == .failFrozen(0), "1 字写入、字数 0：failFrozen")
+        check(TypeVerifyPolicy.verdict(baselineCount: 0, postCount: 0, textOK: true,
+                                       expectedCount: 7, longForm: false) == .failFrozen(0), "7 字写入、字数 0：failFrozen")
         check(verdict(0, 1236, true) == .pass, "目标 1236 字：pass")
         check(verdict(100, 1300, true) == .pass, "基线 100、写后 1300：pass")
         check(verdict(1000, 2236, true) == .pass, "基线 1000、写后 2236：增长兜底 pass")

@@ -2493,6 +2493,137 @@ enum TCProbeLogStore {
         } catch { /* Diagnostics never changes the fail-closed verdict. */ }
     }
 
+    /// Self-test 45. This probe uses the visible tab and never enters performType's retry ladder.
+    func verifyRealPageDraftOnce() async -> String {
+        let tab = activeTab
+        let probeText = String(repeating: "忽略处理器不得提交这段正文。", count: 4)
+        var report: [String: Any] = ["kind":"realpage-forensics", "runtime":"WKWebView",
+            "probeText":probeText, "probeUTF16Length":probeText.utf16.count,
+            "pageURL":tab.webView.url?.absoluteString ?? "unobservable",
+            "documentEpoch":tab.documentEpoch, "attempts":0]
+        func encoded(_ value: Any) -> String {
+            guard let data = try? JSONSerialization.data(withJSONObject:value, options:[.sortedKeys, .prettyPrinted]) else { return "{}" }
+            return String(decoding:data,as:UTF8.self)
+        }
+        func finish(_ conclusion: String, _ reason: String) -> String {
+            report["conclusion"] = conclusion
+            report["reason"] = reason
+            Self.storeType4Diagnostic(report)
+            return encoded(report)
+        }
+        do {
+            // The production extractor owns data-mika-idx. Do not assign an index by hand.
+            guard let pageJSON = try await evaluate(PageScript.extract, on:tab) as? String,
+                  let page = try? JSONDecoder().decode(PageState.self, from:Data(pageJSON.utf8)) else {
+                return finish("unobservable", "production snapshot unavailable")
+            }
+            guard let indexText = try await evaluate("""
+            (()=>{const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+            const host=[...document.querySelectorAll('[contenteditable="true"]')].find(vis);
+            return host?host.getAttribute('data-mika-idx'):null;})()
+            """, on:tab) as? String,
+                  let index = Int(indexText),
+                  let expected = page.elements.first(where:{$0.index == index && $0.editable}) else {
+                return finish("unobservable", "first visible contenteditable is absent or not bound to production snapshot")
+            }
+            let actionJSON = try JSONSerialization.data(withJSONObject:["action":"type", "index":index,
+                "text":probeText, "reason":"自检四十五真页单发取证"])
+            let action = try JSONDecoder().decode(AgentAction.self, from:actionJSON)
+            report["targetIndex"] = index
+            let install = #"""
+            (()=>{
+              const index=__INDEX__, expected=__TEXT__;
+              const vis=x=>{if(!x)return false;const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+              const first=[...document.querySelectorAll('[contenteditable="true"]')].find(vis);
+              const host=document.querySelector('[data-mika-idx="'+index+'"]');
+              if(!host||host!==first)return JSON.stringify({ready:false,reason:'target changed before instrumentation'});
+              const path=x=>{if(!x)return null;if(x.nodeType===3)return path(x.parentElement)+' > #text';const parts=[];for(let n=x;n&&n.nodeType===1;n=n.parentElement){const peers=n.parentElement?[...n.parentElement.children].filter(y=>y.tagName===n.tagName):[];parts.unshift(n.tagName.toLowerCase()+(n.id?'#'+n.id:'')+(peers.length>1?':nth-of-type('+(peers.indexOf(n)+1)+')':''));if(n===document.documentElement)break;}return parts.join(' > ');};
+              const node=x=>x?{path:path(x),tag:x.nodeType===1?x.tagName.toLowerCase():'#text',offsetKey:x.nodeType===1?x.closest('[data-offset-key]')?.getAttribute('data-offset-key')||null:x.parentElement?.closest('[data-offset-key]')?.getAttribute('data-offset-key')||null}:null;
+              const stateText=s=>{try{return s?.getCurrentContent?.().getPlainText('\n')??null;}catch(e){return null;}};
+              const candidateRecord=s=>{const value=stateText(s);return {text:value===null?null:value.slice(0,expected.length+120),length:value?.length??null,fullTextEqual:value===expected};};
+              const findDraft=()=>{const seen=new Set();let fiber=null;for(const k of Object.keys(host)){if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')){fiber=host[k];break;}}for(let f=fiber;f&&!seen.has(f);f=f.return){seen.add(f);const i=f.stateNode;if(i&&i.editor===host&&typeof i.update==='function')return i;}return null;};
+              const record={target:{tag:host.tagName.toLowerCase(),className:String(host.className||'').slice(0,160),dataMikaIdx:host.getAttribute('data-mika-idx'),idxMatched:true,documentURL:host.ownerDocument.URL,documentIsCurrent:host.ownerDocument===document},focusBefore:node(document.activeElement),selectionBefore:null,events:{window:[],document:[],editor:[],defaultPrevented:'unobservable',propagationStoppedBeforeEditor:'unobservable'},draft:{found:false,reason:'unobservable: no DraftEditor instance with instance.editor === host',updateCalls:[],onChangeCalls:[],handler:{status:'unobservable',reason:'React handler closure cannot be safely intercepted'}},exceptions:[],snapshots:[]};
+              const selection=()=>{const s=window.getSelection();return s?{anchor:node(s.anchorNode),anchorOffset:s.anchorOffset,focus:node(s.focusNode),focusOffset:s.focusOffset}:null;};
+              record.selectionBefore=selection();
+              const cleanup=[];
+              for(const [name,target] of [['window',window],['document',document],['editor',host]]){const cb=e=>{let body=null,error=null;try{body=e.clipboardData?.getData('text/plain')??null;}catch(err){error=String(err);}record.events[name].push({type:e.type,target:node(e.target),length:body===null?null:body.length,fullTextEqual:body===null?null:body===expected,error,defaultPrevented:e.defaultPrevented,cancelBubble:e.cancelBubble});};target.addEventListener('paste',cb,true);cleanup.push(()=>target.removeEventListener('paste',cb,true));}
+              const oldError=window.onerror;
+              window.onerror=function(message,source,line,column,error){record.exceptions.push({kind:'onerror',message:String(message),source:source||null,line:line||null,column:column||null,stack:error?.stack||null});if(typeof oldError==='function')return oldError.apply(this,arguments);return false;};
+              cleanup.push(()=>{window.onerror=oldError;});
+              const inst=findDraft();
+              if(inst){record.draft.found=true;record.draft.reason=null;const originalUpdate=inst.update;inst.update=function(next){record.draft.updateCalls.push({atMs:performance.now(),...candidateRecord(next)});return originalUpdate.apply(this,arguments);};cleanup.push(()=>{inst.update=originalUpdate;});
+                const props=inst.props,originalChange=props?.onChange;
+                if(props&&typeof originalChange==='function'&&!Object.isFrozen(props)){try{props.onChange=function(next){record.draft.onChangeCalls.push({atMs:performance.now(),...candidateRecord(next)});return originalChange.apply(this,arguments);};record.draft.onChangeObservable=true;cleanup.push(()=>{props.onChange=originalChange;});}catch(e){record.draft.onChangeObservable=false;record.draft.onChangeReason='unobservable: '+String(e);}}
+                else{record.draft.onChangeObservable=false;record.draft.onChangeReason='unobservable: onChange unavailable or props frozen';}
+                const originalHandle=props?.handlePastedText;
+                if(props&&typeof originalHandle==='function'&&!Object.isFrozen(props)){try{props.handlePastedText=function(text){const call={atMs:performance.now(),length:text?.length??null,fullTextEqual:text===expected,returnValue:'unobservable',exception:null};record.draft.handler.calls.push(call);try{const result=originalHandle.apply(this,arguments);call.returnValue=String(result);return result;}catch(e){call.exception=String(e);throw e;}};record.draft.handler={status:'observable',entry:'handlePastedText',calls:[]};cleanup.push(()=>{props.handlePastedText=originalHandle;});}catch(e){record.draft.handler={status:'unobservable',reason:'handlePastedText wrapper unavailable: '+String(e)};}}
+                else{record.draft.handler={status:'unobservable',reason:'handlePastedText absent or props frozen; Draft internal onPaste closure cannot be safely intercepted'};}
+              }
+              const api={record,host,expected,selection,node,findDraft,snapshot:phase=>{const current=findDraft(),candidate=record.draft.updateCalls[record.draft.updateCalls.length-1]||null;const s={phase,atMs:performance.now(),focus:node(document.activeElement),selection:selection(),hostConnected:host.isConnected,domText:host.innerText||'',domFullTextEqual:(host.innerText||'').replace(/\r\n?/g,'\n')===expected,candidateText:candidate?.text??null,candidateFullTextEqual:candidate?.fullTextEqual??null,committedText:current?stateText(current.props?.editorState):null,committedObservable:!!current&&!!current.props?.editorState,countNode:window.__mikaEditorSignalsDiagnostic||{reason:'unobservable: signal probe did not return a node'}};s.committedFullTextEqual=s.committedObservable?s.committedText===expected:null;record.snapshots.push(s);return s;},finish:()=>{const ev=window.__mikaTypeAttempt;record.typeAttempt=ev||{status:'unobservable',reason:'production attempt record absent'};record.events.defaultPrevented=ev?.hops?.find(x=>x.status==='dispatch-complete')?.defaultPrevented??'unobservable';const hit=record.events.editor.length>0,upper=record.events.window.length>0||record.events.document.length>0;record.events.propagationStoppedBeforeEditor=hit?false:upper?true:'unobservable';record.focusAfter=node(document.activeElement);record.selectionAfter=selection();for(const undo of cleanup.reverse())try{undo();}catch(e){record.exceptions.push({kind:'cleanup',message:String(e)});}return record;}};
+              window.__mikaRealPageForensics=api;
+              return JSON.stringify({ready:true,target:record.target});
+            })()
+            """#
+            let installScript = install.replacingOccurrences(of:"__INDEX__", with:String(index))
+                .replacingOccurrences(of:"__TEXT__", with:String(decoding:try JSONEncoder().encode(probeText),as:UTF8.self))
+            guard let raw = try await evaluate(installScript,on:tab) as? String,
+                  let setup = try JSONSerialization.jsonObject(with:Data(raw.utf8)) as? [String:Any],
+                  setup["ready"] as? Bool == true else {
+                return finish("unobservable", "target changed before instrumentation")
+            }
+            report["target"] = setup["target"] ?? NSNull()
+            do {
+                report["attempts"] = 1
+                report["injectionResult"] = try await runTypeScript(action:action, expected:expected,
+                    approved:false, path:"paste-plain", tab:tab)
+            } catch { report["injectionError"] = error.localizedDescription }
+            var timeline: [[String:Any]] = []
+            for (phase, delay) in [("t0",0),("t300",300),("t1000",700)] {
+                if delay > 0 { try await Task.sleep(for:.milliseconds(delay)) }
+                do {
+                    let signals = try await probeEditorSignals(action:action,tab:tab,diagnostic:true)
+                    let snapshotRaw = try await evaluate("JSON.stringify(window.__mikaRealPageForensics.snapshot('\(phase)'))",on:tab) as? String ?? "{}"
+                    var sample = try JSONSerialization.jsonObject(with:Data(snapshotRaw.utf8)) as? [String:Any] ?? [:]
+                    sample["probeCount"] = signals.count.map{$0 as Any} ?? NSNull()
+                    sample["probeFound"] = signals.found
+                    timeline.append(sample)
+                } catch { timeline.append(["phase":phase,"status":"unobservable","reason":error.localizedDescription]) }
+            }
+            report["timeline"] = timeline
+            let recordRaw = try await evaluate("JSON.stringify(window.__mikaRealPageForensics.finish())",on:tab) as? String ?? "{}"
+            let evidence = try JSONSerialization.jsonObject(with:Data(recordRaw.utf8)) as? [String:Any] ?? [:]
+            report["evidence"] = evidence
+            let events = evidence["events"] as? [String:Any] ?? [:]
+            let hostEvents = events["editor"] as? [[String:Any]] ?? []
+            let draft = evidence["draft"] as? [String:Any] ?? [:]
+            let updates = draft["updateCalls"] as? [[String:Any]] ?? []
+            let changes = draft["onChangeCalls"] as? [[String:Any]] ?? []
+            let finalSample = timeline.last ?? [:]
+            let committed = finalSample["committedFullTextEqual"] as? Bool == true
+            let count = finalSample["probeCount"] as? Int
+            let fullCandidate = (updates + changes).contains{$0["fullTextEqual"] as? Bool == true}
+            let fullPayload = hostEvents.contains{$0["fullTextEqual"] as? Bool == true}
+            let truncated = hostEvents.contains{$0["fullTextEqual"] as? Bool == false}
+            let conclusion: String
+            let reason: String
+            if committed && count == 0 { conclusion="probe-binding"; reason="committed text is exact at +1000ms, selected count remains zero" }
+            else if hostEvents.isEmpty && report["injectionError"] != nil { conclusion="unobservable"; reason="injection failed before a confirmed paste dispatch" }
+            else if hostEvents.isEmpty { conclusion="event-access"; reason="paste did not reach editor capture listener" }
+            else if truncated { conclusion="payload"; reason="editor capture listener received a nonmatching clipboard body" }
+            else if fullCandidate && !committed { conclusion="app-reject-or-rollback"; reason="complete Draft candidate was generated but +1000ms committed state differs" }
+            else if fullPayload && draft["found"] as? Bool == true && updates.isEmpty { conclusion="takeover-no-update"; reason="complete paste reached host; instrumented Draft update recorded no candidate" }
+            else { conclusion="unobservable"; reason=committed ? "committed text is exact; failure taxonomy has no success branch" : "required handler, candidate, or committed state evidence unavailable" }
+            return finish(conclusion,reason)
+        } catch {
+            if let raw = try? await evaluate("window.__mikaRealPageForensics?JSON.stringify(window.__mikaRealPageForensics.finish()):null",on:tab),
+               let json = raw as? String,
+               let evidence = try? JSONSerialization.jsonObject(with:Data(json.utf8)) {
+                report["evidence"] = evidence
+            }
+            return finish("unobservable",error.localizedDescription)
+        }
+    }
+
     private struct TypeVerification: Decodable {
         struct Submit: Decodable { let text: String; let disabled: Bool }
         let found: Bool
@@ -2585,7 +2716,8 @@ enum TCProbeLogStore {
     /// 在编辑器作用域内找短文案里的字数与保存状态；字数未命中时限量扫全页，
     /// 按到最近共同祖先的上行步数选最近计数。编辑器自身内容不参与匹配；「保存中」优先于「已保存」（保存进行
     /// 时旧的已保存标签可能同时在场，活动状态说了算）。
-    private func probeEditorSignals(action: AgentAction, tab: BrowserTab) async throws -> EditorSignals {
+    private func probeEditorSignals(action: AgentAction, tab: BrowserTab, diagnostic: Bool = false) async throws -> EditorSignals {
+        if diagnostic { _ = try await evaluate("window.__mikaEditorSignalsDiagnosticEnabled=true;window.__mikaEditorSignalsDiagnostic=null;true", on:tab) }
         let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "epoch": tab.documentEpoch])
         let json = String(decoding: data, as: UTF8.self)
         guard let raw = try await evaluate("""
@@ -2594,7 +2726,7 @@ enum TCProbeLogStore {
         let ed=document.querySelector('[data-mika-idx="'+a.index+'"]');
         const locatedByIndex=!!(ed&&ed.isContentEditable);
         if(!ed||!ed.isContentEditable)ed=[...document.querySelectorAll('[contenteditable="true"]')].find(vis)||null;
-        if(!ed||!ed.isContentEditable)return JSON.stringify({found:false,locatedByIndex:false,count:null,saveState:null,textLength:0});
+        if(!ed||!ed.isContentEditable){if(window.__mikaEditorSignalsDiagnosticEnabled===true){window.__mikaEditorSignalsDiagnostic={reason:'unobservable: editor absent during signal probe'};window.__mikaEditorSignalsDiagnosticEnabled=false;}return JSON.stringify({found:false,locatedByIndex:false,count:null,saveState:null,textLength:0});}
         const textLength=(ed.innerText||'').length;
         const countRe=/(?:字数|words?|characters?)\\s*[:：]?\\s*(\\d{1,7})/i;
         const savingRe=/保存中|正在保存|saving/i, savedRe=/已保存|保存成功|草稿已保存|上次保存|最近保存|保存于|saved/i;
@@ -2602,9 +2734,11 @@ enum TCProbeLogStore {
         const key='__mikaEditorSignals',old=window[key];
         let nodes=old&&old.epoch===a.epoch&&old.editor===ed&&old.root===root&&old.nodes.every(x=>x.isConnected&&root.contains(x))?old.nodes:null;
         if(!nodes){nodes=[...root.querySelectorAll('*')].filter(x=>{if(ed.contains(x)||x.contains(ed))return false;const t=(x.innerText||'').trim();return (t.length<=40&&(countRe.test(t)||savingRe.test(t)||savedRe.test(t)))||/save|status|count|word|character/i.test((x.id||'')+' '+(x.className||''));});window[key]={epoch:a.epoch,editor:ed,root:root,nodes:nodes};}
-        const cands=nodes.filter(vis).map(x=>(x.innerText||'').trim()).filter(t=>t&&t.length<=40);
+        const countNodes=nodes.filter(vis).filter(x=>{const t=(x.innerText||'').trim();return t&&t.length<=40;});
+        const cands=countNodes.map(x=>(x.innerText||'').trim());
         let count=null;
-        for(const t of cands){const m=t.match(countRe);if(m){count=parseInt(m[1],10);break;}}
+        let countNode=null,countStage=null;
+        for(let i=0;i<cands.length;i++){const m=cands[i].match(countRe);if(m){count=parseInt(m[1],10);countNode=countNodes[i];countStage='editor-root';break;}}
         if(count===null){
             const editorSteps=new Map();let depth=0;
             for(let p=ed;p;p=p.parentElement)editorSteps.set(p,depth++);
@@ -2620,13 +2754,18 @@ enum TCProbeLogStore {
                 while(p&&!editorSteps.has(p)){p=p.parentElement;up++;}
                 if(!p)continue;
                 const distance=up+editorSteps.get(p);
-                if(distance<nearestDistance){nearestDistance=distance;nearest=parseInt(m[1],10);}
+                if(distance<nearestDistance){nearestDistance=distance;nearest=parseInt(m[1],10);countNode=x;countStage='whole-page-fallback';}
             }
             count=nearest;
         }
         let saveState=null;
         if(cands.some(t=>savingRe.test(t)))saveState='saving';
         else if(cands.some(t=>savedRe.test(t)))saveState='saved';
+        if(window.__mikaEditorSignalsDiagnosticEnabled===true){
+            const nodePath=x=>{if(!x)return null;const parts=[];for(let n=x;n&&n.nodeType===1;n=n.parentElement){const siblings=n.parentElement?[...n.parentElement.children].filter(y=>y.tagName===n.tagName):[];parts.unshift(n.tagName.toLowerCase()+(n.id?'#'+n.id:'')+(siblings.length>1?':nth-of-type('+(siblings.indexOf(n)+1)+')':''));if(n===document.documentElement)break;}return parts.join(' > ');};
+            window.__mikaEditorSignalsDiagnostic={nodePath:nodePath(countNode),rawText:countNode?(countNode.innerText||countNode.textContent||''):null,visible:countNode?vis(countNode):null,stage:countStage||'unobservable',rootPath:nodePath(root),editorPath:nodePath(ed),count:count,reason:countNode?null:'no matching count node'};
+            window.__mikaEditorSignalsDiagnosticEnabled=false;
+        }
         return JSON.stringify({found:true,locatedByIndex:locatedByIndex,count:count,saveState:saveState,textLength:textLength});})()
         """, on: tab) as? String, let decoded = try? JSONDecoder().decode(EditorSignals.self, from: Data(raw.utf8)) else {
             throw MikaError("编辑器状态探针失败（页面无响应）")
