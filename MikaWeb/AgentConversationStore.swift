@@ -2,47 +2,6 @@ import SwiftUI
 import Combine
 import UIKit
 
-enum ChatEntryKind: String, Equatable, Codable { case userTask, userAnswer, process, result, error, pause, question, manual, local }
-enum ChatEntrySource: String, Codable { case userTask, userAnswer, engineStep, engineStatus, localValidation }
-struct ChatEntry: Identifiable {
-    let id: UUID
-    let taskID: UUID?
-    let createdAt: Date
-    let kind: ChatEntryKind
-    let text: String
-    let stepID: Int?
-    let action: String?
-    let reason: String?
-    let source: ChatEntrySource
-    init(taskID: UUID?, kind: ChatEntryKind, text: String, stepID: Int? = nil, action: String? = nil, reason: String? = nil, source: ChatEntrySource) {
-        id = UUID(); self.taskID = taskID; createdAt = Date(); self.kind = kind; self.text = text
-        self.stepID = stepID; self.action = action; self.reason = reason; self.source = source
-    }
-    /// 从持久化记录还原（保留原 id 与时间戳，见 AgentConversationStore 的条目持久化）。
-    init(restoring p: PersistedChatEntry) {
-        id = p.id; self.taskID = p.taskID; createdAt = p.createdAt; self.kind = p.kind; self.text = p.text
-        self.stepID = p.stepID; self.action = p.action; self.reason = p.reason; self.source = p.source
-    }
-}
-
-/// 对话条目的持久化形态（Codable 镜像）：与 ChatEntry 分开，避免给 UI 模型
-/// 本身加编解码负担；字段一一对应、还原时不改 id／时间戳。
-struct PersistedChatEntry: Codable {
-    let id: UUID
-    let taskID: UUID?
-    let createdAt: Date
-    let kind: ChatEntryKind
-    let text: String
-    let stepID: Int?
-    let action: String?
-    let reason: String?
-    let source: ChatEntrySource
-    init(_ e: ChatEntry) {
-        id = e.id; taskID = e.taskID; createdAt = e.createdAt; kind = e.kind; text = e.text
-        stepID = e.stepID; action = e.action; reason = e.reason; source = e.source
-    }
-}
-
 @MainActor final class AgentConversationStore: ObservableObject {
     @Published private(set) var entries: [ChatEntry] = []
     @Published var draft = ""
@@ -78,6 +37,7 @@ struct PersistedChatEntry: Codable {
         guard !bound else { return }
         bound = true
         engineRef = engine
+        engine.bindSteeringConversation(self)
         if uiObservers.isEmpty {
             uiObservers.append(NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.batching = true }
@@ -126,6 +86,7 @@ struct PersistedChatEntry: Codable {
         }.store(in: &cancellables)
         engine.$status.sink { [weak self, weak engine] state in
             guard let self, let engine else { return }
+            engine.steeringStatusChanged(state)
             let id = engine.conversationTaskID ?? self.taskID
             switch state {
             case .done(let text): self.route(ChatEntry(taskID: id, kind: .result, text: text, source: .engineStatus), engine: engine)
@@ -204,6 +165,27 @@ struct PersistedChatEntry: Codable {
         localFeedback("提示：\(shownHost) 刚才想用通行密钥（passkey）登录，但 iOS 不允许在 Mika Web 的内置浏览器里弹出通行密钥确认框——只有 Safari 和拿到 Apple 专门授权的浏览器能调它，这边弹不出来。请改用密码在这里登录一次（在 Safari 里登录不会同步到 Mika Web，两边状态是分开的）。")
     }
     func acceptedAnswer(_ text: String) { append(ChatEntry(taskID: taskID, kind: .userAnswer, text: text, source: .userAnswer)) }
+    /// 侧车先写、条目后写；固定条目 ID 让崩溃恢复补写可幂等重试。
+    /// 只更新插话新增字段，不改变既有条目的生成、路由和后台攒批口径。
+    func materializeSteering(_ state: SteerState) throws {
+        let current = state.sessionID == displayedSessionID
+        let url = SessionStore.shared.entriesURL(for: state.sessionID)
+        var logical: [ChatEntry]
+        if current { logical = entries + batchedEntries }
+        else if FileManager.default.fileExists(atPath: url.path) {
+            logical = try JSONDecoder().decode([PersistedChatEntry].self, from: Data(contentsOf: url)).map { ChatEntry(restoring: $0) }
+        } else { logical = [] }
+        logical = SteerProjection.apply(state, to: logical)
+        let retained = Array(logical.suffix(Self.sessionEntryCap))
+        try JSONEncoder().encode(retained.map { PersistedChatEntry($0) }).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        if current {
+            let batchedIDs = Set(batchedEntries.map { $0.id })
+            let previousIDs = Set(entries.map { $0.id })
+            entries = logical.filter { !batchedIDs.contains($0.id) && (!batching || previousIDs.contains($0.id)) }
+            batchedEntries = logical.filter { batchedIDs.contains($0.id) || (batching && !previousIDs.contains($0.id)) }
+        }
+        SessionStore.shared.touch(id: state.sessionID)
+    }
     private func append(_ entry: ChatEntry) {
         if batching { batchedEntries.append(entry) } else { entries.append(entry) }
         if entry.kind == .userTask {
