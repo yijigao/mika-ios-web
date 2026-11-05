@@ -238,6 +238,8 @@ struct SessionListView: View {
     }
 
     private func canDelete(_ meta: SessionMeta) -> Bool {
+        // 中断正在等原 worker 退出时保留启动权；删除不能经 finishTaskFromUser 抢先推进队列。
+        guard !(engine.interruptInFlight && meta.id == engine.runSessionID) else { return false }
         guard store.sessions.count > 1 else { return false }
         return true
     }

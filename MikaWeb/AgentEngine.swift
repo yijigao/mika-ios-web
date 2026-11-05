@@ -712,6 +712,12 @@ struct OpenStall {
     private let settings: SettingsStore
     private var worker: Task<Void, Never>?
     private var generation = UUID()
+    @Published private(set) var pendingSteers: [SteerItem] = []
+    @Published private(set) var pendingInterrupt: SteerInterrupt?
+    @Published private(set) var interruptInFlight = false
+    private weak var steeringConversation: AgentConversationStore?
+    private var steeringSidecars: [UUID: SteerSidecar] = [:]
+    private var acceptedSteerQueueIDs: Set<UUID> = []
     /// 执行代次绑定（M1，2026-11-02——既有代次机制的正式化）：每次 launch
     /// 换代，代次与 (runSessionID, conversationTaskID) 一起记入
     /// activeRunContext；worker 在每轮 checkpoint 与每次模型返回后校验
@@ -961,15 +967,23 @@ struct OpenStall {
     /// startQueued 共用。先在旧 runSessionID 下 stop() 收尾旧任务，再把
     /// 归属切到目标会话——此后状态重置、快照与执行绑定都按目标会话走
     /// （旧会话已暂停任务的快照留在它自己的目录里，切回时可恢复）。
-    private func startInSession(_ sessionID: UUID, local: String?, task: String?) {
+    private func startInSession(_ sessionID: UUID, local: String?, task: String?, startingID: UUID? = nil) {
+        guard !interruptInFlight else { return }
+        if let request = steeringSidecars[sessionID]?.interrupt, request.startingID != startingID {
+            steeringConversation?.localFeedback("还有中断待发文字，请先重试或撤回")
+            return
+        }
         stop()
         if let oldTaskID = conversationTaskID { readbackTabs.endTask(oldTaskID) }
         replacedReadbackTabIDs.removeAll()
         runSessionID = sessionID
+        refreshPendingSteers()
         guard active else { status = .paused("任务只能在前台执行"); return }
         if let issue = modelReadinessIssue() { status = .failed(issue); return }
         if let task { taskText = task }
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
+        do { try prepareSteersForNewTask(in: sessionID) }
+        catch { status = .failed("插话去向未能保存，暂未启动新任务：\(error.localizedDescription)"); return }
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; thermalPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
@@ -983,7 +997,8 @@ struct OpenStall {
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
-        conversationTaskID = UUID()
+        conversationTaskID = startingID ?? UUID()
+        refreshPendingSteers()
         autoTitleSessionIfPlaceholder()
         // 任务绑定到该会话当时的活跃标签页：全程作用于它，用户中途切页／
         // 切会话不影响任务（TABS-IMPL＋M1）。本地页加载走执行页通道——
@@ -991,6 +1006,294 @@ struct OpenStall {
         web.beginExecution(sessionID: sessionID)
         do { if let local { try web.loadLocalOnExecutionTab(local) } } catch { web.endExecution(); status = .failed(error.localizedDescription); return }
         launch()
+    }
+    // MARK: - STEER：侧车事务、唯一消费点与中断串行仲裁
+
+    private func steerFile(_ sessionID: UUID) -> SteerSidecarFile {
+        SteerSidecarFile(url: SessionStore.shared.snapshotURL(for: sessionID).deletingLastPathComponent().appendingPathComponent("steers.json"))
+    }
+    private func sidecar(_ sessionID: UUID) throws -> SteerSidecar {
+        if let cached = steeringSidecars[sessionID] { return cached }
+        let value = try steerFile(sessionID).load()
+        steeringSidecars[sessionID] = value
+        return value
+    }
+    private func saveSidecar(_ value: SteerSidecar, in sessionID: UUID) throws {
+        try steerFile(sessionID).save(value)
+        steeringSidecars[sessionID] = value
+        refreshPendingSteers()
+    }
+    private var currentSteerState: SteerState? {
+        steeringSidecars[runSessionID]?.tasks.first { $0.taskID == conversationTaskID }
+    }
+    private func refreshPendingSteers() {
+        pendingSteers = currentSteerState?.pending ?? []
+        pendingInterrupt = steeringSidecars[runSessionID]?.interrupt
+    }
+    func steerInterrupt(in sessionID: UUID) -> SteerInterrupt? { steeringSidecars[sessionID]?.interrupt }
+    private var steeringWaitActive: Bool {
+        // 通用手输恢复后旧 manual 描述可能仍在；是否仍等手输以 status 为准。
+        // question 则始终保留优先权，不改变任何等待字段或既有确认/作答流程。
+        if case .some(.question(_, _)) = waitingInput { return true }
+        switch status { case .waitingConfirm, .waitingManual: return true; default: return false }
+    }
+    var canSteer: Bool {
+        let running: Bool = { if case .running = status { return true }; return false }()
+        return active && !interruptInFlight && pendingInterrupt == nil && SteerState.allowsThreeWay(viewingRun: true, running: running, waiting: steeringWaitActive)
+    }
+    var canTransformSteers: Bool {
+        guard active, !interruptInFlight, pendingInterrupt == nil, !steeringWaitActive else { return false }
+        switch status { case .running, .paused: return true; default: return false }
+    }
+    private func steeringError(_ error: Error) {
+        steeringConversation?.localFeedback("插话记录暂未写完，文字仍保留，请重试：\(error.localizedDescription)")
+    }
+    func bindSteeringConversation(_ conversation: AgentConversationStore) {
+        steeringConversation = conversation
+        // 恢复只读侧车，不从旧快照重放插话；未完成的投影/队列事务按固定 ID 补齐。
+        for session in SessionStore.shared.sessions {
+            do {
+                var file = try sidecar(session.id)
+                if file.tasks.isEmpty && file.interrupt == nil { continue }
+                let snapshot = loadSnapshotData(for: session.id, allowLegacy: false).flatMap { try? JSONDecoder().decode(SessionSnapshot.self, from: $0) }
+                let resumable = snapshot.flatMap { saved -> UUID? in
+                    guard Date().timeIntervalSince(saved.savedAt) < 24 * 3600, !saved.goal.isEmpty,
+                          saved.sessionID == nil || saved.sessionID == session.id else { return nil }
+                    return saved.taskID
+                }
+                file.recover(resumableTaskID: resumable, snapshotTaskID: snapshot?.taskID)
+                try saveSidecar(file, in: session.id)
+                for state in file.tasks {
+                    for item in state.items where item.disposition == .queued { try enqueueTask(sessionID: session.id, steerTransfer: item) }
+                    try conversation.materializeSteering(state)
+                }
+                file.tasks.removeAll { $0.taskID != resumable }
+                try saveSidecar(file, in: session.id)
+            } catch { steeringError(error) }
+        }
+        refreshPendingSteers()
+    }
+    func steeringStatusChanged(_ state: AgentStatus) {
+        if state.isTerminalForFold { pendingSteers = [] }
+        guard steeringConversation != nil, let taskID = conversationTaskID else { return }
+        do {
+            var file = try sidecar(runSessionID)
+            guard let index = file.tasks.firstIndex(where: { $0.taskID == taskID }) else { return }
+            switch state {
+            case .running: file.tasks[index].thaw()
+            case .paused: file.tasks[index].freeze()
+            case .done, .failed, .ended: file.tasks[index].invalidate("任务已结束")
+            default: return
+            }
+            try saveSidecar(file, in: runSessionID)
+            for item in file.tasks[index].items where item.disposition == .queued { try enqueueTask(sessionID: runSessionID, steerTransfer: item) }
+            try steeringConversation?.materializeSteering(file.tasks[index])
+            switch state {
+            case .done, .failed, .ended:
+                // 先留原文与可定位反馈，再清该 taskID 的侧车；其它会话不动。
+                file.tasks.remove(at: index)
+                try saveSidecar(file, in: runSessionID)
+            default: break
+            }
+        } catch { steeringError(error) }
+    }
+    private func prepareSteersForNewTask(in sessionID: UUID) throws {
+        var file = try sidecar(sessionID)
+        if file.tasks.isEmpty && file.interrupt == nil { return }
+        if let request = file.interrupt, request.startingID != steeringStartingID {
+            throw MikaError("还有中断待发文字，请先重试或撤回")
+        }
+        file.beforeStart(in: sessionID)
+        try saveSidecar(file, in: sessionID)
+        for state in file.tasks {
+            for item in state.items where item.disposition == .queued { try enqueueTask(sessionID: sessionID, steerTransfer: item) }
+            guard let conversation = steeringConversation else {
+                if !state.items.isEmpty { throw MikaError("对话记录尚未就绪") }
+                continue
+            }
+            try conversation.materializeSteering(state)
+        }
+        file.clearProjectedTasks(in: sessionID)
+        try saveSidecar(file, in: sessionID)
+    }
+    @discardableResult func enqueueSteer(_ text: String) -> Bool {
+        guard canSteer, let taskID = conversationTaskID else { return false }
+        do {
+            var file = try sidecar(runSessionID)
+            if !file.tasks.contains(where: { $0.taskID == taskID }) { file.tasks.append(SteerState(taskID: taskID, sessionID: runSessionID)) }
+            guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }) else { return false }
+            guard file.tasks[i].enqueue(text) else {
+                steeringConversation?.localFeedback("已有 3 条插话待生效，请等其生效或撤回一条")
+                return false
+            }
+            try saveSidecar(file, in: runSessionID) // 写前日志是接受边界。
+            do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
+            persistSnapshot()
+            return true
+        } catch { steeringError(error); return false }
+    }
+    private func consumePendingSteers() throws -> String? {
+        guard let taskID = conversationTaskID else { return nil }
+        var file = try sidecar(runSessionID)
+        guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }), !file.tasks[i].pending.isEmpty else { return nil }
+        let hint = file.tasks[i].consume(step: stepSeq + 1)
+        try saveSidecar(file, in: runSessionID) // 消费标记先持久化，快照旧镜像不能复活它。
+        do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
+        persistSnapshot()
+        return hint
+    }
+    func withdrawSteer(_ id: UUID, draft: String) -> String? {
+        guard !interruptInFlight, let taskID = conversationTaskID else { return nil }
+        do {
+            var file = try sidecar(runSessionID)
+            guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }),
+                  let item = file.tasks[i].move(id, to: .withdrawn) else { return nil }
+            try saveSidecar(file, in: runSessionID)
+            do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
+            persistSnapshot()
+            return SteerState.restoredDraft(draft, text: item.text)
+        } catch { steeringError(error); return nil }
+    }
+    private func enqueueTask(sessionID: UUID, steerTransfer item: SteerItem) throws {
+        var candidate = QueueFile(tasks: queuedTasks, acceptedSteerIDs: acceptedSteerQueueIDs)
+        guard candidate.enqueueSteer(item, sessionID: sessionID) else { return }
+        // 接受历史与队列同一次原子写，写成功后才发布内存变化。
+        try writeQueue(candidate)
+        acceptedSteerQueueIDs = candidate.acceptedSteerIDs
+        queuedTasks = candidate.tasks
+    }
+    @discardableResult func queueSteer(_ id: UUID) -> Bool {
+        guard !interruptInFlight, let taskID = conversationTaskID else { return false }
+        do {
+            var file = try sidecar(runSessionID)
+            guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }) else { return false }
+            // 已写的转移意图可重试；不再作为插话消费。
+            let item = file.tasks[i].move(id, to: .queued) ?? file.tasks[i].items.first { $0.id == id && $0.disposition == .queued }
+            guard let item else { return false }
+            try saveSidecar(file, in: runSessionID)
+            try enqueueTask(sessionID: runSessionID, steerTransfer: item)
+            try steeringConversation?.materializeSteering(file.tasks[i])
+            persistSnapshot()
+            return true
+        } catch { steeringError(error); return false }
+    }
+    var unfinishedSteerQueues: [SteerItem] {
+        currentSteerState?.items.filter { $0.disposition == .queued && !acceptedSteerQueueIDs.contains($0.id) } ?? []
+    }
+    private var steeringStartingID: UUID?
+    func interruptAndSend(_ text: String, from steerID: UUID? = nil, expectedTaskID: UUID? = nil) async -> Bool {
+        guard (steerID == nil ? canSteer : canTransformSteers), let taskID = conversationTaskID,
+              expectedTaskID == nil || expectedTaskID == taskID,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        do {
+            var file = try sidecar(runSessionID)
+            if let steerID {
+                guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }), file.tasks[i].move(steerID, to: .interrupt) != nil else { return false }
+            }
+            let request = SteerInterrupt(id: UUID(), taskID: taskID, sessionID: runSessionID, text: text, startingID: UUID())
+            file.interrupt = request
+            try saveSidecar(file, in: runSessionID)
+            return await executeSteerInterrupt(request)
+        } catch { steeringError(error); return false }
+    }
+    func retrySteerInterrupt(requestID: UUID) async -> Bool {
+        guard let request = pendingInterrupt, request.id == requestID, !interruptInFlight,
+              runSessionID == request.sessionID,
+              conversationTaskID == request.taskID || (conversationTaskID == request.startingID && !sessionActive) || (!busy && goal.isEmpty) else { return false }
+        return await executeSteerInterrupt(request)
+    }
+    private func executeSteerInterrupt(_ request: SteerInterrupt) async -> Bool {
+        guard !interruptInFlight, runSessionID == request.sessionID,
+              conversationTaskID == request.taskID || conversationTaskID == request.startingID || (!busy && goal.isEmpty) else { return false }
+        interruptInFlight = true // MainActor 同步受理、绑定原任务；自然终态没有交错入口。
+        let oldWorker = worker
+        let oldGeneration = generation
+        var gate = SteerInterruptGate(taskID: conversationTaskID, oldGeneration: oldGeneration)
+        stop() // 保留原 stop 语义；绝不使用 stopFromUser。
+        let stoppedGeneration = generation
+        await oldWorker?.value // cancel 请求不等于退出，必须等实际返回。
+        gate.acknowledgeWorkerExit()
+        guard generation == stoppedGeneration,
+              gate.reserveStart(taskID: conversationTaskID, generation: generation, running: status.isRunningForSteer) else {
+            interruptInFlight = false; return false
+        }
+        do {
+            var file = try sidecar(request.sessionID)
+            guard file.interrupt?.id == request.id else { interruptInFlight = false; return false }
+            file.interrupt?.attempted = true
+            try saveSidecar(file, in: request.sessionID)
+            steeringStartingID = request.startingID
+            // 先完成原任务插话的可追踪作废，再通过既有终结出口使旧任务不可续跑。
+            try prepareSteersForNewTask(in: request.sessionID)
+            finishTask()
+            interruptInFlight = false // 无 await：此处到 startInSession 完成是同一 MainActor 回合。
+            startInSession(request.sessionID, local: nil, task: request.text, startingID: request.startingID)
+            steeringStartingID = nil
+            guard conversationTaskID == request.startingID, status.isRunningForSteer, worker != nil else { return false }
+            return pendingInterrupt == nil
+        } catch {
+            interruptInFlight = false; steeringStartingID = nil; steeringError(error); return false
+        }
+    }
+    func withdrawSteerInterrupt(_ request: SteerInterrupt, draft: String) -> String? {
+        guard !interruptInFlight else { return nil }
+        do {
+            var file = try sidecar(request.sessionID)
+            guard file.interrupt?.id == request.id else { return nil }
+            guard let conversation = steeringConversation else { throw MikaError("对话记录尚未就绪") }
+            var withdrawn = SteerState(taskID: request.taskID, sessionID: request.sessionID)
+            withdrawn.items = [SteerItem(id: request.id, text: request.text, enqueuedAt: Date(), disposition: .withdrawn)]
+            try conversation.materializeSteering(withdrawn)
+            // 用户撤回的是待发文字；已受理的中断仍结束原任务。
+            if runSessionID == request.sessionID, conversationTaskID == request.taskID { finishTask() }
+            else if let data = loadSnapshotData(for: request.sessionID, allowLegacy: false),
+                    let snapshot = try? JSONDecoder().decode(SessionSnapshot.self, from: data), snapshot.taskID == request.taskID {
+                // 明确撤回该会话的待发文字时，只清已被中断的原任务快照，不碰当前执行器。
+                try FileManager.default.removeItem(at: SessionStore.shared.snapshotURL(for: request.sessionID))
+            }
+            file = try sidecar(request.sessionID)
+            file.interrupt = nil
+            try saveSidecar(file, in: request.sessionID)
+            return SteerState.restoredDraft(draft, text: request.text)
+        } catch { steeringError(error); return nil }
+    }
+    /// 自检四十四的持久化边界：仅使用临时文件/局部模型，不改引擎现役状态。
+    func verifySteerPersistence() -> [String] {
+        var lines: [String] = []
+        func check(_ ok: Bool, _ note: String) { lines.append("\(ok ? "✓" : "✗") \(note)") }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("steer-test-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            var state = SteerState(taskID: UUID(), sessionID: UUID())
+            _ = state.enqueue("侧车原文")
+            state.freeze()
+            let file = SteerSidecarFile(url: directory.appendingPathComponent("steers.json"))
+            try file.save(SteerSidecar(tasks: [state]))
+            let restored = try file.load()
+            check(restored.tasks == [state], "真实临时侧车文件原子写/读往返，冻结项仍在")
+            let original = SteerProjection.apply(state, to: [])
+            state.invalidate("因新任务启动未生效")
+            let projected = SteerProjection.apply(state, to: original)
+            let replayed = SteerProjection.apply(state, to: projected)
+            check(replayed.count == 2 && replayed.map { $0.id } == projected.map { $0.id } && replayed[0].kind == .userSteer && replayed[0].text == "侧车原文" && replayed[1].kind == .local && replayed[1].steerRetryText == "侧车原文" && replayed[1].text.contains(state.items[0].id.uuidString), "崩溃后重复投影：原文不丢、作废反馈可定位且仅一条")
+            var queue = QueueFile(tasks: [], acceptedSteerIDs: [])
+            let accepted = queue.enqueueSteer(state.items[0], sessionID: state.sessionID)
+            let duplicate = queue.enqueueSteer(state.items[0], sessionID: state.sessionID)
+            let disk = try QueueFile.decode(JSONEncoder().encode(queue))
+            var drained = disk
+            drained.tasks.removeAll()
+            let replayAfterDrain = drained.enqueueSteer(state.items[0], sessionID: state.sessionID)
+            check(accepted && !duplicate && disk.tasks.count == 1 && !replayAfterDrain && drained.tasks.isEmpty, "转队列写前意图重试/崩溃重放不重复入队，已推进或取消后也不复活")
+            let legacyQueue = try QueueFile.decode(JSONEncoder().encode(disk.tasks))
+            check(legacyQueue.tasks.map { $0.id } == disk.tasks.map { $0.id } && legacyQueue.acceptedSteerIDs.isEmpty, "M1旧数组格式队列仍可载入")
+            let oldJSON = "{\"version\":2,\"savedAt\":0,\"goal\":\"旧目标\",\"limit\":25,\"stepSeq\":0,\"steps\":[],\"statusKind\":\"paused\",\"statusText\":\"暂停\",\"answersJSON\":\"[]\"}"
+            var snapshot = try JSONDecoder().decode(SessionSnapshot.self, from: Data(oldJSON.utf8))
+            check(snapshot.pendingSteers == nil && snapshot.goal == "旧目标", "旧快照缺pendingSteers仍可解码，目标不变")
+            snapshot.pendingSteers = restored.tasks[0].pending
+            let roundtrip = try JSONDecoder().decode(SessionSnapshot.self, from: JSONEncoder().encode(snapshot))
+            check(roundtrip.pendingSteers == restored.tasks[0].pending, "快照未生效镜像可往返；恢复消费以侧车为准")
+        } catch { check(false, "持久化边界异常：\(error.localizedDescription)") }
+        return lines
     }
     func stop() {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
@@ -1063,6 +1366,7 @@ struct OpenStall {
         }
     }
     func resume() {
+        guard !interruptInFlight, pendingInterrupt == nil else { return }
         guard active, !goal.isEmpty else { return }
         refreshThermalState()
         guard !thermalPaused || thermalGate.canResume(now: Date()) else { return }
@@ -1147,15 +1451,32 @@ struct OpenStall {
         if queuedTasks.count != before { persistQueue() }
     }
 
-    private func persistQueue() {
-        guard let data = try? JSONEncoder().encode(queuedTasks) else { return }
-        try? FileManager.default.createDirectory(at: Self.queueFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: Self.queueFileURL, options: [.atomic])
+    private struct QueueFile: Codable {
+        var tasks: [QueuedTask]
+        var acceptedSteerIDs: Set<UUID>
+        mutating func enqueueSteer(_ item: SteerItem, sessionID: UUID) -> Bool {
+            guard acceptedSteerIDs.insert(item.id).inserted else { return false }
+            if !tasks.contains(where: { $0.id == item.id }) {
+                tasks.append(QueuedTask(id: item.id, sessionID: sessionID, text: item.text, localPage: nil, enqueuedAt: item.enqueuedAt))
+            }
+            return true
+        }
+        static func decode(_ data: Data) throws -> QueueFile {
+            if let current = try? JSONDecoder().decode(QueueFile.self, from: data) { return current }
+            return QueueFile(tasks: try JSONDecoder().decode([QueuedTask].self, from: data), acceptedSteerIDs: [])
+        }
     }
+    private func writeQueue(_ candidate: QueueFile? = nil) throws {
+        try FileManager.default.createDirectory(at: Self.queueFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let file = candidate ?? QueueFile(tasks: queuedTasks, acceptedSteerIDs: acceptedSteerQueueIDs)
+        try JSONEncoder().encode(file).write(to: Self.queueFileURL, options: [.atomic])
+    }
+    private func persistQueue() { try? writeQueue() }
 
     private func loadQueue() {
-        guard let data = try? Data(contentsOf: Self.queueFileURL),
-              let items = try? JSONDecoder().decode([QueuedTask].self, from: data) else { return }
+        guard let data = try? Data(contentsOf: Self.queueFileURL), let file = try? QueueFile.decode(data) else { return }
+        let items = file.tasks
+        acceptedSteerQueueIDs = file.acceptedSteerIDs
         // 所属会话已被删除的条目不再恢复（删除编排通常已清队，这里兜底）
         let known = Set(SessionStore.shared.sessions.map { $0.id })
         queuedTasks = items.filter { known.contains($0.sessionID) }
@@ -1234,6 +1555,7 @@ struct OpenStall {
         runSessionID = sessionID
         resetRuntimeState()
         restoreSnapshot(for: sessionID, allowLegacy: false)
+        refreshPendingSteers()
         web.showSessionTabs(sessionID)
     }
 
@@ -1248,7 +1570,7 @@ struct OpenStall {
         goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
-        conversationTaskID = nil; sessionActive = false; status = .idle
+        conversationTaskID = nil; pendingSteers = []; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         discardPendingUpload()
@@ -1352,7 +1674,8 @@ struct OpenStall {
         let inMemory = queuedTasks.contains { $0.sessionID == b.id && $0.text == "自检九排队样本" }
         var inFile = false
         if let data = try? Data(contentsOf: Self.queueFileURL),
-           let items = try? JSONDecoder().decode([QueuedTask].self, from: data) {
+           let file = try? JSONDecoder().decode(QueueFile.self, from: data) {
+            let items = file.tasks
             inFile = items.contains { $0.sessionID == b.id && $0.text == "自检九排队样本" }
         }
         if let item = queuedTasks.first(where: { $0.sessionID == b.id }) { cancelQueuedTask(id: item.id) }
@@ -1405,6 +1728,7 @@ struct OpenStall {
         launch(confirmed: saved)
     }
     private func launch(confirmed: (AgentAction, PageElement, String, Int)? = nil) {
+        guard !interruptInFlight else { return }
         // 恢复会话的现场重建在此兜底：resume() 已先行调用过则守卫使其为空操作；
         // 等待确认恢复后直接走 confirm() 的路径不经 resume()，也要先把标签带回
         // 中断页面，runConfirmed 的网址／目标复核才有机会在原页面上通过（复核
@@ -1420,7 +1744,22 @@ struct OpenStall {
         transientStreak = 0
         web.agentWorkSuspended = false // launch 只从前台路径进入，驻停标记在此兜底复位
         submitContinuedProcessingIfPossible()
-        persistSnapshot()
+        let snapshotSaved = persistSnapshot()
+        if let startingID = steeringStartingID, startingID == conversationTaskID, let request = pendingInterrupt {
+            do {
+                guard snapshotSaved, request.startingID == conversationTaskID else { throw MikaError("新任务恢复现场未写入") }
+                var file = try sidecar(request.sessionID)
+                file.interrupt = nil
+                try saveSidecar(file, in: request.sessionID)
+            } catch {
+                // 尚未创建 worker：待发文字保留，可安全重试同一目标 taskID。
+                status = .paused("中断待发尚未启动，文字已保留，请重试：\(error.localizedDescription)")
+                sessionActive = false; applyIdleTimerPolicy()
+                endBackgroundGrace(); completeContinuedProcessing(success: false)
+                web.endExecution()
+                return
+            }
+        }
         worker = Task { [weak self] in
             guard let self else { return }
             do {
@@ -1446,11 +1785,12 @@ struct OpenStall {
                         // 消费动作不能放进组装函数里重复执行）
                         let loopHint = pendingLoopHint; pendingLoopHint = nil
                         let outcomeHint = pendingOutcomeHint; pendingOutcomeHint = nil
+                        let steerHint = try consumePendingSteers()
                         // prompt 组装（H1）：任务→状态卡→恢复说明→成果台账→
                         // 历史（确定性折叠）→问答→playbook→提示→当前页面；
                         // 体量由 promptCharBudget 约束，超预算逐级加大折叠
                         // （见 assemblePrompt）。各注入段的口径注释见组装函数。
-                        let prompt = assemblePrompt(pageJSON: json, answersJSON: answers, loopHint: loopHint, outcomeHint: outcomeHint)
+                        let prompt = assemblePrompt(pageJSON: json, answersJSON: answers, loopHint: loopHint, outcomeHint: outcomeHint, steerHint: steerHint)
                         let action: AgentAction
                         if settings.modelSource == .chatGPT {
                             action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
@@ -1473,6 +1813,7 @@ struct OpenStall {
                             if let gate = try await evaluateDoneGate(token: token), gate == .driven {
                                 continue
                             }
+                            guard token == generation else { return }
                             let pendingThisRun = Self.pendingOutcomes(outcomeLedger, since: runStartedAt)
                             if Self.containsCompletionClaim(summary: action.summary), !pendingThisRun.isEmpty, !finalAuditFired {
                                 finalAuditFired = true
@@ -1487,6 +1828,7 @@ struct OpenStall {
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
                             await recycleReadbackTabs(for: conversationTaskID, expectedGeneration: token)
+                            guard token == generation else { return }
                             web.endExecution(); clearSnapshot(); resumeNote = nil
                             // 执行权在此真正空出（M1 串行队列的推进点之一）：
                             // 队首任务（若有）在它自己的会话里接着启动
@@ -1782,6 +2124,7 @@ struct OpenStall {
                 sessionActive = false; applyIdleTimerPolicy()
                 endBackgroundGrace(); completeContinuedProcessing(success: false)
                 await recycleReadbackTabs(for: conversationTaskID, expectedGeneration: token)
+                guard token == generation else { return }
                 web.endExecution(); clearSnapshot(); resumeNote = nil
                 if error is CancellationError { status = .paused("已取消") }
                 else { status = .failed(error.localizedDescription); advanceQueue() }
@@ -3831,17 +4174,17 @@ struct OpenStall {
 
     /// 组装一轮 prompt：从自动级别（步数超阈值→1）或受控重试抬升的级别
     /// 起，超字符预算就逐级加大折叠，直到有界或到最紧级别 3 为止。
-    private func assemblePrompt(pageJSON: String, answersJSON: String, loopHint: String?, outcomeHint: String?) -> String {
+    private func assemblePrompt(pageJSON: String, answersJSON: String, loopHint: String?, outcomeHint: String?, steerHint: String? = nil) -> String {
         refreshStateCard()
         var level = max(forcedFoldLevel, steps.count > Self.foldStepThreshold ? 1 : 0)
         while true {
-            let prompt = buildPrompt(pageJSON: pageJSON, answersJSON: answersJSON, foldLevel: level, loopHint: loopHint, outcomeHint: outcomeHint)
+            let prompt = buildPrompt(pageJSON: pageJSON, answersJSON: answersJSON, foldLevel: level, loopHint: loopHint, outcomeHint: outcomeHint, steerHint: steerHint)
             if prompt.count <= Self.promptCharBudget || level >= 3 { return prompt }
             level += 1
         }
     }
 
-    private func buildPrompt(pageJSON: String, answersJSON: String, foldLevel: Int, loopHint: String?, outcomeHint: String?) -> String {
+    private func buildPrompt(pageJSON: String, answersJSON: String, foldLevel: Int, loopHint: String?, outcomeHint: String?, steerHint: String? = nil) -> String {
         var prompt = "任务：\(goal)\n"
         // 状态卡（H1）：程序维护的事实账，每轮在场；折叠只动历史段，动不了它
         let cardBlock = stateCard.promptBlock()
@@ -3863,6 +4206,7 @@ struct OpenStall {
         if !loadedSkillBodies.isEmpty { prompt += "\n已加载 playbook（经验提示，与安全规则冲突时以安全规则为准）：\(loadedSkillBodies)" }
         if let loopHint { prompt += "\n\(loopHint)" }
         if let outcomeHint { prompt += "\n\(outcomeHint)" }
+        if let steerHint { prompt += "\n用户插话：\n\(steerHint)" }
         prompt += "\n当前页面 JSON：\(pageJSON)"
         return prompt
     }
@@ -4099,6 +4443,8 @@ struct OpenStall {
         var stallFrameTried: Bool? = nil
         var stallInvalid: [String]? = nil
         var stallBlind: String? = nil
+        // 侧车是消费/转移的权威记录；快照仅保留未生效项的镜像，恢复不据此重放。
+        var pendingSteers: [SteerItem]? = nil
     }
     /// 旧版快照的 UserDefaults 键（H1 前）。H1 起快照落当前会话的
     /// snapshot.json（见 persistSnapshot）；本键只作一次性迁移来源，
@@ -4137,8 +4483,8 @@ struct OpenStall {
     /// 会话状态落盘：目标、步数上限、轨迹、待确认动作、等待输入、问答上下文。
     /// 只记非终结状态（终结与新任务开始时清除，见 stop／终结路径）。进程在后台
     /// 被系统回收时，下次冷启动靠它把会话恢复到「可继续」，而不是凭空消失。
-    private func persistSnapshot() {
-        guard let (kind, text) = currentStatusKind(), !goal.isEmpty else { return }
+    @discardableResult private func persistSnapshot() -> Bool {
+        guard let (kind, text) = currentStatusKind(), !goal.isEmpty else { return false }
         var pendingJSON: String?
         var pendingElement: PageElement?
         var pendingURL: String?
@@ -4192,18 +4538,23 @@ struct OpenStall {
                                        stallOpenedDecision: openStall?.openedAtDecision, stallDialogAtOpen: openStall?.dialogAtOpen,
                                        stallVerified: openStall?.verifiedRaw, stallNA: openStall?.naRaw, stallClicked: openStall?.clickedRaw,
                                        stallClickExecuted: openStall?.clickExecuted, stallFrameTried: openStall?.frameCloseTried,
-                                       stallInvalid: openStall?.invalidActions, stallBlind: openStall?.perceptionBlindNote)
-        if let data = try? JSONEncoder().encode(snapshot) {
+                                       stallInvalid: openStall?.invalidActions, stallBlind: openStall?.perceptionBlindNote,
+                                       pendingSteers: currentSteerState?.pending)
+        do {
+            let data = try JSONEncoder().encode(snapshot)
             // H1：快照落所属会话的 snapshot.json（按会话分库；M1 起按
             // runSessionID——任务在会话 A 执行时用户切到 B 浏览，落盘仍回
             // A 的目录）；旧键若还在（迁移未发生的边角）一并清除，防止
             // 旧快照复活盖掉新状态
             let url = SessionStore.shared.snapshotURL(for: runSessionID)
-            try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            let saved: Bool
+            do { try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]); saved = true }
+            catch { saved = false }
             if UserDefaults.standard.object(forKey: Self.snapshotKey) != nil {
                 UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
             }
-        }
+            return saved
+        } catch { return false }
     }
 
     private func clearSnapshot() {
@@ -4296,6 +4647,7 @@ struct OpenStall {
             waitingInput = waiting.kind == "question" ? .question(id: waiting.id, text: waiting.text) : .manual(id: waiting.id, text: waiting.text)
         }
         conversationTaskID = snapshot.taskID ?? UUID()
+        refreshPendingSteers()
         // 成果台账合并（OUTCOME-LEDGER）：快照里的条目按 id 补进台账（自有
         // 持久化已载入的那份为主，快照补其所缺），保证恢复出的会话带着
         // 中断前的已提交记录续跑，注入时与【中断恢复说明】并列出现
@@ -4384,7 +4736,7 @@ struct OpenStall {
         goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
-        conversationTaskID = nil; sessionActive = false; status = .idle
+        conversationTaskID = nil; pendingSteers = []; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         discardPendingUpload()
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
@@ -4477,4 +4829,10 @@ struct OpenStall {
         }
         return lines
     }
+}
+
+// 视图只读状态映射，避免把引擎控制逻辑放进 SwiftUI。
+extension AgentStatus {
+    var isRunningForSteer: Bool { if case .running = self { return true }; return false }
+    var isTerminalForFold: Bool { switch self { case .done, .failed, .ended: return true; default: return false } }
 }

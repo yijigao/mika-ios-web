@@ -302,6 +302,18 @@ struct SelfTestView: View {
                 }
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检四十三：过程降噪 FOLD") {
+                let lines = ProcessFoldTierA.verify()
+                for line in lines { conversation.localFeedback("自检四十三：\(line)") }
+                conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十三：FAIL，见逐项记录" : "自检四十三：Tier A 五项 PASS；UI 展开、滚动与无障碍待真机")
+                dismiss()
+            }.disabled(!engine.active)
+            Button("自检四十四：三态发送 STEER") {
+                let lines = SteerTierA.verify() + engine.verifySteerPersistence()
+                for line in lines { conversation.localFeedback("自检四十四：\(line)") }
+                conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十四：FAIL，见逐项记录" : "自检四十四：Tier A PASS；worker 交接、模型与 UI 联动待 CI/真机")
+                dismiss()
+            }.disabled(!engine.active)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }

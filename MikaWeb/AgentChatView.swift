@@ -19,6 +19,7 @@ struct AgentChatView: View {
     var scrollToBottomRequest: Int
     /// 底部避让：输入栏的实测高度（ContentView 测得后下传），本层底部留白与之等高。
     var bottomInset: CGFloat
+    @State private var expandedProcesses: Set<String> = []
     @State private var viewportHeight: CGFloat = 0
     private let bottomID = "session-scroll-bottom"
     var body: some View {
@@ -46,8 +47,12 @@ struct AgentChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(conversation.entries) { entry in
-                            entryView(entry).id(entry.id)
+                        ForEach(ProcessFold.nodes(conversation.entries)) { node in
+                            if node.isGroup {
+                                processView(node)
+                            } else if let entry = node.entries.first {
+                                entryView(entry).id(entry.id)
+                            }
                         }
                         Color.clear.frame(height: 1).id(bottomID)
                             .background(GeometryReader { geometry in
@@ -94,7 +99,10 @@ struct AgentChatView: View {
                 .onChange(of: conversation.entries.count) { _, _ in
                     if followLatest.wrappedValue { proxy.scrollTo(bottomID, anchor: .bottom) }
                 }
-                .onChange(of: conversation.displayedSessionID) { _, _ in landAtBottom(proxy) }
+                .onChange(of: conversation.displayedSessionID) { _, _ in
+                    expandedProcesses = []
+                    landAtBottom(proxy)
+                }
                 .onChange(of: scrollToBottomRequest) { _, _ in landAtBottom(proxy) }
                 .task { landAtBottom(proxy) }
             }
@@ -144,13 +152,13 @@ struct AgentChatView: View {
     }
     private var isPaused: Bool { if case .paused = engine.status { return true }; return false }
     private var showStop: Bool {
-        guard engine.busy, engine.active, viewingRunSession, questionID == nil else { return false }
+        guard engine.busy, engine.active, !engine.interruptInFlight, engine.pendingInterrupt == nil, viewingRunSession, questionID == nil else { return false }
         switch engine.status {
         case .waitingConfirm, .waitingManual: return false
         default: return true
         }
     }
-    private var showFinish: Bool { isPaused && viewingRunSession && engine.active }
+    private var showFinish: Bool { isPaused && viewingRunSession && engine.active && !engine.interruptInFlight && engine.pendingInterrupt == nil }
     private func actionCapsule(_ title: String, symbol: String? = nil,
                                foreground: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -177,7 +185,7 @@ struct AgentChatView: View {
         sessionStore.sessions.first(where: { $0.id == id })?.title ?? "会话"
     }
     private var canResume: Bool {
-        guard engine.active, questionID == nil, viewingRunSession else { return false }
+        guard engine.active, !engine.interruptInFlight, engine.pendingInterrupt == nil, questionID == nil, viewingRunSession else { return false }
         // .waitingManual（手输等待）不在此列：续跑入口在置顶介入卡的「已处理，继续」，
         // 本行只处理暂停／失败（同一时刻只有一个可点的主入口，避免双入口打架）。
         switch engine.status { case .paused, .failed: return true; default: return false }
@@ -186,15 +194,47 @@ struct AgentChatView: View {
         guard viewingRunSession, case .some(.question(let id, _)) = engine.waitingInput else { return nil }
         switch engine.status { case .waitingManual, .paused: return id; default: return nil }
     }
+    private var processPhase: ProcessFold.Phase {
+        switch engine.status { case .done: return .completed; case .failed, .ended: return .stopped; default: return .executing }
+    }
+    private func processView(_ node: ProcessFold.Node) -> some View {
+        let phase = ProcessFold.phase(taskID: node.entries.first?.taskID, entries: conversation.entries,
+                                      currentTaskID: engine.conversationTaskID, current: processPhase)
+        return VStack(alignment: .leading, spacing: 5) {
+            Button {
+                if !expandedProcesses.insert(node.id).inserted { expandedProcesses.remove(node.id) }
+            } label: {
+                Label(ProcessFold.header(node.entries, phase: phase), systemImage: expandedProcesses.contains(node.id) ? "chevron.down" : "chevron.right")
+                    .font(.caption).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityLabel(ProcessFold.accessibility(node.entries, phase: phase))
+            .accessibilityValue(expandedProcesses.contains(node.id) ? "已展开" : "已收起")
+            if expandedProcesses.contains(node.id) {
+                ForEach(node.entries) { entry in entryView(entry) }
+            }
+        }
+        .onChange(of: phase) { _, phase in
+            if phase != .executing { expandedProcesses.remove(node.id) }
+        }
+    }
     private func entryView(_ entry: ChatEntry) -> some View {
-        let user = entry.kind == .userTask || entry.kind == .userAnswer
-        return Text(entry.text)
-            .font(entry.kind == .process ? .caption : .callout)
-            .foregroundStyle(entry.kind == .error ? .red : .primary)
-            .padding(9)
-            .frame(maxWidth: .infinity, alignment: user ? .trailing : .leading)
-            .background(user ? Color.blue.opacity(0.14) : Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
-            .accessibilityLabel(entry.text)
+        let user = entry.kind == .userTask || entry.kind == .userAnswer || entry.kind == .userSteer
+        let text = entry.kind == .userSteer ? entry.text + "\n" + (entry.steerStatus ?? "插话 · 将在下一步生效") : entry.text
+        return VStack(alignment: user ? .trailing : .leading, spacing: 5) {
+            Text(text)
+                .font(entry.kind == .process ? .caption : .callout)
+                .foregroundStyle(entry.kind == .error ? .red : .primary)
+                .accessibilityLabel(text)
+            if let retryText = entry.steerRetryText, !retryText.isEmpty {
+                Button("重新发起（回填草稿）") {
+                    conversation.draft = SteerState.restoredDraft(conversation.draft, text: retryText)
+                    inputFocus.wrappedValue = true
+                }.font(.caption)
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: user ? .trailing : .leading)
+        .background(user ? Color.blue.opacity(0.14) : Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -275,14 +315,23 @@ struct ChatInputBar: View {
     /// 可入队（M1）：看着别的会话、而执行器正忙——发送即把任务排进
     /// 队列（在本会话名下），不打断正在跑的任务、也不串进它的对话。
     private var canQueue: Bool { !viewingRunSession && engine.busy }
-    private var canSend: Bool { engine.active && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil || canQueue) }
+    private var canThreeWay: Bool { viewingRunSession && engine.canSteer }
+    private var canSend: Bool { engine.active && (!engine.interruptInFlight || canQueue) && (engine.pendingInterrupt == nil || canQueue) && !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (isNewTask || questionID != nil || canQueue || canThreeWay) }
     var body: some View {
-        HStack(alignment: .bottom, spacing: 6) {
-            TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
-                .lineLimit(1...3).textFieldStyle(.roundedBorder)
-                .focused(inputFocus)
-            Button(questionID != nil ? "回答并继续" : (canQueue ? "加入队列" : (isNewTask && isPaused ? "新任务" : "发送"))) { send() }
-                .disabled(!canSend).buttonStyle(.borderedProminent)
+        VStack(spacing: 5) {
+            pendingSteerRows
+            HStack(alignment: .bottom, spacing: 6) {
+                TextField(questionID != nil ? "回答问题" : "输入网页任务", text: $conversation.draft, axis: .vertical)
+                    .lineLimit(1...3).textFieldStyle(.roundedBorder)
+                    .focused(inputFocus)
+                if canThreeWay {
+                    sendButton.contextMenu {
+                        Button("插话（下一步生效）") { sendSteerDraft() }
+                        Button("中断并发送：结束当前任务（不可续跑）并立即开始这条") { interruptDraft() }
+                        Button("排队（本任务结束后作为新任务，按顺序启动）") { queueRunningDraft() }
+                    }
+                } else { sendButton }
+            }
         }
         .padding(.leading, FloatingVisibilityToggleGeometry.textLeading)
         .padding(.trailing, 12)
@@ -299,6 +348,85 @@ struct ChatInputBar: View {
                 Rectangle().fill(.regularMaterial)
             }
             .ignoresSafeArea(edges: .bottom)
+        }
+    }
+    private var sendButton: some View {
+        Button(questionID != nil ? "回答并继续" : (canQueue ? "加入队列" : (isNewTask && isPaused ? "新任务" : "发送"))) { send() }
+            .disabled(!canSend).buttonStyle(.borderedProminent)
+    }
+    @ViewBuilder private var pendingSteerRows: some View {
+        if viewingRunSession {
+            ForEach(engine.pendingSteers) { item in
+                HStack {
+                    Text(item.text).font(.caption).lineLimit(1)
+                    Spacer(minLength: 2)
+                    Menu {
+                        Button("撤回（回填草稿）") {
+                            if let draft = engine.withdrawSteer(item.id, draft: conversation.draft) { conversation.draft = draft }
+                        }
+                        Button("改为中断并发送：结束当前任务（不可续跑）") {
+                            Task { @MainActor in _ = await engine.interruptAndSend(item.text, from: item.id) }
+                        }.disabled(!engine.canTransformSteers)
+                        Button("改为排队（按顺序启动）") {
+                            if engine.queueSteer(item.id) { conversation.queueReceipt("已改为排队：本任务结束后按顺序启动，可在「会话」列表查看或取消。") }
+                        }.disabled(!engine.canTransformSteers)
+                    } label: { Text(item.label).font(.caption2) }
+                    .disabled(engine.interruptInFlight)
+                }
+            }
+            ForEach(engine.unfinishedSteerQueues) { item in
+                HStack {
+                    Text(item.text).font(.caption).lineLimit(1)
+                    Button("重试排队") { _ = engine.queueSteer(item.id) }.font(.caption)
+                }
+            }
+        }
+        if let request = engine.steerInterrupt(in: conversation.displayedSessionID) {
+            HStack {
+                Text(request.text).font(.caption).lineLimit(1)
+                Spacer(minLength: 2)
+                if engine.interruptInFlight { Text("正在等待旧任务退出").font(.caption2) }
+                else {
+                    Button("重试中断并发送") {
+                        let draft = conversation.draft
+                        Task { @MainActor in
+                            if await engine.retrySteerInterrupt(requestID: request.id), draft.trimmingCharacters(in: .whitespacesAndNewlines) == request.text { finishDraftSend(draft) }
+                        }
+                    }.font(.caption).disabled(!viewingRunSession || !engine.active)
+                    Button("撤回") {
+                        if let draft = engine.withdrawSteerInterrupt(request, draft: conversation.draft) { conversation.draft = draft }
+                    }.font(.caption)
+                }
+            }
+        }
+    }
+    private func finishDraftSend(_ original: String) {
+        onSendJumpToBottom()
+        if conversation.draft == original { conversation.draft = "" }
+        followLatest.wrappedValue = true
+        dismissKeyboard()
+    }
+    private func sendSteerDraft() {
+        guard canThreeWay, canSend else { return }
+        let draft = conversation.draft
+        if engine.enqueueSteer(draft.trimmingCharacters(in: .whitespacesAndNewlines)) { finishDraftSend(draft) }
+    }
+    private func queueRunningDraft() {
+        guard canThreeWay, canSend else { return }
+        let draft = conversation.draft
+        engine.enqueueTask(sessionID: engine.runSessionID, text: draft)
+        conversation.queueReceipt("已加入队列：本任务结束后按顺序作为新任务启动（在「会话」列表里可查看或取消）。")
+        finishDraftSend(draft)
+    }
+    private func interruptDraft() {
+        guard canThreeWay, canSend else { return }
+        let draft = conversation.draft
+        let sessionID = conversation.displayedSessionID
+        let taskID = engine.conversationTaskID
+        Task { @MainActor in
+            if await engine.interruptAndSend(draft.trimmingCharacters(in: .whitespacesAndNewlines), expectedTaskID: taskID), conversation.displayedSessionID == sessionID {
+                finishDraftSend(draft)
+            }
         }
     }
     /// 有可续跑的会话上下文（暂停／失败且目标还在、当前不在等回答）：此时
@@ -349,6 +477,8 @@ struct ChatInputBar: View {
                 dismissKeyboard()
             case .rejected(let reason): conversation.localFeedback(reason)
             }
+        } else if canThreeWay {
+            sendSteerDraft()
         } else if isNewTask {
             let previous = engine.conversationTaskID
             engine.taskText = text
