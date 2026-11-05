@@ -42,6 +42,18 @@ struct MikaWebApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(web: graph.web, settings: graph.settings, engine: graph.engine, conversation: graph.conversation, diagnostics: graph.diagnostics)
+                .task {
+                    #if DEBUG && targetEnvironment(simulator)
+                    if ProcessInfo.processInfo.arguments.contains("--mika-type4-selftest") {
+                        let lines = await graph.web.verifyDraftType4()
+                        let result: [String: Any] = ["runtime":"WKWebView", "passed":!lines.contains(where: { $0.hasPrefix("✗") }), "lines":lines]
+                        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted]),
+                           let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                            try? data.write(to: directory.appendingPathComponent("type4-result.json"), options: .atomic)
+                        }
+                    }
+                    #endif
+                }
                 .onChange(of: scenePhase, initial: true) { _, phase in graph.engine.setForeground(phase == .active) }
         }
     }

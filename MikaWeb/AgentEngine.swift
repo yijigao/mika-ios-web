@@ -2275,6 +2275,9 @@ struct OpenStall {
     /// 自检十四·Tier A（WECHAT-COVER-FIX Part A）：弹窗 frame 探针——
     /// 委托 WebController 在合成页 test-frames 上实测（同源/跨源 frame
     /// 各一弹窗：枚举定位＋框内序列/Escape 关闭＋元素消失回读判定）。
+    // Self-test 42 runs in an isolated WKWebView without model calls.
+    func verifyDraftType4() async -> [String] { await web.verifyDraftType4() }
+
     func verifyFrameProbe() async -> [String] {
         guard !busy else { return ["✗ 引擎忙碌中，自检十四 Tier A 未执行（当前任务未终结：可等它跑完，或在暂停时点『结束任务』）"] }
         return await web.verifyFrameProbeAndClick()

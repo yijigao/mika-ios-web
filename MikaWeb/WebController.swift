@@ -1951,12 +1951,22 @@ enum TCProbeLogStore {
     /// input 事件；path=range：Selection/Range 直接写 DOM 再补 InputEvent（末位兜底）。
     /// 表单字段各路径同法：原生 value setter＋InputEvent（React 受控组件认 setter＋
     /// input 事件）。返回 'ok' 或 'exec-failed'。
-    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, strict: Bool = true, tab: BrowserTab) async throws -> String {
+    private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, strict: Bool = true, clipboardConstruction: String = "auto", clipboardText: String? = nil, tab: BrowserTab) async throws -> String {
         let prefix = try guardScript(action: action, expected: expected, approved: approved, strict: strict)
+        let clipboardTextJSON = String(decoding: try JSONEncoder().encode(clipboardText ?? action.text), as: UTF8.self)
         let result = try await evaluate("""
         (()=>{\(prefix)
         e.scrollIntoView({block:'center'});e.focus();
         const text=a.text;
+        const attempt={id:Date.now()+'-'+Math.random(),strategy:'\(path)',hops:[],expectedLength:text.length};
+        window.__mikaTypeAttempt=attempt;
+        const note=(hop,status,detail={})=>attempt.hops.push({hop,status,...detail});
+        window.__mikaTypeNote=note;
+        [1,2,3,4,5].forEach(h=>note(h,'unobserved'));
+        const arrival=ev=>note(1,'arrived',{event:ev.type,trusted:ev.isTrusted,targetIsHost:ev.target===e,focused:document.activeElement===e});
+        if(e.__mikaArrival){for(const t of ['paste','beforeinput','input'])e.removeEventListener(t,e.__mikaArrival,true);}
+        e.__mikaArrival=arrival;
+        for(const t of ['paste','beforeinput','input'])e.addEventListener(t,arrival,true);
         const fireInput=(inputType,data)=>{let ev;try{ev=new InputEvent('input',{bubbles:true,cancelable:false,inputType:inputType,data:data});}catch(_){ev=new Event('input',{bubbles:true});}e.dispatchEvent(ev);};
         if(e.tagName==='INPUT'||e.tagName==='TEXTAREA'||e.tagName==='SELECT'){
           const p=e.tagName==='INPUT'?HTMLInputElement.prototype:e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLSelectElement.prototype;
@@ -1971,7 +1981,7 @@ enum TCProbeLogStore {
           const sel=window.getSelection();
           const selectAll=()=>{const r=document.createRange();r.selectNodeContents(e);sel.removeAllRanges();sel.addRange(r);};
           selectAll();
-          if('\(path)'==='paste'){
+          if('\(path)'==='paste'||'\(path)'==='paste-plain'){
             // 粘贴事务路径（ZHUANLAN-FIX2）：Draft 类编辑器的一切文本事务
             // 只认内部 SelectionState，而第一轮派发前内部选区从未完成同步
             // （selectionchange 派得太晚）、合成 beforeinput 又不被 React 的
@@ -1991,14 +2001,29 @@ enum TCProbeLogStore {
             try{document.dispatchEvent(new Event('selectionchange',{bubbles:true}));}catch(_){}
             try{host.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));}catch(_){}
             const escHtml=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            const plainOnly='\(path)'==='paste-plain';
             const html=text.split('\\n').map(p=>'<p>'+escHtml(p)+'</p>').join('');
-            let dt=null;try{dt=new DataTransfer();}catch(_){dt=null;}
-            if(dt){try{dt.setData('text/plain',text);}catch(_){}try{dt.setData('text/html',html);}catch(_){}if(!dt.getData||!dt.getData('text/plain'))dt=null;}
-            if(!dt){const store={'text/plain':text,'text/html':html};dt={types:['text/plain','text/html'],files:[],items:[],getData:t=>store[t]||'',setData:(t,v)=>{store[t]=v;}};}
+            const payloadText=\(clipboardTextJSON), construction='\(clipboardConstruction)';
+            let dt=null;
+            if(construction!=='compat'){try{dt=new DataTransfer();}catch(_){dt=null;}}
+            if(dt){try{dt.setData('text/plain',payloadText);}catch(_){}if(!plainOnly){try{dt.setData('text/html',html);}catch(_){}}if(!dt.getData||dt.getData('text/plain')!==payloadText)dt=null;}
+            if(construction==='native'&&!dt)throw new Error('Forced native DataTransfer unavailable');
+            const actualConstruction=dt?'native':'compat';
+            if(!dt){const store=plainOnly?{'text/plain':payloadText}:{'text/plain':payloadText,'text/html':html};dt={types:Object.keys(store),files:[],items:[],getData:t=>store[t]||'',setData:(t,v)=>{store[t]=v;}};}
             let ev=null;
-            try{ev=new ClipboardEvent('paste',{bubbles:true,cancelable:true,composed:true,clipboardData:dt});if(!ev.clipboardData||!ev.clipboardData.getData||!ev.clipboardData.getData('text/plain'))ev=null;}catch(_){ev=null;}
+            try{ev=new ClipboardEvent('paste',{bubbles:true,cancelable:true,composed:true,clipboardData:dt});if(!ev.clipboardData||!ev.clipboardData.getData||ev.clipboardData.getData('text/plain')!==payloadText)ev=null;}catch(_){ev=null;}
             if(!ev){ev=new Event('paste',{bubbles:true,cancelable:true,composed:true});try{Object.defineProperty(ev,'clipboardData',{value:dt});}catch(_){try{ev.clipboardData=dt;}catch(__){}}}
+            // Keep the original clipboardData object/prototype and all its other methods.
+            // Temporarily instrument only getData; always restore the own property afterwards.
+            const dataObject=ev.clipboardData, prototype=Object.getPrototypeOf(dataObject);
+            const ownRead=Object.getOwnPropertyDescriptor(dataObject,'getData'), raw=dataObject.getData.bind(dataObject);
+            let instrumented=false;
+            try{Object.defineProperty(dataObject,'getData',{configurable:true,value:t=>{const value=raw(t);if(t==='text/plain')note(2,'instrumented-read',{fullTextEqual:value===text,length:value.length,objectReplaced:false});return value;}});instrumented=true;}catch(_){note(2,'unobservable',{reason:'getData instrumentation unavailable'});}
+            note(2,'clipboard-construction',{requested:construction,actual:actualConstruction,objectReplaced:false,prototypePreserved:Object.getPrototypeOf(dataObject)===prototype,instrumented});
+            try{
             host.dispatchEvent(ev);
+            }finally{if(instrumented){if(ownRead)Object.defineProperty(dataObject,'getData',ownRead);else delete dataObject.getData;}}
+            note(1,'dispatch-complete',{defaultPrevented:ev.defaultPrevented,types:Array.from(dt.types||[])});
             return 'ok';
           }
           if('\(path)'==='exec'){
@@ -2058,6 +2083,188 @@ enum TCProbeLogStore {
         throw new Error('目标不是可填写元素');})()
         """, on: tab)
         return (result as? String) ?? ""
+    }
+
+    /// Self-test 42: actual production injection and orchestration in an isolated WKWebView.
+    func verifyDraftType4() async -> [String] {
+        let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        var lines: [String] = []
+        var records: [[String: Any]] = []
+        func js(_ value: String) -> String { String(decoding: try! JSONEncoder().encode(value), as: UTF8.self) }
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        func bool(_ script: String) async throws -> Bool { (try await evaluate(script, on: tab)) as? Bool == true }
+        func prepare(_ text: String, slot: String = "primary") async throws -> (AgentAction, PageElement) {
+            let page = try await state(in: tab)
+            guard let indexText = try await evaluate("document.querySelector('[data-mika-slot=\"\(slot)\"]').getAttribute('data-mika-idx')", on: tab) as? String,
+                  let index = Int(indexText), let expected = page.elements.first(where: { $0.index == index && $0.editable }) else {
+                throw MikaError("Self-test host binding failed: \(slot)")
+            }
+            let data = try JSONSerialization.data(withJSONObject: ["action":"type", "index":index,"text":text,"reason":"自检四十二"])
+            return (try JSONDecoder().decode(AgentAction.self, from: data), expected)
+        }
+        func record(_ name: String, exact: Bool? = nil, required: Bool = false) async throws {
+            let raw = try await evaluate("JSON.stringify({attempt:window.__mikaTypeAttempt,faults:window.__faultEvidence,errors:window.__type4Errors})", on: tab) as? String ?? "{}"
+            var entry: [String: Any] = ["case":name,"diagnostic":raw,"requiredInputSuccess":required]
+            if let exact { entry["exactCommitted"] = exact }
+            records.append(entry)
+        }
+        func loadFixture() async throws {
+            // A prior DOM-only/control path may make React unmount unsafe. Reload the document.
+            _ = try? await evaluate("window.__ready=false;true", on:tab)
+            try tab.loadLocal("test-draft")
+            for _ in 0..<40 {
+                if (try? await bool("window.__ready===true && !!window.__type4")) == true { return }
+                try await Task.sleep(for:.milliseconds(100))
+            }
+            throw MikaError("Draft fixture readiness timeout")
+        }
+        do {
+            let longText = String(repeating: "长文完整比较：段落和标点必须保留。\n\n", count: 200)
+            let cases = [("empty-chinese", "", "中文短文。"),
+                         ("equal-length", "旧文甲乙", "新文丙丁"),
+                         ("paragraphs-emoji", "旧文", "第一段。\n\n第二段 😀\n末段  保留空格。"),
+                         ("long-form", "旧文", longText)]
+            for (name, old, text) in cases {
+                for path in ["paste-plain", "paste", "events", "chunks", "exec", "range"] {
+                    let constructions = path.hasPrefix("paste") ? ["native", "compat"] : ["auto"]
+                    for construction in constructions {
+                        let label = "\(name)/\(path)/\(construction)"
+                        try await loadFixture()
+                        _ = try await evaluate("window.__type4.reset(\(js(old)),'',\(js(text)));true", on: tab)
+                        let (action, expected) = try await prepare(text)
+                        _ = try await runTypeScript(action: action, expected: expected, approved: false, path: path, clipboardConstruction: construction, tab: tab)
+                        try await Task.sleep(for: .milliseconds(100))
+                        let exact = try await bool("window.__type4.assert(\(js(text)))")
+                        try await record(label, exact:exact, required:path == "paste-plain" || (path == "paste" && !text.contains("\n\n")))
+                        if path == "paste" && text.contains("\n\n") {
+                            // Existing HTML import may collapse blank blocks. Keep the full assertion;
+                            // this is a comparison control, never count DOM/count growth as success.
+                            lines.append("· \(label): dual-format control, committed full equality=\(exact)")
+                            check(try await bool("window.__mikaTypeAttempt.hops.some(x=>x.status==='framework-handler'&&x.fullTextEqual&&x.htmlPresent===true)"), "\(label): dual-format receiver observed")
+                            check(try await bool("window.__type4Errors.length===0"), "\(label): no script exceptions")
+                            continue
+                        }
+                        if path.hasPrefix("paste") {
+                            check(exact, "\(label): committed full equality")
+                            check(try await bool("window.__type4Errors.length===0"), "\(label): no script exceptions")
+                            check(try await bool("""
+                            (()=>{const h=window.__mikaTypeAttempt.hops;
+                            return h.some(x=>x.hop===1&&x.status==='arrived') &&
+                              h.some(x=>x.hop===2&&x.status==='framework-handler'&&x.fullTextEqual) &&
+                              h.some(x=>x.hop===3&&x.status==='generated'&&x.fullTextEqual) &&
+                              h.some(x=>x.hop===4&&x.status==='committed'&&x.fullTextEqual) &&
+                              h.some(x=>x.hop===5&&x.status==='counter-updated'&&x.matchesCommitted);})()
+                            """), "\(label): all five hops")
+                            check(try await bool("window.__mikaTypeAttempt.hops.some(x=>x.status==='clipboard-construction'&&x.actual===\(js(construction))&&x.prototypePreserved&&x.objectReplaced===false)"), "\(label): forced construction, original object")
+                            if path == "paste-plain" {
+                                check(try await bool("window.__mikaTypeAttempt.hops.some(x=>x.status==='framework-handler'&&x.fullTextEqual&&x.htmlPresent===false)"), "\(label): receiver htmlPresent=false")
+                            }
+                            _ = try await evaluate("document.activeElement.blur();window.__type4.rerender();true", on: tab)
+                            check(try await bool("window.__type4.assert(\(js(text)))"), "\(label): blur+rerender")
+                            let saved = try await evaluate("JSON.stringify(window.__type4.savePayload())", on: tab) as? String ?? ""
+                            records.append(["case":label,"independentSave":saved])
+                            check(try await bool("window.__type4.clearForRestore() && window.__type4.text()===''"), "\(label): clear before restore")
+                            _ = try await evaluate("window.__type4.restorePayload();true", on: tab)
+                            check(try await bool("window.__type4.assert(\(js(text)))"), "\(label): independent JSON storage round-trip")
+                        } else {
+                            let errorCount = (try await evaluate("window.__type4Errors.length", on:tab)) as? Int ?? -1
+                            lines.append("· \(label): exactCommitted=\(exact), scriptErrors=\(errorCount), diagnostic control (not a success verdict)")
+                        }
+                    }
+                }
+            }
+            // At least one main positive, including real long text, traverses performType.
+            for text in ["生产编排中文正例。", longText] {
+                try await loadFixture()
+                _ = try await evaluate("window.__type4.reset('','',\(js(text)));true", on: tab)
+                let (action, expected) = try await prepare(text)
+                try await performType(action, expected: expected, approved: false, tab: tab)
+                check(try await bool("window.__type4.assert(\(js(text)))"), "production performType positive: full equality, length=\(text.count)")
+                check(lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") }), "production editor route evidence")
+                check(try await bool("window.__type4Errors.length===0"), "production positive: no script exceptions")
+                records.append(["case":"production-positive","length":text.count,"trace":lastEditorTypeTrace])
+            }
+            try await loadFixture()
+            _ = try await evaluate("window.__type4.reset('','','DOM-only');document.querySelector('[data-mika-slot=primary]').textContent='DOM-only';true", on: tab)
+            check(try await bool("!window.__type4.assert('DOM-only')"), "DOM-only must FAIL")
+
+            // Ignore negative: unrelated exceptions cannot satisfy the expected rejection.
+            let ignoredText = String(repeating:"忽略处理器不得提交这段正文。", count:4)
+            try await loadFixture()
+            _ = try await evaluate("window.__type4.reset('','ignore',\(js(ignoredText)));true", on: tab)
+            let (ignoredAction, ignoredHost) = try await prepare(ignoredText)
+            var expectedRejection = false
+            var rejection = "NO ERROR"
+            do {
+                try await performType(ignoredAction, expected: ignoredHost, approved: false, tab: tab)
+                _ = try await evaluate("document.getElementById('update').click();true", on: tab)
+            } catch {
+                rejection = error.localizedDescription
+                if let mika = error as? MikaError {
+                    expectedRejection = mika.message.contains("编辑器内部字数仍停在 0 字") &&
+                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") }) &&
+                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("range=dom-ok,count-frozen:0(基线0)") })
+                }
+            }
+            check(try await bool("window.__type4Errors.length===0"), "ignored handler: no unrelated script exceptions")
+            check(expectedRejection, "ignored handler: expected frozen-state rejection (other exceptions FAIL)")
+            check(try await bool("window.__faultEvidence.some(x=>x.kind==='paste'&&x.strategy==='paste-plain'&&x.fullTextEqual)"), "ignored handler actually received full paste-plain")
+            check(try await bool("window.__updateCalls===0 && window.__type4.assert('')"), "ignored handler: update calls=0, committed baseline intact")
+            records.append(["case":"ignored-production","error":rejection,"expectedRejection":expectedRejection,"trace":lastEditorTypeTrace])
+            try await record("ignored-handler-receipt")
+
+            // Upper application rejects a generated full candidate state.
+            try await loadFixture()
+            _ = try await evaluate("window.__type4.reset('','reject','上层拒绝候选状态');true", on: tab)
+            let (rejectAction, rejectHost) = try await prepare("上层拒绝候选状态")
+            _ = try await runTypeScript(action: rejectAction, expected: rejectHost, approved: false, path: "paste-plain", clipboardConstruction: "native", tab: tab)
+            check(try await bool("!window.__type4.assert('上层拒绝候选状态') && window.__type4.assert('') && window.__faultEvidence.some(x=>x.kind==='application-rejected'&&x.fullTextEqual) && window.__mikaTypeAttempt.hops.some(x=>x.status==='generated'&&x.fullTextEqual)"), "reject mode: generated full candidate, application refused, no commit")
+            check(try await bool("window.__updateCalls===0"), "reject mode: update calls=0")
+            check(try await bool("window.__type4Errors.length===0"), "reject mode: no script exceptions")
+            try await record("application-reject")
+
+            // Deliberately truncate transport data, retaining expected full body for all assertions.
+            for construction in ["native", "compat"] {
+                try await loadFixture()
+                _ = try await evaluate("window.__type4.reset('','','传输正文不可丢失尾部');true", on: tab)
+                let (lossAction, lossHost) = try await prepare("传输正文不可丢失尾部")
+                _ = try await runTypeScript(action: lossAction, expected: lossHost, approved: false, path: "paste-plain", clipboardConstruction: construction, clipboardText: "传输正文不可丢失", tab: tab)
+                check(try await bool("!window.__type4.assert('传输正文不可丢失尾部') && window.__type4.assert('传输正文不可丢失') && window.__mikaTypeAttempt.hops.some(x=>x.status==='framework-handler'&&x.fullTextEqual===false&&x.htmlPresent===false)"), "data loss/\(construction): receiver mismatch and full equality FAIL")
+                check(try await bool("window.__updateCalls===0"), "data loss/\(construction): update calls=0")
+                check(try await bool("window.__type4Errors.length===0"), "data loss: no script exceptions")
+                try await record("data-loss/\(construction)")
+            }
+
+            // Two independent roots and counters: target the second, preserve the first.
+            let untouched = String(repeating:"第一编辑器保持原文", count:40)
+            let secondText = "第二编辑器独立正文。"
+            try await loadFixture()
+            _ = try await evaluate("window.__type4.dual(\(js(untouched)),'',\(js(secondText)));true", on: tab)
+            let (dualAction, dualHost) = try await prepare(secondText, slot:"secondary")
+            let before = try await probeEditorSignals(action:dualAction, tab:tab)
+            try await performType(dualAction, expected:dualHost, approved:false, tab:tab)
+            let after = try await probeEditorSignals(action:dualAction, tab:tab)
+            check(before.locatedByIndex && before.count == 0 && after.locatedByIndex && after.count == Self.normalizedLength(secondText), "dual editor: production probe bound to second counter")
+            check(try await bool("window.__type4.assert(\(js(untouched)),'primary') && window.__type4.assert(\(js(secondText)),'secondary')"), "dual editor: second exact, first state+counter unchanged")
+            check(try await bool("window.__type4Errors.length===0"), "dual editor: no script exceptions")
+            records.append(["case":"dual-production","trace":lastEditorTypeTrace])
+            try await record("dual-binding")
+        } catch { lines.append("✗ 自检四十二异常（不计为预期拒绝）：\(error.localizedDescription)") }
+        Self.storeType4Diagnostic(["kind":"zhihu-type4", "runtime":"WKWebView", "lines":lines, "records":records])
+        return lines
+    }
+
+    private static func storeType4Diagnostic(_ payload: [String: Any]) {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
+        let id = UUID().uuidString
+        let envelope: [String: Any] = ["schemaVersion":1, "id":id,
+            "receivedAt":ISO8601DateFormatter().string(from: Date()), "types":["type 五跳诊断"], "payload":payload]
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+            try data.write(to: directory.appendingPathComponent("type4-\(id).json"), options: .atomic)
+        } catch { /* Diagnostics never changes the fail-closed verdict. */ }
     }
 
     private struct TypeVerification: Decodable {
@@ -2278,12 +2485,15 @@ enum TCProbeLogStore {
         // ZHUANLAN-FIX2：Draft 类编辑器走粘贴优先阶梯（paste→events→chunks→
         // exec→range）；其余编辑器保持第一轮阶梯不变，不扰动既有可用路径。
         let strategies: [String] = await probeDraftClass(action: action, tab: tab)
-            ? ["paste", "events", "chunks", "exec", "range"]
+            ? ["paste-plain", "paste", "events", "chunks", "exec", "range"]
             : ["exec", "events", "chunks", "range"]
         var trace: [String] = []
         defer { lastEditorTypeTrace.append(contentsOf: trace) }
         var failure: EditorWriteFailure = .domMissing
         for (i, path) in strategies.enumerated() {
+            // No safe framework reset API exists on arbitrary sites. Never rewrite innerHTML
+            // as a "reset"; independent strategy evidence is collected by self-test reconstruction.
+            trace.append("baseline-reset=unavailable,independent=false,strategy=\(path)")
             let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, strict: i == 0, tab: tab)
             if status == "exec-failed" { trace.append("\(path)=exec-failed"); continue }
             try await Task.sleep(for: .milliseconds(500))
@@ -2296,6 +2506,13 @@ enum TCProbeLogStore {
                 }
             }
             let signals = try? await probeEditorSignals(action: action, tab: tab)
+            let counterJSON = signals?.count.map(String.init) ?? "null"
+            _ = try? await evaluate("window.__mikaTypeNote?.(5,'counter-observed',{count:\(counterJSON)});true", on: tab)
+            if let diagnostic = try? await evaluate("JSON.stringify(window.__mikaTypeAttempt||{})", on: tab) as? String {
+                trace.append(diagnostic)
+                Self.storeType4Diagnostic(["kind":"type-attempt", "strategy":path, "fiveHops":diagnostic,
+                    "counterObserved":signals?.count.map { $0 as Any } ?? NSNull(), "baselineReset":"unavailable", "independent":false])
+            }
             switch TypeVerifyPolicy.verdict(baselineCount: baseline.count, postCount: signals?.count,
                                             textOK: v.textOK, expectedCount: expectedLen,
                                             longForm: expectedLen >= 200) {

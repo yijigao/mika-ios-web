@@ -293,6 +293,15 @@ struct SelfTestView: View {
                 dismiss()
             }.disabled(!engine.active)
             Text("自检四十一预期：分发真值表及 199/200 字边界、长文双 nil 失败与短文双 nil 宽容均通过；真实知乎编辑器需真机复测。").font(.caption).foregroundStyle(.secondary)
+            Button("自检四十二：Draft 五跳与全文提交") {
+                Task { @MainActor in
+                    conversation.localFeedback("自检四十二开始：独立 WKWebView；仅换行规范化，全文相等")
+                    let lines = await engine.verifyDraftType4()
+                    for line in lines { conversation.localFeedback("自检四十二：\(line)") }
+                    conversation.localFeedback(lines.contains(where: { $0.hasPrefix("✗") }) ? "自检四十二：FAIL，见诊断导出" : "自检四十二：必检断言 PASS；各策略成功与失败另见诊断")
+                }
+                dismiss()
+            }.disabled(!engine.active)
             if let tcLogURL = TCProbeLogStore.latestURL() {
                 ShareLink(item: tcLogURL) { Text("导出最近一份可信点按实验日志（JSON）") }
             }
