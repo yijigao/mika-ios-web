@@ -2306,15 +2306,14 @@ enum TCProbeLogStore {
             _ = try await evaluate("window.__type4.reset('','','DOM-only');document.querySelector('[data-mika-slot=primary]').textContent='DOM-only';true", on: tab)
             check(try await bool("!window.__type4.assert('DOM-only')"), "DOM-only must FAIL")
 
-            // Ignore negative: unrelated exceptions cannot satisfy the expected rejection.
+            // Verified rejection requires this call's safety, receipt and matching failure evidence.
             let ignoredText = String(repeating:"忽略处理器不得提交这段正文。", count:4)
             try await loadFixture()
             tab.type4IgnoredEvaluationErrors = []
             tab.type4IgnoredEvaluationPhase = "reset-and-prepare"
             _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','reset-and-prepare');window.__type4.reset('','ignore',\(js(ignoredText)));true", on: tab)
             let (ignoredAction, ignoredHost) = try await prepare(ignoredText)
-            var expectedRejection = false
-            var rejectionMessageMatches = false
+            var rejectedWithMikaError = false
             var rejection = "NO ERROR"
             tab.type4IgnoredEvaluationPhase = "performType-including-failure-snapshot"
             _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','performType-including-failure-snapshot');true", on:tab)
@@ -2323,19 +2322,9 @@ enum TCProbeLogStore {
                 _ = try await evaluate("document.getElementById('update').click();true", on: tab)
             } catch {
                 rejection = error.localizedDescription
-                if let mika = error as? MikaError {
-                    rejectionMessageMatches = mika.message.contains("编辑器内部字数仍停在 0 字")
-                }
+                rejectedWithMikaError = error is MikaError
             }
-            let rejectionEditorPathMatches = lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") })
-            let rejectionFrozenTraceMatches = lastEditorTypeTrace.contains(where: { $0.hasSuffix("=dom-ok,count-frozen:0(基线0)") })
-            expectedRejection = rejectionMessageMatches && rejectionEditorPathMatches && rejectionFrozenTraceMatches
-            let rejectionEvidence: [String: Any] = ["errorMessage":rejection, "trace":lastEditorTypeTrace,
-                "messageMatches":rejectionMessageMatches, "editorPathMatches":rejectionEditorPathMatches,
-                "frozenTraceMatches":rejectionFrozenTraceMatches, "expectedRejection":expectedRejection]
-            let rejectionJSON = String(decoding:try JSONSerialization.data(withJSONObject:rejectionEvidence, options:[.sortedKeys]),as:UTF8.self)
-            lines.append("· ignored handler rejection evidence: \(rejectionJSON)")
-            records.append(["case":"ignored-handler-rejection-evidence","evidence":rejectionEvidence])
+            let rejectionTrace = lastEditorTypeTrace
             // Keep every unknown/type-path exception counted. Emit identity in both result
             // lines and Diagnostics before evaluating the unchanged zero-exception requirement.
             let nativeErrors = tab.type4IgnoredEvaluationErrors ?? []
@@ -2354,13 +2343,90 @@ enum TCProbeLogStore {
                 lines.append("· ignored handler exception identity: \(raw)")
             }
             lines.append("· ignored handler exceptions: counted=\(counted), excluded=0 (no proven unrelated source)")
+
+            // JSONDecoder rejects Bool-as-number and string-as-number coercion.
+            func evidenceValue<T: Decodable>(_ type: T.Type, _ value: Any?) -> T? {
+                guard let value, let data = try? JSONSerialization.data(withJSONObject:value, options:[.fragmentsAllowed]) else { return nil }
+                return try? JSONDecoder().decode(type, from:data)
+            }
+            let rejectionStrategies = ["paste-plain", "paste", "events", "chunks", "exec"]
+            var attempts: [[String: Any]] = []
+            var terminals: [(strategy:String, status:String)] = []
+            for row in rejectionTrace {
+                if row.hasPrefix("{"), let data = row.data(using:.utf8),
+                   let attempt = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
+                   let strategy = attempt["strategy"] as? String, rejectionStrategies.contains(strategy) {
+                    attempts.append(attempt)
+                }
+                for strategy in rejectionStrategies where row.hasPrefix(strategy + "=") {
+                    terminals.append((strategy, String(row.dropFirst(strategy.count + 1))))
+                }
+            }
+            // H must be ordered within one complete paste-plain attempt, never stitched.
+            let plainAttempts = attempts.filter { $0["strategy"] as? String == "paste-plain" }
+            let receiptChecks: [([String: Any]) -> Bool] = [
+                { $0["hop"] as? Int == 1 && $0["status"] as? String == "arrived" && $0["event"] as? String == "paste" && evidenceValue(Bool.self, $0["targetIsHost"]) == true },
+                { $0["hop"] as? Int == 2 && $0["status"] as? String == "framework-handler" && $0["editor"] as? String == "primary" && evidenceValue(Bool.self, $0["fullTextEqual"]) == true && evidenceValue(Bool.self, $0["htmlPresent"]) == false },
+                { $0["hop"] as? Int == 2 && $0["status"] as? String == "ignored-handler" && $0["kind"] as? String == "paste" && evidenceValue(Bool.self, $0["fullTextEqual"]) == true },
+                { $0["hop"] as? Int == 1 && $0["status"] as? String == "dispatch-complete" && evidenceValue(Bool.self, $0["defaultPrevented"]) == true }
+            ]
+            var h = false
+            if plainAttempts.count == 1, let id = plainAttempts[0]["id"] as? String, !id.isEmpty,
+               let hops = plainAttempts[0]["hops"] as? [[String:Any]] {
+                var cursor = -1
+                h = receiptChecks.allSatisfy { predicate in
+                    guard let next = hops.indices.first(where: { $0 > cursor && predicate(hops[$0]) }) else { return false }
+                    cursor = next
+                    return true
+                }
+            }
+            let f = terminals.contains { $0.status == "dom-ok,count-frozen:0(基线0)" }
+            let attemptIDs = attempts.compactMap { $0["id"] as? String }
+            let d = !f && attempts.count == 5 && attemptIDs.count == 5 && attemptIDs.allSatisfy { !$0.isEmpty } && Set(attemptIDs).count == 5 && rejectionStrategies.allSatisfy { strategy in
+                let matchingAttempts = attempts.filter { $0["strategy"] as? String == strategy }
+                let matchingTerminals = terminals.filter { $0.strategy == strategy }
+                guard matchingAttempts.count == 1, matchingTerminals.count == 1, matchingTerminals[0].status == "dom-missing",
+                      let hops = matchingAttempts[0]["hops"] as? [[String:Any]] else { return false }
+                let counters = hops.filter { $0["status"] as? String == "counter-observed" }
+                return !counters.isEmpty && counters.allSatisfy {
+                    guard let count = evidenceValue(Double.self, $0["count"]) else { return false }
+                    return count.isFinite && count == 0
+                }
+            }
+            // Same fixture getters as the unchanged independent safety check below.
+            let safetyIntact = try await bool("window.__updateCalls===0 && window.__type4.assert('')")
+            let g = rejectionTrace.first?.hasPrefix("path=editor,") == true && rejectedWithMikaError && safetyIntact && counted == 0
+            let errFrozen = rejection.contains("编辑器内部字数仍停在 0 字")
+            let errDomMissing = rejection.contains("5 种写入方式都已尝试、回读仍为空或对不上")
+            let expectedRejection = g && h && ((f && errFrozen) || (d && errDomMissing))
+            let rejectionEvidence: [String: Any] = ["g":g,"h":h,"f":f,"d":d,
+                "errorKind":errFrozen ? "frozen" : errDomMissing ? "domMissing" : "other",
+                "errorMessage":rejection,"trace":rejectionTrace]
+            let rejectionJSON = String(decoding:try JSONSerialization.data(withJSONObject:rejectionEvidence, options:[.sortedKeys]),as:UTF8.self)
+            lines.append("· ignored handler rejection evidence: \(rejectionJSON)")
+            records.append(["case":"ignored-handler-rejection-evidence","evidence":rejectionEvidence])
             check(counted == 0, "ignored handler: no unrelated script exceptions")
-            check(expectedRejection, "ignored handler: expected frozen-state rejection (other exceptions FAIL)")
+            check(expectedRejection, "ignored handler: expected verified rejection (other exceptions FAIL)")
             check(try await bool("window.__faultEvidence.some(x=>x.kind==='paste'&&x.strategy==='paste-plain'&&x.fullTextEqual)"), "ignored handler actually received full paste-plain")
             check(try await bool("window.__updateCalls===0 && window.__type4.assert('')"), "ignored handler: update calls=0, committed baseline intact")
             records.append(["case":"ignored-production","error":rejection,"expectedRejection":expectedRejection,"trace":lastEditorTypeTrace])
             try await record("ignored-handler-receipt")
             tab.type4IgnoredEvaluationErrors = nil
+
+            // Paired control: same fixture, empty baseline and 56-character body; ignore off.
+            try await loadFixture()
+            _ = try await evaluate("window.__type4.reset('','ignore',\(js(ignoredText)));window.__mode='';true", on:tab)
+            let (positiveAction, positiveHost) = try await prepare(ignoredText)
+            var positiveCommitted = false
+            do {
+                try await performType(positiveAction, expected:positiveHost, approved:false, tab:tab)
+                let signals = try await probeEditorSignals(action:positiveAction, tab:tab)
+                positiveCommitted = try await bool("window.__type4.assert(\(js(ignoredText)))") && signals.found && signals.locatedByIndex && signals.count == Self.normalizedLength(ignoredText)
+            } catch {
+                lines.append("· ignored handler positive control error: \(error.localizedDescription)")
+            }
+            check(positiveCommitted, "ignored handler: positive control commits full text when ignore off")
+            check(TypeVerifyPolicy.verdict(baselineCount:0, postCount:0, textOK:true, expectedCount:100, longForm:false) == .failFrozen(0), "type policy: frozen verdict pinned (baseline 0, post 0, expected 100)")
 
             // Upper application rejects a generated full candidate state.
             try await loadFixture()
