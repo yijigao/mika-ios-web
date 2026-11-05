@@ -40,7 +40,7 @@ const path = require('path');
   async function probe(index) { return JSON.parse(await page.evaluate(probeTemplate.replace('\\(json)',JSON.stringify({index,epoch:1})))); }
   const longText = '长文完整比较：段落和标点必须保留。\n\n'.repeat(200);
   for(const [name,old,text] of [['empty','','中文短文。'],['equal','旧文甲乙','新文丙丁'],['multi','旧文','第一段。\n\n第二段 😀\n末段  保留空格。'],['long','旧文',longText]]) {
-   for(const strategy of ['paste-plain','paste','events','chunks','exec','range']) {
+   for(const strategy of ['paste-plain','paste','events','chunks','exec']) {
     for(const construction of strategy.startsWith('paste') ? ['native','compat'] : ['auto']) {
      const label = `${name}/${strategy}/${construction}`;
      await reset(old,text);

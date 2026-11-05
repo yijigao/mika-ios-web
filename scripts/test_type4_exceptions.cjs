@@ -26,16 +26,18 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
    const prefix=`const a=${JSON.stringify({text,index})},e=document.querySelector('[data-mika-slot=primary]');`;
    const source=template.replace('\\(prefix)',prefix).replaceAll('\\(path)',strategy).replaceAll('\\(clipboardConstruction)','auto').replaceAll('\\(clipboardTextJSON)',JSON.stringify(text));
    await page.evaluate(()=>window.__type4SetExceptionContext('ignored-handler','performType-JS-sequence'));
-   await page.evaluate(source);await page.waitForTimeout(500);
+   const status=await page.evaluate(source);await page.waitForTimeout(500);
    const signals=JSON.parse(await page.evaluate(probe.replace('\\(json)',JSON.stringify({index,epoch:1}))));
-   return {strategy,signals,exceptionReport:await page.evaluate(()=>window.__type4ExceptionReport())};
+   return {strategy,status,signals,exceptionReport:await page.evaluate(()=>window.__type4ExceptionReport())};
   }
   await reset();
-  for(const strategy of ['paste-plain','paste','events','chunks','exec','range'])records.push(await inject(strategy));
+  for(const strategy of ['paste-plain','paste','events','chunks','exec'])records.push(await inject(strategy));
   // Match the post-failure extraction, and yield for asynchronous selectionchange errors.
   await page.evaluate(extract);await page.waitForTimeout(250);
   const natural=await page.evaluate(()=>({report:window.__type4ExceptionReport(),baseline:window.__type4.assert(''),calls:window.__updateCalls,faults:window.__faultEvidence}));
   check(natural.baseline&&natural.calls===0,'full dirty fallback control keeps baseline and update=0');
+  check(natural.report.counted===0&&natural.report.entries.length===0,'ignored handler: no unrelated script exceptions');
+  check(records.at(-1).strategy==='exec'&&records.at(-1).status==='ok'&&records.at(-1).signals.count===0&&records.at(-1).signals.textLength===text.length,'last exec leaves visible body but frozen zero state');
   check(natural.faults.some(x=>x.kind==='paste'&&x.strategy==='paste-plain'&&x.fullTextEqual),'full control actually receives ignored body');
   check(natural.report.counted===natural.report.entries.length&&natural.report.excluded.length===0,'natural errors remain counted, none excluded');
   check(natural.report.entries.every(x=>x.counted&&x.classification==='unclassified-counted'&&Object.hasOwn(x,'filename')&&Object.hasOwn(x,'stack')),'natural identity preserved without source allowlist');

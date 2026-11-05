@@ -1991,7 +1991,7 @@ enum TCProbeLogStore {
     /// beforeinput→（框架未接管才）原生插入→input 事件序列（Draft.js 类编辑器靠
     /// beforeinput 的 data 把文字吃进内部状态，整段原生插入在 WKWebView 里可能只
     /// 改 DOM 不动状态——ZHIHU-COLUMN-SYNC 实证）；path=chunks：按段原生插入＋逐段
-    /// input 事件；path=range：Selection/Range 直接写 DOM 再补 InputEvent（末位兜底）。
+    /// input 事件。
     /// 表单字段各路径同法：原生 value setter＋InputEvent（React 受控组件认 setter＋
     /// input 事件）。返回 'ok' 或 'exec-failed'。
     private func runTypeScript(action: AgentAction, expected: PageElement, approved: Bool, path: String, strict: Bool = true, clipboardConstruction: String = "auto", clipboardText: String? = nil, tab: BrowserTab) async throws -> String {
@@ -2111,17 +2111,6 @@ enum TCProbeLogStore {
             });
             return 'ok';
           }
-          const range=sel.getRangeAt(0);
-          range.deleteContents();
-          const frag=document.createDocumentFragment();
-          text.split('\\n').forEach((line,i)=>{if(i>0)frag.appendChild(document.createElement('br'));frag.appendChild(document.createTextNode(line));});
-          range.insertNode(frag);
-          sel.collapseToEnd();
-          let bi=null;try{bi=new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:text});}catch(_){bi=null;}
-          if(bi)e.dispatchEvent(bi);
-          fireInput('insertText',text);
-          e.dispatchEvent(new Event('change',{bubbles:true}));
-          return 'ok';
         }
         throw new Error('目标不是可填写元素');})()
         """, on: tab)
@@ -2254,7 +2243,7 @@ enum TCProbeLogStore {
                          ("paragraphs-emoji", "旧文", "第一段。\n\n第二段 😀\n末段  保留空格。"),
                          ("long-form", "旧文", longText)]
             for (name, old, text) in cases {
-                for path in ["paste-plain", "paste", "events", "chunks", "exec", "range"] {
+                for path in ["paste-plain", "paste", "events", "chunks", "exec"] {
                     let constructions = path.hasPrefix("paste") ? ["native", "compat"] : ["auto"]
                     for construction in constructions {
                         let label = "\(name)/\(path)/\(construction)"
@@ -2336,7 +2325,7 @@ enum TCProbeLogStore {
                 if let mika = error as? MikaError {
                     expectedRejection = mika.message.contains("编辑器内部字数仍停在 0 字") &&
                         lastEditorTypeTrace.contains(where: { $0.hasPrefix("path=editor,") }) &&
-                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("range=dom-ok,count-frozen:0(基线0)") })
+                        lastEditorTypeTrace.contains(where: { $0.hasPrefix("exec=dom-ok,count-frozen:0(基线0)") })
                 }
             }
             // Keep every unknown/type-path exception counted. Emit identity in both result
@@ -2621,8 +2610,8 @@ enum TCProbeLogStore {
     /// 编辑器内部状态，判该策略失败并自动升级下一策略）、保存状态落定（计数
     /// 已对上但一直「保存中」时先失焦促同步并等一个窗口复查，仍不落定按
     /// 「保存未落定」口径收尾，未落定前本动作绝不返回成功、更不会去点更新）。
-    /// 策略阶梯：Draft 类＝paste→events→chunks→exec→range，其余＝exec→
-    /// events→chunks→range（ZHUANLAN-FIX2 分流）。首策略用严格 guard，后续
+    /// 策略阶梯：Draft 类＝paste-plain→paste→events→chunks→exec，其余＝exec→
+    /// events→chunks（ZHUANLAN-FIX2 分流）。首策略用严格 guard，后续
     /// 策略用宽松 guard（编辑器文本已被前一策略改动，逐字段比对必然误判）。
     /// 全部不过关才汇报，逐策略读数进失败快照留痕。
     /// Draft 类编辑器探测（ZHUANLAN-FIX2）：编辑器子树里有 data-offset-key
@@ -2645,11 +2634,10 @@ enum TCProbeLogStore {
 
     private func performTypeInEditor(action: AgentAction, expected: PageElement, approved: Bool, baseline: EditorSignals, tab: BrowserTab) async throws {
         let expectedLen = Self.normalizedLength(action.text)
-        // ZHUANLAN-FIX2：Draft 类编辑器走粘贴优先阶梯（paste→events→chunks→
-        // exec→range）；其余编辑器保持第一轮阶梯不变，不扰动既有可用路径。
+        // Draft 类走 paste-plain→paste→events→chunks→exec；其他编辑器仅移除 range。
         let strategies: [String] = await probeDraftClass(action: action, tab: tab)
-            ? ["paste-plain", "paste", "events", "chunks", "exec", "range"]
-            : ["exec", "events", "chunks", "range"]
+            ? ["paste-plain", "paste", "events", "chunks", "exec"]
+            : ["exec", "events", "chunks"]
         var trace: [String] = []
         defer { lastEditorTypeTrace.append(contentsOf: trace) }
         var failure: EditorWriteFailure = .domMissing
@@ -2737,7 +2725,7 @@ enum TCProbeLogStore {
     /// 路径重试一次；仍不过关如实报「没输入进去」，不再误报成「找不到发表按钮」。
     /// 文字已进但提交按钮全员禁用时单独报「按钮是灰的」。
     private func performTypeLegacy(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
-        for path in ["exec", "range"] {
+        for path in ["exec"] {
             let status = try await runTypeScript(action: action, expected: expected, approved: approved, path: path, tab: tab)
             if status == "exec-failed" { continue }
             try await Task.sleep(for: .milliseconds(400))
