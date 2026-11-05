@@ -4,8 +4,40 @@ const normalize = s => s.replace(/\r\n?/g, '\n');
 const countText = s => s.replace(/\s/g, '').length; // Fixture counter: UTF-16 non-whitespace units.
 const hop = (n, status, detail = {}) => window.__mikaTypeNote?.(n, status, detail);
 const instances = new Map();
+// Keep the original append-only window.error count; enrich identity without suppressing anything.
 window.__type4Errors = [];
-window.addEventListener('error', event => window.__type4Errors.push(event.message));
+window.__type4UnhandledRejections = [];
+window.__type4ExceptionContext = {case:'fixture-bootstrap', phase:'fixture-bootstrap'};
+window.__type4SetExceptionContext = (caseName, phase) => { window.__type4ExceptionContext = {case:caseName, phase}; };
+const exceptionIdentity = (kind, error, identity) => ({
+  kind, ...identity, name:typeof error?.name === 'string' ? error.name : null,
+  stack:typeof error?.stack === 'string' ? error.stack : null,
+  context:{...window.__type4ExceptionContext}, strategy:window.__mikaTypeAttempt?.strategy || null,
+  mode:window.__mode || null, documentURL:location.href, capturedAt:new Date().toISOString(), monotonicMs:performance.now()
+});
+window.addEventListener('error', event => {
+  window.__type4Errors.push(exceptionIdentity('window.error', event.error, {
+    message:typeof event.message === 'string' ? event.message : null,
+    filename:typeof event.filename === 'string' ? event.filename : null,
+    lineno:event.lineno ?? null, colno:event.colno ?? null,
+    resourceURL:event.target?.src || event.target?.href || null
+  }));
+});
+window.addEventListener('unhandledrejection', event => {
+  const reason = event.reason;
+  // Store separately: only the ignored-handler hygiene gate consumes this added channel.
+  window.__type4UnhandledRejections.push(exceptionIdentity('unhandledrejection', reason, {
+    message:typeof reason?.message === 'string' ? reason.message : typeof reason === 'string' ? reason : String(reason),
+    filename:null, lineno:null, colno:null, resourceURL:null
+  }));
+});
+window.__type4ExceptionReport = (nativeErrors = []) => {
+  // No error has a proven unrelated origin yet. No message/filename/phase allowlist.
+  const entries = [...window.__type4Errors, ...window.__type4UnhandledRejections, ...nativeErrors].map(error => ({
+    ...error, classification:'unclassified-counted', counted:true, exclusionBasis:null
+  }));
+  return {policy:'fail-unless-proven-unrelated-and-causally-independent', counted:entries.length, excluded:[], entries};
+};
 const element = (name, id = 'primary') => document.getElementById(id === 'primary' ? name : name + '-secondary');
 const fault = (kind, text) => {
   const evidence = {kind, fullTextEqual: text === window.__expected, strategy: window.__mikaTypeAttempt?.strategy};

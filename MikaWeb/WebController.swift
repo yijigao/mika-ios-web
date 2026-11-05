@@ -193,6 +193,9 @@ enum SiteMode: String {
     /// 不承诺网页进程永驻：进程被系统回收时由引擎调度恢复。
     @Published var isPinned = false
     let webView: WKWebView
+    // Nil for every normal tab and every other self-test: opt-in ignored-handler evidence only.
+    fileprivate var type4IgnoredEvaluationErrors: [[String: Any]]?
+    fileprivate var type4IgnoredEvaluationPhase = ""
     @Published private(set) var urlString = ""
     @Published private(set) var title = ""
     @Published private(set) var estimatedProgress = 0.0
@@ -1843,7 +1846,29 @@ enum TCProbeLogStore {
     }
     /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
     func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
-    private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? { try await tab.webView.evaluateJavaScript(script) }
+    private func captureType4IgnoredEvaluationError(_ error: Error, script: String, on tab: BrowserTab) {
+        guard tab.type4IgnoredEvaluationErrors != nil else { return }
+        let native = error as NSError
+        let info = native.userInfo
+        let entry: [String: Any] = ["kind":"evaluateJavaScript", "scriptID":UUID().uuidString,
+            "message":info["WKJavaScriptExceptionMessage"] as? String ?? error.localizedDescription,
+            "localizedDescription":error.localizedDescription, "domain":native.domain,"code":native.code,
+            "filename":info["WKJavaScriptExceptionSourceURL"] as? String ?? "",
+            "lineno":(info["WKJavaScriptExceptionLineNumber"] as? NSNumber).map { $0 as Any } ?? NSNull(),
+            "colno":(info["WKJavaScriptExceptionColumnNumber"] as? NSNumber).map { $0 as Any } ?? NSNull(),
+            "context":["case":"ignored-handler","phase":tab.type4IgnoredEvaluationPhase],
+            "capturedAt":ISO8601DateFormatter().string(from:Date()),"script":script,
+            "classification":"unclassified-counted","counted":true]
+        tab.type4IgnoredEvaluationErrors?.append(entry)
+        Self.storeType4Diagnostic(["kind":"ignored-handler-native-exception","exception":entry])
+    }
+    private func evaluate(_ script: String, on tab: BrowserTab) async throws -> Any? {
+        do { return try await tab.webView.evaluateJavaScript(script) }
+        catch {
+            captureType4IgnoredEvaluationError(error, script:script, on:tab)
+            throw error
+        }
+    }
     func state() async throws -> PageState { try await state(in: executionTab) }
     private func state(in tab: BrowserTab, forCapture: Bool = false) async throws -> PageState {
         if !agentWorkSuspended && !forCapture {
@@ -2108,6 +2133,7 @@ enum TCProbeLogStore {
         let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
         var lines: [String] = []
         var records: [[String: Any]] = []
+        defer { tab.type4IgnoredEvaluationErrors = nil }
         func js(_ value: String) -> String { String(decoding: try! JSONEncoder().encode(value), as: UTF8.self) }
         func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
         func bool(_ script: String) async throws -> Bool { (try await evaluate(script, on: tab)) as? Bool == true }
@@ -2126,7 +2152,10 @@ enum TCProbeLogStore {
                 }
                 tab.webView.evaluateJavaScript(script) { value, error in
                     Task { @MainActor in
-                        if let error { gate.finish(.failure(error)) }
+                        if let error {
+                            self.captureType4IgnoredEvaluationError(error, script:script, on:tab)
+                            gate.finish(.failure(error))
+                        }
                         else if let value = value as? String { gate.finish(.success(value)) }
                         else { gate.finish(.failure(MikaError("Self-test host probe returned non-JSON result"))) }
                     }
@@ -2291,10 +2320,14 @@ enum TCProbeLogStore {
             // Ignore negative: unrelated exceptions cannot satisfy the expected rejection.
             let ignoredText = String(repeating:"忽略处理器不得提交这段正文。", count:4)
             try await loadFixture()
-            _ = try await evaluate("window.__type4.reset('','ignore',\(js(ignoredText)));true", on: tab)
+            tab.type4IgnoredEvaluationErrors = []
+            tab.type4IgnoredEvaluationPhase = "reset-and-prepare"
+            _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','reset-and-prepare');window.__type4.reset('','ignore',\(js(ignoredText)));true", on: tab)
             let (ignoredAction, ignoredHost) = try await prepare(ignoredText)
             var expectedRejection = false
             var rejection = "NO ERROR"
+            tab.type4IgnoredEvaluationPhase = "performType-including-failure-snapshot"
+            _ = try await evaluate("window.__type4SetExceptionContext('ignored-handler','performType-including-failure-snapshot');true", on:tab)
             do {
                 try await performType(ignoredAction, expected: ignoredHost, approved: false, tab: tab)
                 _ = try await evaluate("document.getElementById('update').click();true", on: tab)
@@ -2306,12 +2339,31 @@ enum TCProbeLogStore {
                         lastEditorTypeTrace.contains(where: { $0.hasPrefix("range=dom-ok,count-frozen:0(基线0)") })
                 }
             }
-            check(try await bool("window.__type4Errors.length===0"), "ignored handler: no unrelated script exceptions")
+            // Keep every unknown/type-path exception counted. Emit identity in both result
+            // lines and Diagnostics before evaluating the unchanged zero-exception requirement.
+            let nativeErrors = tab.type4IgnoredEvaluationErrors ?? []
+            let nativeJSON = String(decoding:try JSONSerialization.data(withJSONObject:nativeErrors),as:UTF8.self)
+            let exceptionJSON = try await evaluate("JSON.stringify(window.__type4ExceptionReport(\(nativeJSON)))", on:tab) as? String ?? ""
+            guard let exceptionReport = try JSONSerialization.jsonObject(with:Data(exceptionJSON.utf8)) as? [String:Any],
+                  let counted = exceptionReport["counted"] as? Int, let entries = exceptionReport["entries"] as? [[String:Any]] else {
+                throw MikaError("Ignored-handler exception report unavailable (FAIL)")
+            }
+            records.append(["case":"ignored-handler-exception-report","report":exceptionReport])
+            for entry in entries {
+                var identity = entry
+                // Full native script is retained by scriptID in Diagnostics, not duplicated in lines.
+                identity.removeValue(forKey:"script")
+                let raw = String(decoding:try JSONSerialization.data(withJSONObject:identity, options:[.sortedKeys]),as:UTF8.self)
+                lines.append("· ignored handler exception identity: \(raw)")
+            }
+            lines.append("· ignored handler exceptions: counted=\(counted), excluded=0 (no proven unrelated source)")
+            check(counted == 0, "ignored handler: no unrelated script exceptions")
             check(expectedRejection, "ignored handler: expected frozen-state rejection (other exceptions FAIL)")
             check(try await bool("window.__faultEvidence.some(x=>x.kind==='paste'&&x.strategy==='paste-plain'&&x.fullTextEqual)"), "ignored handler actually received full paste-plain")
             check(try await bool("window.__updateCalls===0 && window.__type4.assert('')"), "ignored handler: update calls=0, committed baseline intact")
             records.append(["case":"ignored-production","error":rejection,"expectedRejection":expectedRejection,"trace":lastEditorTypeTrace])
             try await record("ignored-handler-receipt")
+            tab.type4IgnoredEvaluationErrors = nil
 
             // Upper application rejects a generated full candidate state.
             try await loadFixture()
@@ -2349,7 +2401,18 @@ enum TCProbeLogStore {
             check(try await bool("window.__type4Errors.length===0"), "dual editor: no script exceptions")
             records.append(["case":"dual-production","trace":lastEditorTypeTrace])
             try await record("dual-binding")
-        } catch { lines.append("✗ 自检四十二异常（不计为预期拒绝）：\(error.localizedDescription)") }
+        } catch {
+            if let native = tab.type4IgnoredEvaluationErrors, !native.isEmpty {
+                records.append(["case":"ignored-handler-aborted-native-errors","exceptions":native])
+                for entry in native {
+                    var identity = entry; identity.removeValue(forKey:"script")
+                    if let data = try? JSONSerialization.data(withJSONObject:identity, options:[.sortedKeys]) {
+                        lines.append("· ignored handler exception identity: \(String(decoding:data,as:UTF8.self))")
+                    }
+                }
+            }
+            lines.append("✗ 自检四十二异常（不计为预期拒绝）：\(error.localizedDescription)")
+        }
         Self.storeType4Diagnostic(["kind":"zhihu-type4", "runtime":"WKWebView", "lines":lines, "records":records])
         return lines
     }
