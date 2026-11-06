@@ -13,7 +13,7 @@ const check = (ok, label) => checks.push({ ok: !!ok, label });
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 (async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE || undefined });
   const context = await browser.newContext();
   await context.addInitScript({ content: `
     if (window === window.top) window.__mikaReports = [];
