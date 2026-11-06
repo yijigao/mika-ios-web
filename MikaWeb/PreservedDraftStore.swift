@@ -16,6 +16,8 @@ struct PreservedDraft: Codable, Equatable, Identifiable {
     var version: Int
     var target: PreservedDraftTarget
     var sourceTaskID: UUID
+    /// 稿件所属聊天会话。旧稿没有此字段时仍可按 sourceTaskID/draftID 恢复。
+    var sourceSessionID: UUID? = nil
     var updatedAt: Date
     var textHash: String
 }
@@ -34,10 +36,10 @@ final class PreservedDraftStore {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func readUnlocked() -> [PreservedDraft] {
-        guard let data = try? Data(contentsOf: fileURL),
-              let drafts = try? JSONDecoder().decode([PreservedDraft].self, from: data) else { return [] }
-        return drafts
+    private func readUnlocked() throws -> [PreservedDraft] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
+        let data = try Data(contentsOf: fileURL)
+        return try JSONDecoder().decode([PreservedDraft].self, from: data)
     }
 
     private func writeUnlocked(_ drafts: [PreservedDraft]) throws {
@@ -47,9 +49,12 @@ final class PreservedDraftStore {
     }
 
     @discardableResult
-    func save(fullText: String, target: PreservedDraftTarget, sourceTaskID: UUID) throws -> PreservedDraft {
+    func save(fullText: String, target: PreservedDraftTarget, sourceTaskID: UUID,
+              sourceSessionID: UUID? = nil) throws -> PreservedDraft {
         try queue.sync {
-            var drafts = readUnlocked()
+            // 文件存在但不可读/不可解码时必须把错误抛给调用方；绝不能把损坏
+            // 或暂时不可读的正式库当成空库并覆盖。
+            var drafts = try readUnlocked()
             let aliases = ZhihuAccountIdentity.normalizedAliases(target.accountAliases)
             let normalizedTarget = PreservedDraftTarget(accountStableID: target.accountStableID,
                                                          accountAliases: aliases,
@@ -63,18 +68,38 @@ final class PreservedDraftStore {
             let draft = PreservedDraft(id: index.map { drafts[$0].id } ?? UUID(), fullText: fullText,
                                        version: nextVersion, target: normalizedTarget,
                                        sourceTaskID: index.map { drafts[$0].sourceTaskID } ?? sourceTaskID,
+                                       sourceSessionID: sourceSessionID ?? index.flatMap { drafts[$0].sourceSessionID },
                                        updatedAt: Date(),
                                        textHash: Self.hash(fullText))
             if let index { drafts[index] = draft } else { drafts.append(draft) }
             drafts.sort { $0.updatedAt > $1.updatedAt }
-            try writeUnlocked(Array(drafts.prefix(20)))
+            // 稿件是用户内容；未定义显式清理策略前不做静默淘汰。
+            try writeUnlocked(drafts)
             return draft
         }
     }
 
     func latestZhihuDraft() -> PreservedDraft? {
-        queue.sync { readUnlocked().max { $0.updatedAt < $1.updatedAt } }
+        queue.sync { (try? readUnlocked())?.max { $0.updatedAt < $1.updatedAt } }
     }
 
-    func all() -> [PreservedDraft] { queue.sync { readUnlocked() } }
+    func draft(id: UUID) throws -> PreservedDraft? {
+        try queue.sync { try readUnlocked().first { $0.id == id } }
+    }
+
+    func draft(sourceTaskID: UUID) throws -> PreservedDraft? {
+        try queue.sync {
+            try readUnlocked().filter { $0.sourceTaskID == sourceTaskID }
+                .max { $0.updatedAt < $1.updatedAt }
+        }
+    }
+
+    func draft(sourceSessionID: UUID) throws -> PreservedDraft? {
+        try queue.sync {
+            try readUnlocked().filter { $0.sourceSessionID == sourceSessionID }
+                .max { $0.updatedAt < $1.updatedAt }
+        }
+    }
+
+    func all() throws -> [PreservedDraft] { try queue.sync { try readUnlocked() } }
 }

@@ -173,8 +173,14 @@ def validate():
         scale = float(e["scale"][:-1])
         assert (width,height) == tuple(int(x*scale) for x in size), f"Wrong PNG size: {e['filename']}"
     assert "scripts/validate_project.py" in (ROOT/"codemagic.yaml").read_text()
+    codemagic = (ROOT/"codemagic.yaml").read_text()
+    assert "MikaWeb/Trace" in codemagic and "collect_evidence" in codemagic
+    assert 'simctl terminate "$SIM" "$BUNDLE"' in codemagic and "type4-restart-result.json" in codemagic
     ci = (ROOT/".github/workflows/ci.yml").read_text()
     assert "set -euo pipefail" in ci and 'MIKA_BUILD_SHA="$(git rev-parse HEAD)"' in ci
+    fastfile = (ROOT/"fastlane/Fastfile").read_text()
+    assert 'xcargs: "MIKA_BUILD_SHA=#{build_sha}"' in fastfile
+    assert "Archived MikaBuildSHA mismatch" in fastfile and "git rev-parse HEAD" in fastfile
     diagnostic = (ROOT/"MikaWeb/DiagnosticStore.swift").read_text()
     assert 'else { return "unknown" }' in diagnostic and "b8cdb8e" not in diagnostic
     print(f"PASS: LICENSE, NOTICE, {len(entries)} icon PNGs, Codemagic validator and fail-closed build identity")

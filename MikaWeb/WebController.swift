@@ -2556,6 +2556,7 @@ enum TCProbeLogStore {
             records.append(["case":"dual-production","trace":lastEditorTypeTrace])
             try await record("dual-binding")
         } catch {
+            await testHost.captureFailure("自检四十二断言/异常：\(error.localizedDescription)")
             if let native = tab.type4IgnoredEvaluationErrors, !native.isEmpty {
                 records.append(["case":"ignored-handler-aborted-native-errors","exceptions":native])
                 for entry in native {
@@ -2566,6 +2567,9 @@ enum TCProbeLogStore {
                 }
             }
             lines.append("✗ 自检四十二异常（不计为预期拒绝）：\(error.localizedDescription)")
+        }
+        if lines.contains(where: { $0.hasPrefix("✗") }) {
+            await testHost.captureFailure("自检四十二存在失败断言")
         }
         Self.storeType4Diagnostic(["kind":"zhihu-type4", "runtime":"WKWebView", "lines":lines, "records":records])
         return lines
@@ -3362,6 +3366,7 @@ enum TCProbeLogStore {
             check(!migration.contains(where: { $0.hasPrefix("✗") }),
                   "六十四：随包 v4 与旧内置手册按哈希迁移、用户编辑文件保留；运行时恢复按名称加载当前安装版本")
         } catch {
+            await testHost.captureFailure("自检五十六断言/异常：\(error.localizedDescription)")
             lines.append("✗ 自检五十六生产链异常：\(error.localizedDescription)")
         }
         let blocker = await verifyHitBlockerClose()
@@ -3370,6 +3375,9 @@ enum TCProbeLogStore {
         check(!blocker.contains(where: { $0.hasPrefix("✗") }) && !geometry.contains(where: { $0.hasPrefix("✗") }) &&
               !modalAccounting.contains(where: { $0.hasPrefix("✗") }),
               "六十五：两条同名模态、纯 SVG、未保存正文保全及关闭/绕行分账均走生产路径")
+        if lines.contains(where: { $0.hasPrefix("✗") }) {
+            await testHost.captureFailure("自检五十六存在失败断言")
+        }
         return lines
     }
 
@@ -3434,8 +3442,10 @@ enum TCProbeLogStore {
             guard let submit = page.elements.first(where: { $0.text == "提交" }) else { throw MikaError("本地表单缺提交按钮") }
             try await dispatchClick(action("click", index:submit.index), expected:submit, approved:false, tab:tab)
             let passed = (try await evaluate("document.getElementById('result')?.textContent==='提交成功：姓名 张三，邮箱 zhangsan@example.com'", on:tab)) as? Bool == true
+            if !passed { await testHost.captureFailure("普通本地表单结果断言失败") }
             return ["\(passed ? "✓" : "✗") 普通本地填表：生产 type×2＋click 后结果全文一致"]
         } catch {
+            await testHost.captureFailure("普通本地表单断言/异常：\(error.localizedDescription)")
             return ["✗ 普通本地填表异常：\(error.localizedDescription)"]
         }
     }

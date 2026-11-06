@@ -71,6 +71,23 @@ import WebKit
         throw MikaError("WK self-test host timeout: \(encoded)")
     }
 
+    /// 宿主就绪后的断言/异常出口也走同一现场交付路径，而不只覆盖等待超时。
+    func captureFailure(_ context: String) async {
+        let snapshot = await capture(readinessJavaScript: "false")
+        let dom = snapshot["dom"] as? String ?? ""
+        let attachment = AgentTraceStore.shared.storeAttachment(dom)
+        AgentTraceStore.shared.appendEngineAction(action: "wk-selftest-failure",
+            targetFingerprint: suite, method: "unified-failure-snapshot", result: "failed",
+            pageURL: tab.webView.url?.absoluteString ?? "", evidence: [
+                "suite": suite, "context": context, "domAttachment": attachment,
+                "host": snapshot.filter { $0.key != "dom" },
+                "navigation": ["isLoading": tab.webView.isLoading,
+                    "documentEpoch": tab.documentEpoch,
+                    "finishedDocumentEpoch": tab.finishedDocumentEpoch ?? -1,
+                    "url": tab.webView.url?.absoluteString ?? ""]
+            ])
+    }
+
     private func capture(readinessJavaScript: String) async -> [String: Any] {
         let script = """
         (()=>{let ready=false,probeError=null;try{ready=!!(\(readinessJavaScript));}catch(e){probeError=String(e?.stack||e);}

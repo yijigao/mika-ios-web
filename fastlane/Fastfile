@@ -1,5 +1,7 @@
 default_platform(:ios)
 
+require "shellwords"
+
 APP_ID = "com.jigaoyi.mikaweb"
 
 def asc_api_key
@@ -32,15 +34,23 @@ platform :ios do
       code_sign_identity: "Apple Distribution"
     )
     increment_build_number(build_number: Time.now.strftime("%Y%m%d%H%M"))
+    build_sha = sh("git rev-parse HEAD").strip
+    archive_path = File.expand_path("../build/MikaWeb.xcarchive", __dir__)
     build_app(
       scheme: "MikaWeb",
       export_method: "app-store",
+      archive_path: archive_path,
+      xcargs: "MIKA_BUILD_SHA=#{build_sha}",
       export_options: {
         provisioningProfiles: {
           APP_ID => "match AppStore com.jigaoyi.mikaweb"
         }
       }
     )
+    archived_plist = File.join(archive_path, "Products/Applications/MikaWeb.app/Info.plist")
+    archived_sha = sh("/usr/libexec/PlistBuddy -c 'Print :MikaBuildSHA' #{Shellwords.escape(archived_plist)}").strip
+    UI.user_error!("Archived MikaBuildSHA mismatch: expected #{build_sha}, got #{archived_sha}") unless archived_sha == build_sha
+    UI.success("Archived MikaBuildSHA=#{archived_sha}")
     upload_to_testflight(api_key: api_key, skip_waiting_for_build_processing: true)
   end
 

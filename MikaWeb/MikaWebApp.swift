@@ -44,7 +44,17 @@ struct MikaWebApp: App {
             ContentView(web: graph.web, settings: graph.settings, engine: graph.engine, conversation: graph.conversation, diagnostics: graph.diagnostics)
                 .task {
                     #if DEBUG && targetEnvironment(simulator)
-                    if ProcessInfo.processInfo.arguments.contains("--mika-type4-selftest") {
+                    if ProcessInfo.processInfo.arguments.contains("--mika-type4-restart-check") {
+                        let lines = graph.engine.verifyZhihuProcessRestartCheckpoint()
+                        let result: [String: Any] = [
+                            "runtime":"WKWebView", "buildSHA":AgentTraceStore.buildSHA,
+                            "passed":!lines.contains(where: { $0.hasPrefix("✗") }), "lines":lines
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted]),
+                           let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                            try? data.write(to: directory.appendingPathComponent("type4-restart-result.json"), options: .atomic)
+                        }
+                    } else if ProcessInfo.processInfo.arguments.contains("--mika-type4-selftest") {
                         let type4 = await graph.web.verifyDraftType4()
                         let selfTest56 = await graph.web.verifyZhihuPublishControl()
                         let production = await graph.engine.verifyZhihuProductionOrchestration()
