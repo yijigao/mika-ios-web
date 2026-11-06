@@ -31,7 +31,7 @@ struct CrashReportsView: View {
                     Text(report.receivedAt == .distantPast ? "接收时间不可读取" : report.receivedAt.formatted(date: .abbreviated, time: .standard))
                     Text(report.types.joined(separator: "、")).font(.caption).foregroundStyle(.secondary)
                     if report.readable {
-                        Button("分享 JSON") {
+                        Button("分享诊断＋Trace 证据链") {
                             do { sharingURL = try store.prepareShare(for: report) }
                             catch { shareError = error.localizedDescription }
                         }

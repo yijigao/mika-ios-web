@@ -70,7 +70,25 @@ final class AgentTraceStore: ObservableObject {
                 throw NSError(domain: "MikaWeb.Trace", code: 1, userInfo: [NSLocalizedDescriptionKey: "尚无 trace 记录"])
             }
             let destination = FileManager.default.temporaryDirectory.appendingPathComponent("mika-agent-trace-\(UUID().uuidString).jsonl")
-            try FileManager.default.copyItem(at: file, to: destination)
+            let source = try String(contentsOf: file, encoding: .utf8).split(separator: "\n", omittingEmptySubsequences: true)
+            let byteLimit = 2_000_000
+            var selected: [Substring] = [], bytes = 0
+            for line in source.reversed() {
+                let cost = line.utf8.count + 1
+                if bytes + cost > byteLimit { break }
+                selected.append(line); bytes += cost
+            }
+            selected.reverse()
+            var output = ""
+            if selected.count < source.count {
+                let marker = ["kind": "export-truncation", "truncated": true,
+                              "omittedRecords": source.count - selected.count, "byteLimit": byteLimit] as [String : Any]
+                let data = try JSONSerialization.data(withJSONObject: marker, options: [.sortedKeys])
+                output += String(decoding: data, as: UTF8.self) + "\n"
+            }
+            output += selected.joined(separator: "\n")
+            if !selected.isEmpty { output += "\n" }
+            try Data(output.utf8).write(to: destination, options: .atomic)
             return destination
         }
     }
@@ -251,13 +269,75 @@ final class DiagnosticStore: NSObject, ObservableObject, MXMetricManagerSubscrib
         DispatchQueue.main.async { [weak self] in self?.reports = list }
     }
     private func reportError(_ message: String) { DispatchQueue.main.async { [weak self] in self?.storageError = message } }
+
+    private static func boundedExport(_ value: Any, depth: Int = 0, truncated: inout Bool) -> Any {
+        if depth >= 10 { truncated = true; return ["truncated": true, "reason": "depth-limit"] }
+        if let string = value as? String {
+            if string.count > 8_192 { truncated = true; return String(string.prefix(8_192)) }
+            return string
+        }
+        if let array = value as? [Any] {
+            if array.count > 64 { truncated = true }
+            return array.prefix(64).map { boundedExport($0, depth: depth + 1, truncated: &truncated) }
+        }
+        if let dictionary = value as? [String: Any] {
+            var result: [String: Any] = [:]
+            let keys = dictionary.keys.sorted()
+            if keys.count > 128 { truncated = true }
+            for key in keys.prefix(128) {
+                if key.lowercased().contains("screenshot") && dictionary[key] is String {
+                    result[key] = "[omitted-from-export]"; truncated = true
+                } else {
+                    result[key] = boundedExport(dictionary[key] as Any, depth: depth + 1, truncated: &truncated)
+                }
+            }
+            return result
+        }
+        return value
+    }
+
     func prepareShare(for report: StoredDiagnosticReport) throws -> URL {
         try queue.sync {
             guard report.readable else { throw NSError(domain: "MikaWeb.Diagnostics", code: 1, userInfo: [NSLocalizedDescriptionKey: "报告不可读取"]) }
             try FileManager.default.createDirectory(at: shareDirectory, withIntermediateDirectories: true)
-            let copy = shareDirectory.appendingPathComponent(UUID().uuidString + ".json")
-            try FileManager.default.copyItem(at: report.url, to: copy)
-            return copy
+            guard let selectedData = try? Data(contentsOf: report.url),
+                  let selectedObject = try? JSONSerialization.jsonObject(with: selectedData) as? [String: Any] else {
+                throw NSError(domain: "MikaWeb.Diagnostics", code: 2, userInfo: [NSLocalizedDescriptionKey: "报告 JSON 不可读取"])
+            }
+            let attemptID = (((selectedObject["payload"] as? [String: Any])?["identity"] as? [String: Any])?["attemptID"] as? String)
+            let relatedObjects: [[String: Any]] = scan().filter { candidate in
+                guard candidate.readable, let attemptID,
+                      let data = try? Data(contentsOf: candidate.url),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let payload = object["payload"] as? [String: Any],
+                      let identity = payload["identity"] as? [String: Any] else { return candidate.url == report.url }
+                return identity["attemptID"] as? String == attemptID
+            }.prefix(5).compactMap { candidate in
+                (try? Data(contentsOf: candidate.url)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            }
+            let traceURL = try? AgentTraceStore.shared.exportURL()
+            defer { if let traceURL { try? FileManager.default.removeItem(at: traceURL) } }
+            let traceLines = traceURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }?
+                .split(separator: "\n").filter { line in attemptID.map { line.contains($0) } ?? false }.prefix(200)
+                .compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } ?? []
+            var wasTruncated = relatedObjects.count >= 5 || traceLines.count >= 200
+            let boundedSelected = Self.boundedExport(selectedObject, truncated: &wasTruncated)
+            let boundedRelated = Self.boundedExport(relatedObjects, truncated: &wasTruncated)
+            let boundedTrace = Self.boundedExport(traceLines, truncated: &wasTruncated)
+            let bundle: [String: Any] = [
+                "schemaVersion": 1, "kind": "mika-evidence-chain",
+                "attemptID": attemptID ?? "unobservable",
+                "selectedDiagnostic": boundedSelected,
+                "relatedDiagnostics": boundedRelated,
+                "traceRecords": boundedTrace,
+                "limits": ["diagnostics": 5, "traceRecords": 200, "stringCharacters": 8_192,
+                           "traceExportBytes": 2_000_000],
+                "truncated": wasTruncated
+            ]
+            let data = try JSONSerialization.data(withJSONObject: bundle, options: [.prettyPrinted, .sortedKeys])
+            let destination = shareDirectory.appendingPathComponent("mika-evidence-chain-\(UUID().uuidString).json")
+            try data.write(to: destination, options: .atomic)
+            return destination
         }
     }
     func finishShare(_ url: URL) { queue.async { try? FileManager.default.removeItem(at: url) } }

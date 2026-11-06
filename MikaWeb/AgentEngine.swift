@@ -930,16 +930,14 @@ struct OpenStall {
     private var traceInputStrategies: [String] = []
     private var traceFinalAction: [String: Any]?
     private var traceRewriteReason = "none"
-    private var pendingDialogAttemptRecords: [WebController.ModalAttemptRecord] = []
-
     private func consumeDialogAttemptRecords() -> (summary: String, actuallyExecuted: Bool) {
-        let fresh = web.takeModalAttemptRecords()
-        if !fresh.isEmpty { pendingDialogAttemptRecords = fresh }
-        let records = pendingDialogAttemptRecords
+        // Records belong only to the immediately completed web attempt. Never reuse
+        // a prior attempt when the current one produced no action or timed out.
+        let records = web.takeModalAttemptRecords()
         let summary = records.isEmpty ? "未执行（执行层无动作记录）" : records.map {
-            "\($0.method)=\($0.status.rawValue)\($0.note.isEmpty ? "" : "（\($0.note)）")"
+            "\($0.kind.rawValue):\($0.method)=\($0.status.rawValue)@\($0.timestamp)；落点=\($0.landing)\($0.note.isEmpty ? "" : "（\($0.note)）")"
         }.joined(separator: "；")
-        let executed = records.contains { $0.status == .executed || $0.status == .failed }
+        let executed = records.contains { $0.kind == .action && ($0.status == .executed || $0.status == .failed) }
         return (summary, executed)
     }
     static let foldStepThreshold = 12
@@ -1888,7 +1886,6 @@ struct OpenStall {
         finalAuditFired = false
         activeRunContext = conversationTaskID.map { (sessionID: runSessionID, taskID: $0, generation: token) }
         web.setDiagnosticContext(taskID: conversationTaskID, runID: token)
-        pendingDialogAttemptRecords = []
         worker?.cancel(); status = .running; sessionActive = true; applyIdleTimerPolicy()
         transientStreak = 0
         web.agentWorkSuspended = false // launch 只从前台路径进入，驻停标记在此兜底复位
@@ -2438,7 +2435,7 @@ struct OpenStall {
             if Self.modalInterventionText(for: error) != nil {
                 let accounting = consumeDialogAttemptRecords()
                 appendStep("click", "弹窗点按无响应（能力卡点）：实际执行账：\(accounting.summary)。改走绕行梯（弹窗导航绕行）")
-                if await driveDialogBypass(token: token) {
+                if await driveDialogBypass(token: token, accounting: accounting) {
                     pending = saved
                     appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，已确认动作放回等待确认——请在干净页面上重新确认（确认属安全类，仍由用户点）")
                     status = .waitingConfirm(saved.0)
@@ -2803,7 +2800,7 @@ struct OpenStall {
                         return .strategySwitch
                     }
                     appendStep("click", "弹窗点按无响应（能力卡点）：实际执行账：\(accounting.summary)。改走绕行梯（弹窗导航绕行）")
-                    if await driveDialogBypass(token: token) {
+                    if await driveDialogBypass(token: token, accounting: accounting) {
                         appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，请按最新页面重新判断")
                         return .strategySwitch
                     }
@@ -3274,14 +3271,17 @@ struct OpenStall {
     /// 试过并连败），此处补记后走梯级③弹窗导航绕行。返回 true＝弹窗
     /// 已消失、页面可继续；false＝可用梯级已尽（梯账已记全，调用方
     /// 走失败结案）。
-    private func driveDialogBypass(token: UUID) async -> Bool {
-        let accounting = consumeDialogAttemptRecords()
+    private func driveDialogBypass(token: UUID,
+                                   accounting suppliedAccounting: (summary: String, actuallyExecuted: Bool)? = nil) async -> Bool {
+        let accounting = suppliedAccounting ?? consumeDialogAttemptRecords()
         // 只把实际执行的阶段记为实证；未适用、未执行与观测超时保留原状态。
         if var stall = openStall, accounting.actuallyExecuted {
             stall.noteFrameCloseSignal(); openStall = stall
         }
-        if !bypassLadder.attempted.contains(.existingMeans) {
+        if accounting.actuallyExecuted && !bypassLadder.attempted.contains(.existingMeans) {
             bypassLadder.markAttempted(.existingMeans, note: "执行层实际执行账：\(accounting.summary)")
+        } else if !accounting.actuallyExecuted {
+            appendStep("bypass-accounting", "既有关闭手段未记 attempted：\(accounting.summary)")
         }
         if bypassLadder.attempted.contains(.dialogNavBypass) { return false }
         let outcome = await attemptDialogNavBypass(token: token)
@@ -3307,8 +3307,11 @@ struct OpenStall {
     ///   只保证「离开前保存已落定」这一前提；真编辑器往返属 Tier B
     ///   真机验证项（见案卷未证项），不得据本函数声称已验不丢稿。
     private func attemptDialogNavBypass(token: UUID) async -> (success: Bool, note: String) {
+        let evidenceAttemptID = UUID().uuidString
         let before = await web.dialogCensus()
-        guard !before.hits.isEmpty else { return (false, "绕行前 frame 普查未发现弹窗，此级不适用") }
+        let beforeEvidenceID = web.recordNavigationBypassEvidence(census: before, attemptID: evidenceAttemptID,
+            phase: "before-engine-navigation-bypass", disposition: before.observation.label)
+        guard !before.hits.isEmpty else { return (false, "绕行前 frame 普查未发现弹窗，此级未执行；证据=\(beforeEvidenceID)") }
         let sigsBefore = Set(before.hits.map { $0.sig })
         guard let page = try? await web.state() else { return (false, "页面状态读取失败") }
         let originalURL = page.url
@@ -3336,14 +3339,18 @@ struct OpenStall {
             try? await Task.sleep(for: .milliseconds(800))
             _ = await web.settledCapture()
             let after = await web.dialogCensus()
-            guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
+            let afterEvidenceID = web.recordNavigationBypassEvidence(census: after, attemptID: evidenceAttemptID,
+                phase: "after-engine-navigation-bypass", disposition: after.observation.label,
+                resultEvidence: ["beforeEvidenceID": beforeEvidenceID])
+            guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）；证据=\(afterEvidenceID)") }
             let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+            let currentClear = after.hits.isEmpty
             if gone, let destination = await purposeState(), destination != .present {
-                return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功")
+                return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功；证据=\(afterEvidenceID)")
             }
-            return gone
-                ? (true, "成功（非编辑页重载绕行）：重载前弹窗 \(sigsBefore.count) 个，重载后原弹窗签名全部消失")
-                : (false, "非编辑页重载后弹窗仍在（普查：\(after.summary)）")
+            return gone && currentClear
+                ? (true, "成功（非编辑页重载绕行）：当前阻挡为空且目的状态通过；证据=\(afterEvidenceID)")
+                : (false, "非编辑页重载后当前仍有弹窗/阻挡（普查：\(after.summary)）；证据=\(afterEvidenceID)")
         }
         guard let saveElement = page.elements.first(where: { element in
             (element.text.contains("保存") || element.text.contains("存草稿")) && !element.disabled
@@ -3369,14 +3376,18 @@ struct OpenStall {
         } catch { return (false, "导航往返抛错：\(error.localizedDescription)") }
         _ = await web.settledCapture()
         let after = await web.dialogCensus()
-        guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
+        let afterEvidenceID = web.recordNavigationBypassEvidence(census: after, attemptID: evidenceAttemptID,
+            phase: "after-engine-navigation-bypass", disposition: after.observation.label,
+            resultEvidence: ["beforeEvidenceID": beforeEvidenceID])
+        guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）；证据=\(afterEvidenceID)") }
         let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+        let currentClear = after.hits.isEmpty
         if gone, let destination = await purposeState(), destination != .present {
-            return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功")
+            return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功；证据=\(afterEvidenceID)")
         }
-        return gone
-            ? (true, "成功（编辑页往返绕行）：先保存并 settle 回读落定→离开→直达返回后，原弹窗签名全部消失；正文完整以模型下一轮回读为准")
-            : (false, "编辑页往返后弹窗仍在（普查：\(after.summary)）")
+        return gone && currentClear
+            ? (true, "成功（编辑页往返绕行）：先保存并 settle，返回后当前阻挡为空且目的状态通过；证据=\(afterEvidenceID)")
+            : (false, "编辑页往返后当前仍有弹窗/阻挡（普查：\(after.summary)）；证据=\(afterEvidenceID)")
     }
 
     /// 自检十八（AUTONOMY-FIX）：自主完成逻辑核查——纯函数部分
