@@ -317,6 +317,18 @@ struct SelfTestView: View {
                 conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十四：FAIL，见逐项记录" : "自检四十四：Tier A PASS；worker 交接、模型与 UI 联动待 CI/真机")
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检四十六：计数冻结与 committed 复核") {
+                Task { @MainActor in
+                    let lines = await WebController().verifyFrozenDraftCommitted()
+                    for line in lines { conversation.localFeedback("自检四十六：\(line)") }
+                }
+            }
+            Button("自检四十七：命中阻挡层识别与关闭") {
+                Task { @MainActor in
+                    let lines = await WebController().verifyHitBlockerClose()
+                    for line in lines { conversation.localFeedback("自检四十七：\(line)") }
+                }
+            }
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true

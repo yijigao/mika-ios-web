@@ -345,6 +345,45 @@ enum SiteMode: String {
         }
         return out;
       };
+      // Retain the requested click target so later census and failure snapshots agree.
+      var hitTarget = null;
+      var targetFor = function(d){
+        if (d.targetIndex !== undefined && window===window.top) hitTarget=document.querySelector('[data-mika-idx="'+d.targetIndex+'"]');
+        else if (d.targetLabel) hitTarget=Array.from(document.querySelectorAll('button,[role="button"],a')).find(function(x){return vis(x)&&norm(lab(x))===norm(d.targetLabel);})||null;
+        return hitTarget;
+      };
+      var blockerFor = function(target){
+        if(!target || !target.isConnected || !vis(target)) return null;
+        var r=target.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+        if(x<0||y<0||x>=innerWidth||y>=innerHeight)return null;
+        var h=document.elementFromPoint(x,y);
+        if(!h||h===target||target.contains(h)||h.contains(target))return null;
+        return h;
+      };
+      var nodePath = function(n){var p=[];for(;n&&n.nodeType===1;n=n.parentElement){var peers=n.parentElement?Array.from(n.parentElement.children).filter(function(x){return x.tagName===n.tagName;}):[];p.unshift(n.tagName.toLowerCase()+(n.id?'#'+n.id:'')+':nth-of-type('+(peers.indexOf(n)+1)+')');}return p.join(' > ');};
+      var blockerDescription = function(h){
+        var r=h.getBoundingClientRect(),st=getComputedStyle(h);
+        var fingerprint={kind:'hit-blocker',path:nodePath(h),tag:h.tagName.toLowerCase(),class:clsOf(h).slice(0,80),text:lab(h).slice(0,80),rect:[r.left,r.top,r.width,r.height],position:st.position,zIndex:st.zIndex,framePath:framePath()};
+        return {sig:'hit-blocker:'+JSON.stringify(fingerprint),text:JSON.stringify(fingerprint),buttons:[],fingerprint:fingerprint};
+      };
+      var closeHitBlocker = function(d){
+        targetFor(d);
+        var h=blockerFor(hitTarget); if(!h)return;
+        var evidence=blockerDescription(h),container=h;
+        // A hit on the content card still belongs to its positioned covering ancestor.
+        for(var n=h;n&&n!==document.body;n=n.parentElement){var st=getComputedStyle(n);if((st.position==='fixed'||st.position==='absolute')&&!n.contains(hitTarget)){container=n;break;}}
+        var gone=function(){return !h.isConnected||!vis(h)||!container.isConnected||!vis(container)||!blockerFor(hitTarget);};
+        var finish=function(ok,stage){post({kind:'click-report',token:d.token,path:framePath(),clicked:true,gone:ok,stage:stage,stages:stages,sig:evidence.sig,fingerprint:evidence.fingerprint});};
+        var stages=[];
+        var poll=function(cb){var end=Date.now()+700;var check=function(){if(gone())return cb(true);if(Date.now()>=end)return cb(false);setTimeout(check,80);};check();};
+        var safe=function(el){var t=(lab(el)+' '+(el.getAttribute('aria-label')||'')).toLowerCase();return d.approved||!(d.keywords||[]).some(function(k){return t.indexOf(k)>=0;});};
+        var plan=[
+          function(cb){var c=findCloser(container,null);if(!c)return cb(false);if(!safe(c)){finish(false,'refused-sensitive');return;}stages.push('hit-blocker-close');seqOn(c,'pointer',function(){poll(cb);});},
+          function(cb){stages.push('hit-blocker-escape');document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}));document.dispatchEvent(new KeyboardEvent('keyup',{key:'Escape',code:'Escape',bubbles:true}));poll(cb);},
+          function(cb){stages.push('hit-blocker-corner');var r=container.getBoundingClientRect(),x=Math.max(1,r.left+10),y=Math.max(1,r.top+10),el=document.elementFromPoint(x,y);if(!el||el!==container||!safe(el))return cb(false);seqOn(el,'pointer',function(){poll(cb);},{x:x,y:y});}
+        ];
+        var run=function(i){if(gone())return finish(true,'hit-blocker-cleared');if(i>=plan.length)return finish(false,'hit-blocker-still');plan[i](function(ok){if(ok)finish(true,stages[stages.length-1]);else run(i+1);});};run(0);
+      };
       var dialogSig = function(d){ return (d.id ? '#'+d.id : d.tagName.toLowerCase()) + '|' + clsOf(d).slice(0,60) + '|' + lab(d).slice(0,30); };
       var describeDialog = function(d){
         var btns = [], cands = d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');
@@ -547,8 +586,12 @@ enum SiteMode: String {
         if (!d || d.__mikaFrame !== 1) return;
         for (var i=0;i<window.frames.length;i++){ try { window.frames[i].postMessage(d, '*'); } catch (e) {} }
         if (d.kind === 'probe'){
+          targetFor(d);
           var dialogs = dialogElements().map(describeDialog);
+          var blocker=blockerFor(hitTarget);if(blocker)dialogs.push(blockerDescription(blocker));
           post({ kind:'probe-report', token:d.token, path:framePath(), href:hrefSafe(), isTop: window===window.top, children: window.frames.length, dialogs:dialogs });
+        } else if (d.kind === 'click-blocker'){
+          closeHitBlocker(d);
         } else if (d.kind === 'click'){
           handleClick(d);
         } else if (d.kind === 'harvest'){
@@ -2845,10 +2888,137 @@ enum TCProbeLogStore {
         return raw == "draft"
     }
 
+    /// 自检四十六：使用现有真实 Draft fixture，仅在独立测试页改造计数位置。
+    static let frozenDraftFixture = #"""
+    (()=>{
+      const section=document.querySelector('[data-editor-root]');section.removeAttribute('data-editor-root');
+      const form=document.createElement('form'),root=document.getElementById('root');section.prepend(form);form.appendChild(root);
+      const oldCount=document.getElementById('count').parentElement;oldCount.style.display='none';
+      for(const n of oldCount.childNodes)if(n.nodeType===3)n.textContent='内部状态：';
+      const status=document.createElement('p');status.id='round46-count';status.textContent='字数：0\nMarkdown 语法输入中\u200b';section.appendChild(status);
+      return true;
+    })()
+    """#
+
+    func verifyFrozenDraftCommitted() async -> [String] {
+        let tab = BrowserTab(loadStartPage:false, sessionID:displayedSessionID)
+        tab.webView.frame = CGRect(x:0,y:0,width:1024,height:768)
+        var lines: [String] = []
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        func js(_ value: String) -> String { String(decoding:try! JSONEncoder().encode(value),as:UTF8.self) }
+        let text = String(repeating:"计数冻结但状态完整。",count:12)
+        do {
+            for mode in ["committed", "ignore", "unobservable"] {
+                let epoch = tab.documentEpoch
+                try tab.loadLocal("test-draft")
+                var ready = false
+                for _ in 0..<100 {
+                    if tab.documentEpoch > epoch,
+                       (try? await evaluate("window.__ready===true",on:tab)) as? Bool == true { ready = true; break }
+                    try await Task.sleep(for:.milliseconds(100))
+                }
+                guard ready else { throw MikaError("自检四十六 fixture 加载超时") }
+                _ = try await evaluate("window.__type4.reset('',\(js(mode == "ignore" ? "ignore" : "")),\(js(text)));true",on:tab)
+                _ = try await evaluate(Self.frozenDraftFixture,on:tab)
+                if mode == "unobservable" {
+                    _ = try await evaluate("(()=>{const h=document.querySelector('[contenteditable=true]');for(const k of Object.keys(h))if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$'))Object.defineProperty(h,k,{enumerable:false});return true;})()",on:tab)
+                }
+                guard let raw = try await evaluate(PageScript.extract,on:tab) as? String else { throw MikaError("fixture 无快照") }
+                let page = try JSONDecoder().decode(PageState.self,from:Data(raw.utf8))
+                guard let expected = page.elements.first(where: { $0.editable }) else { throw MikaError("fixture 无编辑器") }
+                let data = try JSONSerialization.data(withJSONObject:["action":"type","index":expected.index,"text":text,"reason":"自检四十六"])
+                let action = try JSONDecoder().decode(AgentAction.self,from:data)
+                let baseline = try await probeEditorSignals(action:action,tab:tab,diagnostic:true)
+                check(baseline.count == 0, "\(mode): baseline count=0")
+                lastEditorTypeTrace = []
+                var passed = false
+                do { try await performTypeInEditor(action:action,expected:expected,approved:false,baseline:baseline,tab:tab); passed = true }
+                catch let error as MikaError { lines.append("· \(mode): \(error.localizedDescription)") }
+                check(passed == (mode == "committed"), "\(mode): performType \(passed ? "PASS" : "FAIL")")
+                let marker = mode == "committed" ? "committed-override" : mode == "ignore" ? "committed-miss" : "committed-unobservable"
+                check(lastEditorTypeTrace.contains { $0.contains(marker) }, "\(mode): \(marker)")
+                let diagnostic = try await evaluate("JSON.stringify(window.__mikaEditorSignalsDiagnostic)",on:tab) as? String ?? ""
+                check(diagnostic.contains("whole-page-fallback"), "\(mode): whole-page-fallback（form 外计数）")
+                if mode == "ignore" {
+                    check((try await evaluate("window.__updateCalls===0&&window.__type4.text()===''",on:tab)) as? Bool == true, "ignored: update=0, committed empty")
+                }
+                lines.append("· \(mode): \(lastEditorTypeTrace.joined(separator:"；"))")
+            }
+            lines.append("✗ 反例甲（DOM 全文／计数变动／committed 缺失）判据冲突，待裁决；不计通过")
+        } catch { lines.append("✗ 自检四十六异常：\(error.localizedDescription)") }
+        return lines
+    }
+
+    /// 自检四十七：独立页面经生产 dispatchClick；shadow 内部仅报告 host 指纹。
+    func verifyHitBlockerClose() async -> [String] {
+        let tab = BrowserTab(loadStartPage:false, sessionID:displayedSessionID)
+        tab.webView.frame = CGRect(x:0,y:0,width:1024,height:768)
+        var lines: [String] = []
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        do {
+            for mode in ["closable", "plain", "stubborn"] {
+                let closer = mode == "closable" ? "<button onclick='this.parentElement.remove()'>×</button>" : ""
+                let veil = mode == "plain" ? "" : "<div class='promo-veil' style='position:fixed;inset:0;z-index:1000'>\(closer)</div>"
+                let html = "<html><meta name='viewport' content='width=device-width'><body><button id='target' style='margin:150px' onclick='window.originalClicks++'>原按钮</button>\(veil)<script>window.originalClicks=0;window.round47Mode='\(mode)';window.round47Ready=true;</script></body></html>"
+                tab.webView.loadHTMLString(html,baseURL:nil)
+                var ready = false
+                for _ in 0..<100 {
+                    if (try? await evaluate("window.round47Ready===true&&window.round47Mode==='\(mode)'&&window.__mikaFrameProbe===true",on:tab)) as? Bool == true { ready = true; break }
+                    try await Task.sleep(for:.milliseconds(100))
+                }
+                guard ready else { throw MikaError("自检四十七加载超时") }
+                guard let raw = try await evaluate(PageScript.extract,on:tab) as? String else { throw MikaError("无快照") }
+                let page = try JSONDecoder().decode(PageState.self,from:Data(raw.utf8))
+                guard let target = page.elements.first(where: { $0.text == "原按钮" }),
+                      let action = Self.selfTestClickAction(index:target.index) else { throw MikaError("无目标按钮") }
+                let census = await probeFrames(on:tab,targetIndex:target.index,targetLabel:"原按钮")
+                check(census.hits.contains { $0.sig.hasPrefix("hit-blocker:") } == (mode != "plain"), "\(mode): hit-blocker census")
+                lines.append("· \(mode): \(census.summary)")
+                var errorText = ""
+                do { try await dispatchClick(action,expected:target,approved:false,tab:tab) }
+                catch let error as MikaError { errorText = error.localizedDescription }
+                let clicked = (try await evaluate("window.originalClicks===1",on:tab)) as? Bool == true
+                check(mode == "stubborn" ? !clicked && errorText.contains(Self.modalUnresponsivePrefix) && errorText.contains("hit-blocker:") && errorText.contains("promo-veil") : clicked && errorText.isEmpty, "\(mode): 原点击／失败指纹回读")
+                if !errorText.isEmpty { lines.append("· \(errorText)") }
+            }
+            tab.webView.loadHTMLString("<html><body><iframe srcdoc=\"<div role='dialog'><button onclick='this.parentElement.remove()'>关闭窗</button></div>\"></iframe></body></html>",baseURL:nil)
+            var frameReady = false
+            for _ in 0..<100 {
+                let census = await probeFrames(on:tab)
+                if census.hits.contains(where: { !$0.isTop && $0.buttons.contains(where: { $0.label == "关闭窗" }) }) { frameReady = true; break }
+                try await Task.sleep(for:.milliseconds(100))
+            }
+            check(frameReady,"iframe role=dialog 感知")
+            if frameReady {
+                let report = await dispatchFrameClick(on:tab,label:"关闭窗",approved:false)
+                let after = await probeFrames(on:tab)
+                check(report?.gone == true && !after.hits.contains(where: { !$0.isTop }),"iframe 既有关闭路径")
+            }
+        } catch { lines.append("✗ 自检四十七异常：\(error.localizedDescription)") }
+        return lines
+    }
+
+    /// 自检四十五同源，只读 Draft committed 状态；不包装站点函数。
+    private func readDraftCommitted(action: AgentAction, tab: BrowserTab) async -> Bool? {
+        let json = String(decoding: (try? JSONSerialization.data(withJSONObject: ["index":action.index,"text":action.text])) ?? Data(), as: UTF8.self)
+        let raw = try? await evaluate("""
+        (()=>{const a=\(json),host=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        if(!host)return 'unobservable';
+        const stateText=s=>{try{return s?.getCurrentContent?.().getPlainText('\\n')??null;}catch(e){return null;}};
+        const findDraft=()=>{const seen=new Set();let fiber=null;for(const k of Object.keys(host)){if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')){fiber=host[k];break;}}for(let f=fiber;f&&!seen.has(f);f=f.return){seen.add(f);const i=f.stateNode;if(i&&i.editor===host&&typeof i.update==='function')return i;}return null;};
+        const instance=findDraft(),text=instance?stateText(instance.props?.editorState):null;
+        if(typeof text!=='string')return 'unobservable';
+        const norm=s=>(s||'').replace(/[\\s\\u200b\\ufeff]+/g,'');
+        return norm(text).length>0&&norm(text).includes(norm(a.text))?'match':'miss';})()
+        """, on: tab) as? String
+        switch raw { case "match": return true; case "miss": return false; default: return nil }
+    }
+
     private func performTypeInEditor(action: AgentAction, expected: PageElement, approved: Bool, baseline: EditorSignals, tab: BrowserTab) async throws {
         let expectedLen = Self.normalizedLength(action.text)
         // Draft 类走 paste-plain→paste→events→chunks→exec；其他编辑器仅移除 range。
-        let strategies: [String] = await probeDraftClass(action: action, tab: tab)
+        let isDraft = await probeDraftClass(action: action, tab: tab)
+        let strategies: [String] = isDraft
             ? ["paste-plain", "paste", "events", "chunks", "exec"]
             : ["exec", "events", "chunks"]
         var trace: [String] = []
@@ -2878,24 +3048,36 @@ enum TCProbeLogStore {
                 Self.storeType4Diagnostic(["kind":"type-attempt", "strategy":path, "fiveHops":diagnostic,
                     "counterObserved":signals?.count.map { $0 as Any } ?? NSNull(), "baselineReset":"unavailable", "independent":false])
             }
-            switch TypeVerifyPolicy.verdict(baselineCount: baseline.count, postCount: signals?.count,
-                                            textOK: v.textOK, expectedCount: expectedLen,
-                                            longForm: expectedLen >= 200) {
-            case .failDomMissing:
-                trace.append("\(path)=dom-missing")
-                failure = .domMissing
-                continue
-            case .failSignalLost:
-                trace.append("\(path)=count-signal-lost")
-                failure = .signalLost
-                continue
-            case .failFrozen(let count):
-                trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
-                failure = .stateRejected(count: count, baseline: baseline.count)
-                if case nil = firstStateRejected { firstStateRejected = failure }
-                continue
-            case .pass:
-                break
+            var committedOverride = false
+            if isDraft {
+                switch await readDraftCommitted(action: action, tab: tab) {
+                case true?:
+                    committedOverride = true
+                    trace.append("committed-override(count=\(counterJSON)),strategy=\(path)")
+                case false?: trace.append("committed-miss,strategy=\(path)")
+                case nil: trace.append("committed-unobservable,strategy=\(path)")
+                }
+            }
+            if !committedOverride {
+                switch TypeVerifyPolicy.verdict(baselineCount: baseline.count, postCount: signals?.count,
+                                                textOK: v.textOK, expectedCount: expectedLen,
+                                                longForm: expectedLen >= 200) {
+                case .failDomMissing:
+                    trace.append("\(path)=dom-missing")
+                    failure = .domMissing
+                    continue
+                case .failSignalLost:
+                    trace.append("\(path)=count-signal-lost")
+                    failure = .signalLost
+                    continue
+                case .failFrozen(let count):
+                    trace.append("\(path)=dom-ok,count-frozen:\(count)(基线\(baseline.count.map { "\($0)" } ?? "无"))")
+                    failure = .stateRejected(count: count, baseline: baseline.count)
+                    if case nil = firstStateRejected { firstStateRejected = failure }
+                    continue
+                case .pass:
+                    break
+                }
             }
             if let count = signals?.count {
                 if signals?.saveState == "saving" {
@@ -3215,7 +3397,7 @@ enum TCProbeLogStore {
             let parts = hits.map { hit in
                 let whereabouts = hit.isTop ? "主 frame" : "frame \(hit.framePath)（\(hit.frameHref.prefix(60))）"
                 let labels = hit.buttons.map { $0.label }.joined(separator: "／")
-                return "\(whereabouts) 内弹窗「\(hit.text.prefix(30))」按钮 [\(labels)]"
+                return hit.sig.hasPrefix("hit-blocker:") ? "\(whereabouts) \(hit.sig)" : "\(whereabouts) 内弹窗「\(hit.text.prefix(30))」按钮 [\(labels)]"
             }
             return "共 \(frameCount) 个 frame；" + parts.joined(separator: "；")
         }
@@ -3228,14 +3410,17 @@ enum TCProbeLogStore {
     /// frame 普查：向主 frame 发起洪泛询问，收集各 frame 的 probe-report
     /// （900ms 窗口）。探针未覆盖的页面（注入缺失）返回空普查，调用方
     /// 据此回落旧路径。
-    func probeFrames(on tab: BrowserTab) async -> FrameCensus {
+    func probeFrames(on tab: BrowserTab, targetIndex: Int? = nil, targetLabel: String = "") async -> FrameCensus {
         let token = UUID().uuidString
         let box = FrameMessageBox()
         FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
             if (body["kind"] as? String) == "probe-report" { box.messages.append(body) }
         }
         defer { FrameProbeHub.shared.unregister(token: token) }
-        let flood = "(()=>{const d={__mikaFrame:1,kind:'probe',token:'\(token)'};window.postMessage(d,'*');return 'flooded';})()"
+        var payload: [String: Any] = ["__mikaFrame":1,"kind":"probe","token":token]
+        if let targetIndex { payload["targetIndex"] = targetIndex; payload["targetLabel"] = targetLabel }
+        let payloadJSON = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
+        let flood = "(()=>{const d=\(payloadJSON);window.postMessage(d,'*');return 'flooded';})()"
         _ = try? await evaluate(flood, on: tab)
         try? await Task.sleep(for: .milliseconds(900))
         var hits: [FrameDialogHit] = []
@@ -3269,14 +3454,14 @@ enum TCProbeLogStore {
     /// 目标按钮的 frame 会回報；其余 frame 静默）。阶段尝试在 frame 内
     /// 完成，最长约 8 秒，等待上限 10 秒；无回報（探针未覆盖／没有
     /// frame 持有该按钮）返回 nil。
-    func dispatchFrameClick(on tab: BrowserTab, label: String, approved: Bool) async -> FrameClickReport? {
+    func dispatchFrameClick(on tab: BrowserTab, label: String, approved: Bool, blockerOnly: Bool = false) async -> FrameClickReport? {
         let token = UUID().uuidString
         let box = FrameMessageBox()
         FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
             if (body["kind"] as? String) == "click-report", box.messages.isEmpty { box.messages.append(body) }
         }
         defer { FrameProbeHub.shared.unregister(token: token) }
-        let payload: [String: Any] = ["__mikaFrame": 1, "kind": "click", "token": token, "label": label, "approved": approved, "keywords": SafetyPolicy.keywords]
+        let payload: [String: Any] = ["__mikaFrame": 1, "kind": blockerOnly ? "click-blocker" : "click", "token": token, "label": label, "approved": approved, "keywords": SafetyPolicy.keywords]
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
         let flood = "(()=>{const d=\(String(decoding: payloadData, as: UTF8.self));window.postMessage(d,'*');return 'flooded';})()"
         _ = try? await evaluate(flood, on: tab)
@@ -3338,7 +3523,7 @@ enum TCProbeLogStore {
                 ?? census.hits.first
             guard let hit else { break }
             sawDialog = true
-            if let report = await dispatchFrameClick(on: tab, label: label, approved: approved), report.gone {
+            if let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: hit.sig.hasPrefix("hit-blocker:")), report.gone {
                 let after = await probeFrames(on: tab)
                 if !after.hits.contains(where: { $0.sig == hit.sig }) { return }
             }
@@ -3444,6 +3629,25 @@ enum TCProbeLogStore {
     private func dispatchClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
         let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
+        if probe.hasPrefix("ready-") {
+            _ = try await evaluate("document.querySelector('[data-mika-idx=\"\(expected.index)\"]')?.scrollIntoView({block:'center'});true", on: tab)
+        }
+        let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
+        var blockerCensus = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
+        if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+            recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label)
+            for _ in 0..<2 {
+                let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: true)
+                if report?.stage == "refused-sensitive" { throw MikaError("敏感操作未经确认") }
+                blockerCensus = await probeFrames(on: tab)
+                if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) { break }
+            }
+            if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+                let evidence = blockerCensus.summary
+                await captureFailureSnapshot(context: "命中阻挡层关闭失败：\(evidence)", tab: tab)
+                throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)")
+            }
+        }
         if probe == "ready-dialog" {
             try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
             return
@@ -3471,7 +3675,6 @@ enum TCProbeLogStore {
                 return
             }
         }
-        let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         if status == "disabled" {
             await captureFailureSnapshot(context: "click 目标禁用：\(action.reason)", tab: tab)
             throw MikaError("「\(label)」按钮是灰的（存在但被禁用），无法点击")
