@@ -45,7 +45,7 @@ struct MikaWebApp: App {
                 .task {
                     #if DEBUG && targetEnvironment(simulator)
                     if ProcessInfo.processInfo.arguments.contains("--mika-type4-restart-check") {
-                        let lines = graph.engine.verifyZhihuProcessRestartCheckpoint()
+                        let lines = await graph.engine.verifyZhihuProcessRestartCheckpoint()
                         let result: [String: Any] = [
                             "runtime":"WKWebView", "buildSHA":AgentTraceStore.buildSHA,
                             "passed":!lines.contains(where: { $0.hasPrefix("✗") }), "lines":lines

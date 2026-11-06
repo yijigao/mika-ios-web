@@ -32,7 +32,7 @@ final class PreservedDraftStore {
             .appendingPathComponent("MikaWeb/Drafts/zhihu-drafts.json")
     }
 
-    private static func hash(_ text: String) -> String {
+    static func textHash(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -70,7 +70,7 @@ final class PreservedDraftStore {
                                        sourceTaskID: index.map { drafts[$0].sourceTaskID } ?? sourceTaskID,
                                        sourceSessionID: sourceSessionID ?? index.flatMap { drafts[$0].sourceSessionID },
                                        updatedAt: Date(),
-                                       textHash: Self.hash(fullText))
+                                       textHash: Self.textHash(fullText))
             if let index { drafts[index] = draft } else { drafts.append(draft) }
             drafts.sort { $0.updatedAt > $1.updatedAt }
             // 稿件是用户内容；未定义显式清理策略前不做静默淘汰。

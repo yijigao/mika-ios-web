@@ -3452,15 +3452,16 @@ enum TCProbeLogStore {
 
     /// 为受控模型主循环准备站点端。处理器把实际 Draft DOM 收到的正文保存为
     /// 服务端响应源；详情页不会再从测试期望值凭空生成正文。
-    func loadZhihuEngineFixture(outcome: String = "published") async throws -> (editor: PageElement, publish: PageElement) {
+    func loadZhihuEngineFixture(outcome: String = "published", questionID: String = "4242") async throws -> (editor: PageElement, publish: PageElement) {
         let tab = executionTab
         let testHost = WKSelfTestHost(tab: tab, suite: "zhihu-production-orchestration")
         controlledZhihuFixtureTabID = tab.id
         controlledZhihuFixtureOutcome = outcome
         _ = try await testHost.loadLocalAndWait("test-draft",
             readinessJavaScript: "window.__ready===true && !!window.__type4 && !!document.querySelector('#editor-primary [contenteditable=true]')")
+        let encodedQuestionID = String(decoding: try JSONEncoder().encode(questionID), as: UTF8.self)
         _ = try await evaluate("""
-        (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update'),e=s.querySelector('[contenteditable=true]');s.setAttribute('data-answer-editor','engine-fixture-composer');s.setAttribute('data-question-id','4242');e.setAttribute('data-editor-id','engine-fixture-editor');b.textContent='发布回答';b.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','engine-me-id');window.__INITIAL_STATE__={people:{currentUser:{id:'engine-me-id',urlToken:'engine-me-token'}}};window.__pubCalls=0;window.__publishedBody='';b.addEventListener('click',()=>{window.__pubCalls++;window.__publishedBody=(e.innerText||'').replace(/\\r\\n?/g,'\\n');});return true;})()
+        (()=>{const q=\(encodedQuestionID),s=document.getElementById('editor-primary'),b=document.getElementById('update'),e=s.querySelector('[contenteditable=true]');s.setAttribute('data-answer-editor','engine-fixture-composer');s.setAttribute('data-question-id',q);e.setAttribute('data-editor-id','engine-fixture-editor');b.textContent='发布回答';b.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','engine-me-id');window.__INITIAL_STATE__={people:{currentUser:{id:'engine-me-id',urlToken:'engine-me-token'}}};window.__pubCalls=0;window.__publishedBody='';b.addEventListener('click',()=>{window.__pubCalls++;window.__publishedBody=(e.innerText||'').replace(/\\r\\n?/g,'\\n');});return true;})()
         """, on: tab)
         if outcome == "native-disabled-fieldset-stale" {
             _ = try await evaluate("""

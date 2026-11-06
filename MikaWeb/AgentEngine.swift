@@ -4357,21 +4357,55 @@ struct OpenStall {
              !Set(lhs.accountAliases).isDisjoint(with: Set(rhs.accountAliases)))
     }
 
-    /// 只按任务/会话保存的 draftID 引用取稿，不再用关键词或全局最新稿猜测。
-    /// `instruction` 仅用于轨迹说明，因此“发出去”等授权解析器认可的表达也
-    /// 会沿用同一会话关联。
+    private static func explicitZhihuQuestionID(in instruction: String) -> String? {
+        let patterns = [#"zhihu\.com/question/(\d+)"#, #"(?:问题|题目)\s*(?:ID\s*)?[：:#]?\s*(\d{3,})"#]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let match = regex.firstMatch(in: instruction,
+                    range: NSRange(instruction.startIndex..<instruction.endIndex, in: instruction)),
+                  let range = Range(match.range(at: 1), in: instruction) else { continue }
+            return String(instruction[range])
+        }
+        return nil
+    }
+
+    /// 会话关联只兜底承接“这篇／刚才／继续”等旧目标。带不同问题 ID，或明确
+    /// 要另写、换题、围绕新主题创作的任务，必须从空稿开始，不能被旧稿绑住。
+    private static func sessionDraftApplies(_ draft: PreservedDraft, to instruction: String) -> Bool {
+        if let questionID = explicitZhihuQuestionID(in: instruction) {
+            return questionID == draft.target.questionID
+        }
+        let newTargetPatterns = [
+            #"(?:另|另外|换|改|重新|新)(?:一|个|道|篇|份)?.{0,6}(?:题|问题|话题|回答|稿)"#,
+            #"(?:写|回答|创作|起草).{0,8}(?:关于|针对|题目|问题|话题|《|“|「|：|:)"#,
+            #"(?:题目|问题|话题).{0,2}(?:是|为|：|:)"#
+        ]
+        return !newTargetPatterns.contains { pattern in
+            instruction.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+    }
+
+    /// 恢复优先级固定为明确 draftID → 来源任务 → 适用的会话关联；不再用
+    /// 关键词或全局最新稿猜测。明确关联不受新题文本启发式影响。
     private func attachPreservedDraft(to instruction: String, draftID: UUID? = nil,
                                       sourceTaskID: UUID? = nil) {
-        let associatedID = draftID ?? UserDefaults.standard.string(
-            forKey: Self.preservedDraftAssociationPrefix + runSessionID.uuidString).flatMap(UUID.init(uuidString:))
         let draft: PreservedDraft?
         do {
-            if let associatedID {
-                draft = try preservedDraftStore.draft(id: associatedID)
+            if let draftID {
+                draft = try preservedDraftStore.draft(id: draftID)
+            } else if let sourceTaskID,
+                      let taskDraft = try preservedDraftStore.draft(sourceTaskID: sourceTaskID) {
+                draft = taskDraft
             } else {
-                let taskDraft = try sourceTaskID.flatMap { try preservedDraftStore.draft(sourceTaskID: $0) }
+                let associatedID = UserDefaults.standard.string(
+                    forKey: Self.preservedDraftAssociationPrefix + runSessionID.uuidString).flatMap(UUID.init(uuidString:))
+                let associatedDraft = try associatedID.flatMap { try preservedDraftStore.draft(id: $0) }
                 let sessionDraft = try preservedDraftStore.draft(sourceSessionID: runSessionID)
-                draft = taskDraft ?? sessionDraft
+                let candidate = associatedDraft ?? sessionDraft
+                draft = candidate.flatMap { Self.sessionDraftApplies($0, to: instruction) ? $0 : nil }
+                if let candidate, draft == nil {
+                    appendStep("draft-restore", "新任务含明确的新题/新目标，未续用会话旧稿：draft=\(candidate.id.uuidString)、question=\(candidate.target.questionID)")
+                }
             }
         } catch {
             activePreservedDraft = nil
@@ -4728,7 +4762,14 @@ struct OpenStall {
     /// click→done 全由主循环消费。恢复分支创建新的 AgentEngine，并调用同一个
     /// restoreSnapshot(for:) 生产入口。
     func verifyZhihuProductionOrchestration() async -> [String] {
-        func line(_ ok: Bool, _ text: String) -> String { "\(ok ? "✓" : "✗") \(text)" }
+        var failureContexts: [String] = []
+        var failureHosts: [WKSelfTestHost] = [
+            WKSelfTestHost(tab: web.executionTab, suite: "zhihu-production-orchestration-root")
+        ]
+        func line(_ ok: Bool, _ text: String) -> String {
+            if !ok { failureContexts.append(text) }
+            return "\(ok ? "✓" : "✗") \(text)"
+        }
         func action(_ name: String, index: Int = -1, text: String = "", summary: String = "") throws -> AgentAction {
             let data = try JSONSerialization.data(withJSONObject: ["action": name, "index": index,
                 "text": text, "reason": "FIX6 controlled production loop", "summary": summary])
@@ -4748,6 +4789,18 @@ struct OpenStall {
             let directory = SessionStore.shared.snapshotURL(for: sessionID).deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             return directory
+        }
+        func loadFixture(_ web: WebController, outcome: String = "published",
+                         questionID: String = "4242", label: String) async throws
+            -> (editor: PageElement, publish: PageElement) {
+            failureHosts.append(WKSelfTestHost(tab: web.executionTab,
+                suite: "zhihu-production-orchestration-\(label)"))
+            return try await web.loadZhihuEngineFixture(outcome: outcome, questionID: questionID)
+        }
+        func loadModalFixture(_ web: WebController, mode: String) async throws -> PageElement {
+            failureHosts.append(WKSelfTestHost(tab: web.executionTab,
+                suite: "zhihu-production-orchestration-modal-\(mode)"))
+            return try await web.loadZhihuModalEngineFixture(mode: mode)
         }
         func configure(_ engine: AgentEngine, web: WebController, sessionID: UUID, taskID: UUID,
                        goal: String, actions: [AgentAction], readbackBody: String? = nil) {
@@ -4820,6 +4873,73 @@ struct OpenStall {
             lines.append(line(corruptSaveRejected && corruptAfter == corruptBytes,
                               "稿库保全：存在但解码失败的文件使 save 报错，原字节保持不变"))
 
+            // 同一会话的明确新题不能继承旧稿；随后按来源任务恢复时又必须越过
+            // 会话最新稿，精确取回甲稿。三段都走 startInSession 生产入口。
+            let interleaveStore = PreservedDraftStore(
+                fileURL: isolatedDraftDirectory.appendingPathComponent("interleaved.json"))
+            let interleaveSession = UUID(), topicATask = UUID(), topicBTask = UUID()
+            directories.append(prepareDirectory(interleaveSession))
+            let topicABody = "甲稿全文：围绕可靠恢复说明证据边界；甲稿标识只应出现在问题 6101。"
+            let topicBBody = "乙稿全文：围绕独立保存说明新题隔离；乙稿标识只应出现在问题 6102。"
+
+            let topicAWeb = WebController(); topicAWeb.beginExecution(sessionID: interleaveSession)
+            let topicAFixture = try await loadFixture(topicAWeb, questionID: "6101", label: "topic-a")
+            let topicAEngine = AgentEngine(web: topicAWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: interleaveStore,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            configure(topicAEngine, web: topicAWeb, sessionID: interleaveSession, taskID: topicATask,
+                goal: "为知乎问题 6101 写甲题回答，只保存草稿", actions: [
+                    try action("type", index: topicAFixture.editor.index, text: topicABody),
+                    try action("done", summary: "甲稿已保存")
+                ])
+            topicAEngine.startInSession(interleaveSession, local: nil,
+                task: "为知乎问题 6101 写甲题回答，只保存草稿", startingID: topicATask)
+            let topicADone = await waitFor({ isDone(topicAEngine) }, seconds: 20)
+            let savedA = try interleaveStore.draft(sourceTaskID: topicATask)
+
+            let topicBWeb = WebController(); topicBWeb.beginExecution(sessionID: interleaveSession)
+            let topicBFixture = try await loadFixture(topicBWeb, questionID: "6102", label: "topic-b")
+            let topicBEngine = AgentEngine(web: topicBWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: interleaveStore,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            configure(topicBEngine, web: topicBWeb, sessionID: interleaveSession, taskID: topicBTask,
+                goal: "为知乎问题 6102 写乙题回答，只保存草稿", actions: [
+                    try action("type", index: topicBFixture.editor.index, text: topicBBody),
+                    try action("done", summary: "乙稿已保存")
+                ])
+            topicBEngine.startInSession(interleaveSession, local: nil,
+                task: "为知乎问题 6102 写乙题回答，只保存草稿", startingID: topicBTask)
+            let topicBDone = await waitFor({ isDone(topicBEngine) }, seconds: 20)
+            let savedB = try interleaveStore.draft(sourceTaskID: topicBTask)
+
+            let restoreAWeb = WebController(); restoreAWeb.beginExecution(sessionID: interleaveSession)
+            let restoreAFixture = try await loadFixture(restoreAWeb, questionID: "6101", label: "topic-a-restore")
+            let restoreAEngine = AgentEngine(web: restoreAWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: interleaveStore,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            configure(restoreAEngine, web: restoreAWeb, sessionID: interleaveSession, taskID: topicATask,
+                goal: "恢复来源任务甲稿并继续编辑", actions: [
+                    try action("type", index: restoreAFixture.editor.index, text: "__MIKA_PRESERVED_DRAFT__"),
+                    try action("done", summary: "甲稿恢复完成")
+                ])
+            restoreAEngine.startInSession(interleaveSession, local: nil,
+                task: "恢复来源任务甲稿并继续编辑", startingID: topicATask)
+            let restoreADone = await waitFor({ isDone(restoreAEngine) }, seconds: 20)
+            let restoredA = try interleaveStore.draft(sourceTaskID: topicATask)
+            let interleavedDrafts = try interleaveStore.all()
+            let topicBDetached = topicBEngine.steps.contains {
+                $0.action == "draft-restore" && $0.reason.contains("明确的新题/新目标")
+            }
+            let topicARestored = restoreAEngine.steps.contains {
+                $0.action == "draft-restore" && $0.reason.contains(savedA?.id.uuidString ?? "missing")
+            }
+            lines.append(line(topicADone && topicBDone && restoreADone && topicBDetached && topicARestored &&
+                              savedA?.id != savedB?.id && interleavedDrafts.count == 2 &&
+                              savedA?.fullText == topicABody && savedB?.fullText == topicBBody &&
+                              restoredA?.fullText == topicABody &&
+                              restoreAEngine.currentZhihuWriteProof?.expectedText == topicABody,
+                              "关联取稿：同会话甲→明确新题乙分别独立保存；再按来源任务恢复甲，生产入口取回全文与原甲稿一致"))
+
             // 真实生产主循环先完成“只写草稿”任务；任务收口后不靠任务快照，
             // 新建 Store/Engine 模拟进程退出，再从独立稿件文件取回正文。
             // CLI WK 自检会在本轮完成后由 CI 真正终止 App，再用新进程从此
@@ -4833,7 +4953,7 @@ struct OpenStall {
             let sourceSession = UUID(), sourceTask = UUID()
             directories.append(prepareDirectory(sourceSession))
             let sourceWeb = WebController(); sourceWeb.beginExecution(sessionID: sourceSession)
-            let sourceFixture = try await sourceWeb.loadZhihuEngineFixture()
+            let sourceFixture = try await loadFixture(sourceWeb, label: "draft-source")
             let sourceEngine = AgentEngine(web: sourceWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: sourceStore,
                 controlledZhihuPublishFixture: true, restoreSession: false)
@@ -4853,7 +4973,8 @@ struct OpenStall {
             if let checkpoint = restoredAfterRestart {
                 let marker: [String: Any] = ["draftID": checkpoint.id.uuidString,
                     "textHash": checkpoint.textHash, "accountStableID": checkpoint.target.accountStableID,
-                    "accountAliases": checkpoint.target.accountAliases, "questionID": checkpoint.target.questionID]
+                    "accountAliases": checkpoint.target.accountAliases, "questionID": checkpoint.target.questionID,
+                    "sourceSessionID": sourceSession.uuidString, "sourceTaskID": sourceTask.uuidString]
                 let data = try JSONSerialization.data(withJSONObject: marker, options: [.sortedKeys])
                 try data.write(to: draftDirectory.appendingPathComponent("checkpoint.json"), options: .atomic)
             }
@@ -4874,7 +4995,7 @@ struct OpenStall {
             let mainSession = sourceSession, mainTask = UUID()
             let mainWeb = WebController()
             mainWeb.beginExecution(sessionID: mainSession)
-            let mainFixture = try await mainWeb.loadZhihuEngineFixture()
+            let mainFixture = try await loadFixture(mainWeb, label: "authorization-main")
             let mainEngine = AgentEngine(web: mainWeb, settings: SettingsStore(),
                                          zhihuPublishLedgerKeyOverride: ledgerKey,
                                          preservedDraftStore: restartedStore,
@@ -4914,7 +5035,7 @@ struct OpenStall {
             let offSession = UUID(), offTask = UUID()
             directories.append(prepareDirectory(offSession))
             let offWeb = WebController(); offWeb.beginExecution(sessionID: offSession)
-            let offFixture = try await offWeb.loadZhihuEngineFixture()
+            let offFixture = try await loadFixture(offWeb, label: "switch-off")
             let offEngine = AgentEngine(web: offWeb, settings: offSettings,
                 zhihuPublishLedgerKeyOverride: switchOffKey,
                 preservedDraftStore: restartedStore, restoreSession: false)
@@ -4941,7 +5062,7 @@ struct OpenStall {
             let reviewKey = "zhihuPublishLedger.selftest.review-switch-off.\(suffix)"
             keys.append(reviewKey); directories.append(prepareDirectory(reviewSession))
             let reviewWeb = WebController(); reviewWeb.beginExecution(sessionID: reviewSession)
-            let reviewFixture = try await reviewWeb.loadZhihuEngineFixture()
+            let reviewFixture = try await loadFixture(reviewWeb, label: "review-only")
             let reviewEngine = AgentEngine(web: reviewWeb, settings: reviewSettings,
                 zhihuPublishLedgerKeyOverride: reviewKey,
                 preservedDraftStore: isolatedDraftStore, restoreSession: false)
@@ -4965,7 +5086,7 @@ struct OpenStall {
             let revokeSession = UUID(), revokeTask = UUID()
             directories.append(prepareDirectory(revokeSession))
             let revokeWeb = WebController(); revokeWeb.beginExecution(sessionID: revokeSession)
-            let revokeFixture = try await revokeWeb.loadZhihuEngineFixture()
+            let revokeFixture = try await loadFixture(revokeWeb, label: "authorization-revoke")
             let revokeEngine = AgentEngine(web: revokeWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: revokeKey, preservedDraftStore: restartedStore,
                 controlledZhihuPublishFixture: true, restoreSession: false)
@@ -4991,7 +5112,7 @@ struct OpenStall {
             let repeatSession = UUID(), repeatTask = UUID()
             directories.append(prepareDirectory(repeatSession))
             let repeatWeb = WebController(); repeatWeb.beginExecution(sessionID: repeatSession)
-            _ = try await repeatWeb.loadZhihuEngineFixture()
+            _ = try await loadFixture(repeatWeb, label: "repeat-readback")
             try await repeatWeb.exposeOnlyControlledZhihuAlias("engine-me-token")
             let repeatEngine = AgentEngine(web: repeatWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: ledgerKey,
@@ -5042,7 +5163,7 @@ struct OpenStall {
                 lines.append(line(cachedReturn == nil,
                     "七十三-3：返回问题 4242，页面仍只暴露 `me-token`，命中缓存仍先查同题旧 `me-id` 未决记录，缺少关联或区分证据时 fail-closed"))
             } else {
-                lines.append("✗ B.2-迁移：主回归未产生可迁移记录")
+                lines.append(line(false, "B.2-迁移：主回归未产生可迁移记录"))
             }
 
             // 57 + D.2：原生 disabled 与 disabled fieldset 同时在真实
@@ -5053,7 +5174,8 @@ struct OpenStall {
             let disabledSession = UUID(), disabledTask = UUID()
             directories.append(prepareDirectory(disabledSession))
             let disabledWeb = WebController(); disabledWeb.beginExecution(sessionID: disabledSession)
-            let disabledFixture = try await disabledWeb.loadZhihuEngineFixture(outcome: "native-disabled-fieldset-stale")
+            let disabledFixture = try await loadFixture(disabledWeb,
+                outcome: "native-disabled-fieldset-stale", label: "disabled-fieldset")
             let disabledEngine = AgentEngine(web: disabledWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: disabledKey,
                 preservedDraftStore: isolatedDraftStore,
@@ -5090,7 +5212,8 @@ struct OpenStall {
                 let session = UUID(), task = UUID()
                 directories.append(prepareDirectory(session))
                 let outcomeWeb = WebController(); outcomeWeb.beginExecution(sessionID: session)
-                let fixture = try await outcomeWeb.loadZhihuEngineFixture(outcome: mode)
+                let fixture = try await loadFixture(outcomeWeb, outcome: mode,
+                    label: "outcome-\(mode)")
                 let outcomeEngine = AgentEngine(web: outcomeWeb, settings: SettingsStore(),
                     zhihuPublishLedgerKeyOverride: key,
                     preservedDraftStore: isolatedDraftStore,
@@ -5119,7 +5242,8 @@ struct OpenStall {
             let revealSession = UUID(), revealTask = UUID()
             directories.append(prepareDirectory(revealSession))
             let revealWeb = WebController(); revealWeb.beginExecution(sessionID: revealSession)
-            let revealFixture = try await revealWeb.loadZhihuEngineFixture(outcome: "rejected-hidden-visible")
+            let revealFixture = try await loadFixture(revealWeb,
+                outcome: "rejected-hidden-visible", label: "hidden-visible")
             let revealEngine = AgentEngine(web: revealWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: revealKey,
                 preservedDraftStore: isolatedDraftStore,
@@ -5146,7 +5270,7 @@ struct OpenStall {
             let recoverySession = UUID(), recoveryTask = UUID()
             directories.append(prepareDirectory(recoverySession))
             let firstWeb = WebController(); firstWeb.beginExecution(sessionID: recoverySession)
-            let firstFixture = try await firstWeb.loadZhihuEngineFixture()
+            let firstFixture = try await loadFixture(firstWeb, label: "snapshot-source")
             let firstEngine = AgentEngine(web: firstWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: recoveryKey,
                 preservedDraftStore: isolatedDraftStore,
@@ -5171,7 +5295,7 @@ struct OpenStall {
             recoveredEngine.queuedTasks = []; recoveredEngine.acceptedSteerQueueIDs = []
             recoveredEngine.applyPendingTabRestore()
             recoveredWeb.beginExecution(sessionID: recoverySession)
-            _ = try await recoveredWeb.loadZhihuEngineFixture()
+            _ = try await loadFixture(recoveredWeb, label: "snapshot-recovered")
             recoveredEngine.controlledActions = [try action("click", index: -2),
                 try action("click", index: -2), try action("done", summary: "恢复回读完成")]
             recoveredEngine.controlledActionCursor = 0
@@ -5192,7 +5316,7 @@ struct OpenStall {
             let timeoutSession = UUID(), timeoutTask = UUID()
             directories.append(prepareDirectory(timeoutSession))
             let timeoutFirstWeb = WebController(); timeoutFirstWeb.beginExecution(sessionID: timeoutSession)
-            let timeoutFixture = try await timeoutFirstWeb.loadZhihuEngineFixture()
+            let timeoutFixture = try await loadFixture(timeoutFirstWeb, label: "timeout-source")
             let timeoutFirst = AgentEngine(web: timeoutFirstWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: timeoutKey,
                 preservedDraftStore: isolatedDraftStore,
@@ -5216,7 +5340,7 @@ struct OpenStall {
             timeoutRecovered.queuedTasks = []; timeoutRecovered.acceptedSteerQueueIDs = []
             timeoutRecovered.applyPendingTabRestore()
             timeoutWeb.beginExecution(sessionID: timeoutSession)
-            _ = try await timeoutWeb.loadZhihuEngineFixture()
+            _ = try await loadFixture(timeoutWeb, label: "timeout-recovered")
             timeoutRecovered.controlledActions = [try action("click", index: -2), try action("done", summary: "未知结果收口")]
             timeoutRecovered.controlledActionCursor = 0
             timeoutRecovered.controlledZhihuReadback = true
@@ -5240,7 +5364,7 @@ struct OpenStall {
             let exceptionSession = UUID(), exceptionTask = UUID()
             directories.append(prepareDirectory(exceptionSession))
             let exceptionWeb = WebController(); exceptionWeb.beginExecution(sessionID: exceptionSession)
-            let exceptionFixture = try await exceptionWeb.loadZhihuEngineFixture()
+            let exceptionFixture = try await loadFixture(exceptionWeb, label: "exception")
             try await exceptionWeb.injectControlledZhihuPostClickException()
             let exceptionEngine = AgentEngine(web: exceptionWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: exceptionKey,
@@ -5270,7 +5394,7 @@ struct OpenStall {
             let mutationSession = UUID(), mutationTask = UUID(), mutationKey = "zhihuPublishLedger.selftest.mutation.\(suffix)"
             keys.append(mutationKey); directories.append(prepareDirectory(mutationSession))
             let mutationWeb = WebController(); mutationWeb.beginExecution(sessionID: mutationSession)
-            let mutationFixture = try await mutationWeb.loadZhihuEngineFixture()
+            let mutationFixture = try await loadFixture(mutationWeb, label: "body-mutation")
             let mutationEngine = AgentEngine(web: mutationWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: mutationKey,
                 preservedDraftStore: isolatedDraftStore,
@@ -5299,7 +5423,7 @@ struct OpenStall {
                 let session = UUID(), task = UUID(), key = "zhihuPublishLedger.selftest.modal.\(mode).\(suffix)"
                 keys.append(key); directories.append(prepareDirectory(session))
                 let modalWeb = WebController(); modalWeb.beginExecution(sessionID: session)
-                let target = try await modalWeb.loadZhihuModalEngineFixture(mode: mode)
+                let target = try await loadModalFixture(modalWeb, mode: mode)
                 let modalEngine = AgentEngine(web: modalWeb, settings: SettingsStore(),
                     zhihuPublishLedgerKeyOverride: key,
                     preservedDraftStore: isolatedDraftStore,
@@ -5327,7 +5451,7 @@ struct OpenStall {
                 UserDefaults.standard.removeObject(forKey: key + ".accounts")
                 let directory = prepareDirectory(session); directories.append(directory)
                 let steerWeb = WebController(); steerWeb.beginExecution(sessionID: session)
-                let fixture = try await steerWeb.loadZhihuEngineFixture()
+                let fixture = try await loadFixture(steerWeb, label: "steer-\(number)")
                 let steerEngine = AgentEngine(web: steerWeb, settings: SettingsStore(),
                     zhihuPublishLedgerKeyOverride: key,
                     preservedDraftStore: isolatedDraftStore,
@@ -5355,39 +5479,104 @@ struct OpenStall {
                 UserDefaults.standard.removeObject(forKey: key + ".accounts")
             }
         } catch {
-            lines.append("✗ FIX6 生产编排异常：\(error.localizedDescription)")
+            let context = "FIX6 生产编排异常：\(error.localizedDescription)"
+            failureContexts.append(context)
+            lines.append("✗ \(context)")
         }
         let formalDraftsAfter = try? PreservedDraftStore.shared.all()
         lines.append(line(formalDraftsBefore != nil && formalDraftsBefore == formalDraftsAfter,
                           "自检稿库隔离：所有自检/恢复 AgentEngine 显式使用临时 PreservedDraftStore，运行前后正式稿库逐项相同"))
+        if !failureContexts.isEmpty {
+            let context = "生产编排自检失败：" + failureContexts.joined(separator: " | ")
+            for host in failureHosts { await host.captureFailure(context) }
+        }
         return lines
     }
 
-    /// 仅供模拟器 CLI 第二次启动：CI 在第一阶段结果落盘后执行 simctl terminate，
-    /// 新 App 进程再按 checkpoint 中的 draftID 回读隔离稿库。检查后清理夹具。
-    func verifyZhihuProcessRestartCheckpoint() -> [String] {
+    /// 仅供模拟器 CLI 第二次启动：CI 在第一阶段结果落盘后执行 simctl terminate。
+    /// 新 App 进程必须经聊天共用补授权入口取得正文；不得直接读 Store 冒充恢复。
+    func verifyZhihuProcessRestartCheckpoint() async -> [String] {
         let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MikaWebSelfTest/process-restart", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        var failureHost: WKSelfTestHost?
         do {
             let markerData = try Data(contentsOf: directory.appendingPathComponent("checkpoint.json"))
             guard let marker = try JSONSerialization.jsonObject(with: markerData) as? [String: Any],
                   let rawID = marker["draftID"] as? String, let draftID = UUID(uuidString: rawID),
                   let textHash = marker["textHash"] as? String,
                   let accountStableID = marker["accountStableID"] as? String,
-                  let questionID = marker["questionID"] as? String else {
+                  let questionID = marker["questionID"] as? String,
+                  let rawSessionID = marker["sourceSessionID"] as? String,
+                  let sourceSessionID = UUID(uuidString: rawSessionID),
+                  let rawTaskID = marker["sourceTaskID"] as? String,
+                  let sourceTaskID = UUID(uuidString: rawTaskID) else {
                 throw MikaError("进程重启 checkpoint 格式无效")
             }
             let store = PreservedDraftStore(fileURL: directory.appendingPathComponent("drafts.json"))
-            guard let draft = try store.draft(id: draftID) else { throw MikaError("按 draftID 未找到稿件") }
+            let associationKey = Self.preservedDraftAssociationPrefix + sourceSessionID.uuidString
+            let ledgerKey = "zhihuPublishLedger.selftest.process-restart.\(UUID().uuidString)"
+            defer {
+                UserDefaults.standard.removeObject(forKey: associationKey)
+                UserDefaults.standard.removeObject(forKey: ledgerKey)
+                UserDefaults.standard.removeObject(forKey: ledgerKey + ".accounts")
+            }
+            UserDefaults.standard.set(draftID.uuidString, forKey: associationKey)
+
+            let web = WebController(); web.beginExecution(sessionID: sourceSessionID)
+            failureHost = WKSelfTestHost(tab: web.executionTab,
+                suite: "zhihu-process-restart-production-entry")
+            let fixture = try await web.loadZhihuEngineFixture(questionID: questionID)
+            func action(_ name: String, index: Int = -1, text: String = "", summary: String = "") throws -> AgentAction {
+                let data = try JSONSerialization.data(withJSONObject: ["action": name, "index": index,
+                    "text": text, "reason": "process restart production entry", "summary": summary])
+                return try JSONDecoder().decode(AgentAction.self, from: data)
+            }
+            let settings = SettingsStore(); settings.zhihuAutoPublishEnabled = false
+            let engine = AgentEngine(web: web, settings: settings,
+                zhihuPublishLedgerKeyOverride: ledgerKey, preservedDraftStore: store,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            let recoveryTaskID = UUID()
+            engine.controlledActions = [
+                try action("type", index: fixture.editor.index, text: "__MIKA_PRESERVED_DRAFT__"),
+                try action("done", summary: "进程重启恢复检查完成")
+            ]
+            var recoveredDraft: PreservedDraft?
+            var oldProofAbsent = false
+            engine.controlledActionWillDispatch = { cursor, _ in
+                guard cursor == 0 else { return }
+                recoveredDraft = engine.activePreservedDraft
+                oldProofAbsent = engine.currentZhihuWriteProof == nil
+            }
+            engine.startInSession(sourceSessionID, local: nil,
+                task: "把这篇知乎回答发出去", startingID: recoveryTaskID)
+            let deadline = Date().addingTimeInterval(20)
+            while Date() < deadline {
+                if case .done = engine.status { break }
+                if case .failed = engine.status { break }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+
             let aliases = marker["accountAliases"] as? [String] ?? []
-            let passed = draft.textHash == textHash &&
-                draft.target.accountStableID == accountStableID &&
-                draft.target.accountAliases == aliases &&
-                draft.target.questionID == questionID
-            return ["\(passed ? "✓" : "✗") 进程级恢复：App 被终止并重启后按 draftID 回读，正文哈希/zhacct 稳定身份＋别名/题目一致"]
+            let recomputedHash = recoveredDraft.map { PreservedDraftStore.textHash($0.fullText) }
+            let proof = engine.currentZhihuWriteProof
+            let restoredThroughEntry = engine.steps.contains {
+                $0.action == "draft-restore" && $0.reason.contains(draftID.uuidString)
+            }
+            let done: Bool = { if case .done = engine.status { return true }; return false }()
+            let passed = done && restoredThroughEntry && oldProofAbsent &&
+                recomputedHash == textHash && proof?.expectedText == recoveredDraft?.fullText &&
+                proof?.taskID == recoveryTaskID && proof?.taskID != sourceTaskID &&
+                recoveredDraft?.target.accountStableID == accountStableID &&
+                recoveredDraft?.target.accountAliases == aliases &&
+                recoveredDraft?.target.questionID == questionID
+            let result = "\(passed ? "✓" : "✗") 进程级恢复：新 App 进程经生产补授权入口按 draftID 取得正文，重算 fullText 哈希及账号/题目一致，旧 proof 未恢复、当前任务重新生成 proof"
+            if !passed { await failureHost?.captureFailure(result) }
+            return [result]
         } catch {
-            return ["✗ 进程级恢复异常：\(error.localizedDescription)"]
+            let result = "进程级恢复异常：\(error.localizedDescription)"
+            await failureHost?.captureFailure(result)
+            return ["✗ \(result)"]
         }
     }
 
