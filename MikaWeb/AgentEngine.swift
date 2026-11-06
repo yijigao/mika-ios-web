@@ -4370,7 +4370,8 @@ struct OpenStall {
                 draft = try preservedDraftStore.draft(id: associatedID)
             } else {
                 let taskDraft = try sourceTaskID.flatMap { try preservedDraftStore.draft(sourceTaskID: $0) }
-                draft = taskDraft ?? (try preservedDraftStore.draft(sourceSessionID: runSessionID))
+                let sessionDraft = try preservedDraftStore.draft(sourceSessionID: runSessionID)
+                draft = taskDraft ?? sessionDraft
             }
         } catch {
             activePreservedDraft = nil
@@ -4815,7 +4816,8 @@ struct OpenStall {
                         accountAliases: ["corrupt"], questionID: "corrupt"),
                     sourceTaskID: UUID())
             } catch { corruptSaveRejected = true }
-            lines.append(line(corruptSaveRejected && (try Data(contentsOf: corruptURL)) == corruptBytes,
+            let corruptAfter = try Data(contentsOf: corruptURL)
+            lines.append(line(corruptSaveRejected && corruptAfter == corruptBytes,
                               "稿库保全：存在但解码失败的文件使 save 报错，原字节保持不变"))
 
             // 真实生产主循环先完成“只写草稿”任务；任务收口后不靠任务快照，
