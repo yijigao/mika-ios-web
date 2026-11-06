@@ -816,6 +816,9 @@ struct OpenStall {
     /// App 里就是一条新任务，台账必须跨得过任务界），自有持久化＋随会话
     /// 快照双写，进程被杀重开仍在；24 小时过期、最多 20 条（见 prunedOutcomes）。
     private(set) var outcomeLedger: [OutcomeRecord] = []
+    /// 成果主张的任务归属与终局状态。与旧 OutcomeRecord 分表保存，避免改动
+    /// 既有台账格式；claim.id 与 OutcomeRecord.id 相同。
+    private var taskClaims: [TaskStateClaim] = []
     /// 软门已提醒过的台账条目 id（本进程内）：同一条目只拦第一次重复提交；
     /// 模型收到提醒后仍坚持、或用户在新任务里明确要求重发时放行，由落记
     /// 路径回记为再次提交。进程重启后集合清空，会再提醒一次（软门口径）。
@@ -937,6 +940,8 @@ struct OpenStall {
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
         loadOutcomeLedger()
+        loadTaskClaims()
+        saveTaskClaims()
         loadQueue()
         restoreSnapshotIfNeeded()
     }
@@ -994,10 +999,12 @@ struct OpenStall {
         guard !taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = .failed("请输入任务"); return }
         do { try prepareSteersForNewTask(in: sessionID) }
         catch { status = .failed("插话去向未能保存，暂未启动新任务：\(error.localizedDescription)"); return }
+        applyUserClaimStatement(taskText)
+        let newTaskID = startingID ?? UUID()
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; thermalPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
-        stateCard = TaskStateCard(goal: goal); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
+        stateCard = TaskStateCard(goal: goal, claims: taskClaims); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         // 绕行梯随新任务重置（AUTONOMY-FIX）：每个任务从梯级①重新开始
         bypassLadder = BypassLadder()
         // 在开卡点随新任务重置（LADDER-FIX）：卡点是单任务现场
@@ -1007,7 +1014,7 @@ struct OpenStall {
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
-        conversationTaskID = startingID ?? UUID()
+        conversationTaskID = newTaskID
         refreshPendingSteers()
         autoTitleSessionIfPlaceholder()
         // 任务绑定到该会话当时的活跃标签页：全程作用于它，用户中途切页／
@@ -1147,6 +1154,9 @@ struct OpenStall {
         var file = try sidecar(runSessionID)
         guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }), !file.tasks[i].pending.isEmpty else { return nil }
         let hint = file.tasks[i].consume(step: stepSeq + 1)
+        for item in file.tasks[i].items where item.disposition == .applied && hint?.contains(item.text) == true {
+            applyUserClaimStatement(item.text)
+        }
         try saveSidecar(file, in: runSessionID) // 消费标记先持久化，快照旧镜像不能复活它。
         do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
         persistSnapshot()
@@ -1719,6 +1729,7 @@ struct OpenStall {
         guard case .some(.question(let id, let question)) = waitingInput, id == requestID else { return .rejected("这条问题已失效") }
         switch status { case .waitingManual, .paused: break; default: return .rejected("当前不能提交回答") }
         answerContext.append(QuestionAnswer(questionID: id, question: question, answer: answer))
+        applyUserClaimStatement(answer)
         // 用户答复是程序可确定的关键事实：钉进状态卡 pinnedFacts，折叠与
         // 摘要都动不了它（H1）——长任务后段模型仍能看到用户早先的明确口径
         stateCard.pinFact("用户对「\(question)」的答复：\(answer)")
@@ -3908,6 +3919,7 @@ struct OpenStall {
     // MARK: - 成果台账（OUTCOME-LEDGER-2026-11-02.md）
 
     private static let outcomeLedgerKey = "outcomeLedger.v1"
+    private static let taskClaimsKey = "taskStateClaims.v1"
     private static let outcomeTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
@@ -3932,6 +3944,52 @@ struct OpenStall {
         if let data = try? JSONEncoder().encode(outcomeLedger) {
             UserDefaults.standard.set(data, forKey: Self.outcomeLedgerKey)
         }
+    }
+
+    private func loadTaskClaims() {
+        if let data = UserDefaults.standard.data(forKey: Self.taskClaimsKey),
+           let saved = try? JSONDecoder().decode([TaskStateClaim].self, from: data) {
+            taskClaims = saved
+        }
+        // 升级前的 OutcomeRecord 没有任务归属；给它一次性分配“旧任务”标识，
+        // 默认仍是未核实。这样既不泄露细节，又允许随后用户明确确认时定位。
+        for record in outcomeLedger where !taskClaims.contains(where: { $0.id == record.id }) {
+            taskClaims.append(TaskStateClaim(id: record.id, sourceTaskID: UUID(),
+                                             text: "在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」提交\(record.contentPrefix.isEmpty ? "内容" : "内容「\(record.contentPrefix)…」")"))
+        }
+    }
+    private func saveTaskClaims() {
+        let liveIDs = Set(outcomeLedger.map(\.id))
+        taskClaims = taskClaims.filter { liveIDs.contains($0.id) }
+        if let data = try? JSONEncoder().encode(taskClaims) {
+            UserDefaults.standard.set(data, forKey: Self.taskClaimsKey)
+        }
+        stateCard.claims = taskClaims
+    }
+
+    /// 明确的用户事实断言可把相关主张终局化。只在有确认/纠正语义且能以
+    /// 内容前缀或最近一条唯一定位时生效；普通任务文本不会误改台账。
+    private func applyUserClaimStatement(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assertionWords = ["我确认", "用户确认", "亲口确认", "亲令", "确实", "已经发布", "已经提交", "发布成功", "提交成功", "我已", "我没有", "并未", "未发布", "未提交"]
+        guard assertionWords.contains(where: text.contains) else { return }
+        let matching = taskClaims.indices.filter { index in
+            guard taskClaims[index].status == .unverified else { return false }
+            let record = outcomeLedger.first { $0.id == taskClaims[index].id }
+            return record?.contentPrefix.isEmpty == false && text.contains(record!.contentPrefix)
+        }
+        let target: Int?
+        if matching.count == 1 { target = matching[0] }
+        else if matching.isEmpty { target = taskClaims.lastIndex { $0.status == .unverified } }
+        else { target = nil }
+        guard let target else { return }
+        taskClaims[target].text = String(text.prefix(160))
+        _ = taskClaims[target].setStatus(.verified, verifiedByUser: true)
+        if let recordIndex = outcomeLedger.firstIndex(where: { $0.id == taskClaims[target].id }) {
+            outcomeLedger[recordIndex].statusNote = "据用户确认：\(String(text.prefix(120)))"
+            saveOutcomeLedger()
+        }
+        saveTaskClaims()
     }
 
     /// 条目同一性：双方都有正文指纹时按指纹＋主机比（同内容同站点才算同一
@@ -3978,7 +4036,9 @@ struct OpenStall {
         if let index = outcomeLedger.firstIndex(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }) {
             outcomeLedger[index].recordedAt = Date()
             outcomeLedger[index].resubmittedAt = Date()
-            outcomeLedger[index].statusNote = "再次提交（经提醒或用户确认后执行），待核查"
+            if taskClaims.first(where: { $0.id == outcomeLedger[index].id })?.verifiedByUser != true {
+                outcomeLedger[index].statusNote = "再次提交（经提醒或用户确认后执行），待核查"
+            }
             saveOutcomeLedger()
             return ("成果台账更新：同一内容已再次提交（「\(label)」），条目时间与状态已更新——后续仍按已提交内容对待，不得无意识再发", outcomeLedger[index].id)
         }
@@ -3986,7 +4046,12 @@ struct OpenStall {
                                     contentFingerprint: hash, contentPrefix: prefix,
                                     statusNote: "已提交（待核查）", recordedAt: Date(), resubmittedAt: nil)
         outcomeLedger.append(record)
+        if let taskID = conversationTaskID {
+            taskClaims.append(TaskStateClaim(id: record.id, sourceTaskID: taskID,
+                                             text: "在 \(host.isEmpty ? "本地页面" : host) 点了「\(label)」提交\(prefix.isEmpty ? "内容" : "内容「\(prefix)…」")"))
+        }
         saveOutcomeLedger()
+        saveTaskClaims()
         let contentDesc = prefix.isEmpty ? "（正文未留指纹，按页面与按钮记账）" : "内容「\(prefix)…」"
         return ("成果台账已记录：\(Self.outcomeTime(record.recordedAt)) 在 \(host.isEmpty ? "本地页面" : host) 提交了\(contentDesc)（按钮「\(label)」），状态：已提交（待核查）", record.id)
     }
@@ -4143,6 +4208,7 @@ struct OpenStall {
         var changed = false
         guard let startedAt else { return }
         for index in outcomeLedger.indices where outcomeLedger[index].recordedAt >= startedAt && outcomeLedger[index].statusNote.contains("待核查") {
+            if taskClaims.first(where: { $0.id == outcomeLedger[index].id })?.verifiedByUser == true { continue }
             outcomeLedger[index].statusNote = "已提交（待核查）；结案自述（未经独立核实）：\(String(trimmed.prefix(80)))"
             changed = true
         }
@@ -4190,15 +4256,67 @@ struct OpenStall {
         return lines
     }
 
+    /// 自检五十三至五十五（MIKA-FIX3）：纯结构断言，不调用模型、不改现场。
+    func verifyTaskClaimIsolation() -> [String] {
+        let taskA = UUID(), taskB = UUID()
+        var card = TaskStateCard(goal: "任务乙")
+        card.claims = [
+            TaskStateClaim(sourceTaskID: taskA, text: "甲的未核实细节：旧发布待核查"),
+            TaskStateClaim(sourceTaskID: taskA, text: "甲的已核实事实：用户确认已发布", status: .verified, verifiedByUser: true),
+            TaskStateClaim(sourceTaskID: taskB, text: "乙的本任务主张")
+        ]
+        let prompt = card.claimPromptBlock(currentTaskID: taskB)
+        return [
+            "\(!prompt.contains("甲的未核实细节") ? "✓" : "✗") 任务乙 prompt 不含任务甲未核实主张细节",
+            "\(prompt.contains("上个任务有未核实记录（不属于本任务）") ? "✓" : "✗") 跨任务未核实项只留一行无义务提示",
+            "\(prompt.contains("已核实事实（背景，只读；本任务不得重开或降级）") && prompt.contains("甲的已核实事实") ? "✓" : "✗") 任务甲已核实事实作为只读背景出现",
+            "\(prompt.contains("乙的本任务主张") ? "✓" : "✗") 任务乙自产主张照常出现"
+        ]
+    }
+
+    func verifyUserFinalClaim() -> [String] {
+        var claim = TaskStateClaim(sourceTaskID: UUID(), text: "用户确认已发布")
+        let upgraded = claim.setStatus(.verified, verifiedByUser: true)
+        let rejected = !claim.setStatus(.unverified)
+        return [
+            "\(upgraded && claim.verifiedByUser && claim.status == .verified ? "✓" : "✗") verifiedByUser 写入后成为已核实终局",
+            "\(rejected && claim.status == .verified ? "✓" : "✗") 降级为未核实/待核查的写入被拒",
+            "\(claim.displayText.contains("据用户确认") ? "✓" : "✗") 后续呈现只按据用户确认口径"
+        ]
+    }
+
+    func verifyFix3SystemRules() -> [String] {
+        let text = ModelClient.system
+        return [
+            "\(text.contains("新任务") && text.contains("不得反问任务身份或范围") && text.contains("口语默认是语气词") ? "✓" : "✗") 新任务明确时不反问且口语不当标题",
+            "\(text.contains("同站同题至多 1 步") && text.contains("不得展开多步复查") && text.contains("不得改写旧结论") ? "✓" : "✗") 旧账只许防重所需最小检查",
+            "\(text.contains("本任务成败只按本任务的动作与回读判定") && text.contains("用户对既往动作的明确确认或纠正是终局事实") ? "✓" : "✗") 证据任务内一致且用户确认终局"
+        ]
+    }
+
     /// 台账注入段：动作留痕、效果核查、模型自述分层表述。
     private func outcomePromptBlock() -> String {
         let records = Self.prunedOutcomes(outcomeLedger)
         guard !records.isEmpty else { return "" }
-        let lines = records.map { record in
-            let content = record.contentPrefix.isEmpty ? "（正文未留指纹）" : "内容「\(record.contentPrefix)…」"
-            return "· \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」：\(content)，状态：\(Self.displayedOutcomeStatus(record.statusNote))"
+        let currentID = conversationTaskID
+        let visible = records.filter { record in
+            guard let claim = taskClaims.first(where: { $0.id == record.id }) else { return false }
+            return claim.sourceTaskID == currentID || claim.status == .verified
         }
-        return "【本任务关键动作留痕】\n" + lines.joined(separator: "\n") + "\n硬性口径：①表中提交是引擎实录的动作留痕（点了什么、何时、何页），属于事实；不得对同一内容重复提交/发布。②提交是否真正生效（存上/发出去）以内容列表/记录页的回读证据为准；未回读前一律表述为「待核查」，用户追问时如实说待核查，不得声称已核实。编辑器残留同文草稿不能单独证明提交失败。③「结案自述」只是模型自己的总结，不是核验证据；引用已核实结果时须说明页面原文及证据来源。"
+        let hasForeignUnverified = records.contains { record in
+            guard let claim = taskClaims.first(where: { $0.id == record.id }) else { return true }
+            return claim.sourceTaskID != currentID && claim.status == .unverified
+        }
+        var lines = visible.map { record in
+            let content = record.contentPrefix.isEmpty ? "（正文未留指纹）" : "内容「\(record.contentPrefix)…」"
+            let claim = taskClaims.first { $0.id == record.id }
+            let scope = claim?.sourceTaskID == currentID ? "本任务" : "背景只读"
+            let confirmed = claim?.verifiedByUser == true ? "（据用户确认，终局）" : ""
+            return "· [\(scope)] \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」：\(content)，状态：\(Self.displayedOutcomeStatus(record.statusNote))\(confirmed)"
+        }
+        if hasForeignUnverified { lines.append("· 上个任务有未核实记录（不属于本任务）") }
+        guard !lines.isEmpty else { return "" }
+        return "【本任务关键动作留痕】\n" + lines.joined(separator: "\n") + "\n硬性口径：①本任务条目照常记账核实；背景条目只读，不得重开或降级，用户确认的终局事实至多注明「据用户确认」。②跨任务未核实记录不属于本任务，不构成核查义务。③本任务提交是否生效只按本任务动作与回读判定。"
     }
 
     private func flushPendingOutcomeStep() {
@@ -4301,9 +4419,13 @@ struct OpenStall {
         } else {
             stateCard.todos = []
         }
-        stateCard.outcomeRefs = outcomeLedger.map {
-            "\(Self.outcomeTime($0.recordedAt)) \($0.host.isEmpty ? "本地页面" : $0.host)「\($0.elementLabel)」：\(Self.displayedOutcomeStatus($0.statusNote))"
+        stateCard.outcomeRefs = outcomeLedger.compactMap { record in
+            guard let taskID = conversationTaskID,
+                  let claim = taskClaims.first(where: { $0.id == record.id }),
+                  claim.sourceTaskID == taskID || claim.status == .verified else { return nil }
+            return "\(Self.outcomeTime(record.recordedAt)) \(record.host.isEmpty ? "本地页面" : record.host)「\(record.elementLabel)」：\(Self.displayedOutcomeStatus(record.statusNote))\(claim.verifiedByUser ? "（据用户确认）" : "")"
         }
+        stateCard.claims = taskClaims
         stateCard.updatedAt = Date()
     }
 
@@ -4331,6 +4453,10 @@ struct OpenStall {
         // 状态卡（H1）：程序维护的事实账，每轮在场；折叠只动历史段，动不了它
         let cardBlock = stateCard.promptBlock()
         if !cardBlock.isEmpty { prompt += cardBlock + "\n" }
+        if let taskID = conversationTaskID {
+            let claimsBlock = stateCard.claimPromptBlock(currentTaskID: taskID)
+            if !claimsBlock.isEmpty { prompt += claimsBlock + "\n" }
+        }
         // 中断恢复的续跑提示（RESUME-CONTEXT-FIX）：恢复会话的每一轮都带上
         // ——原页面恢复结果＋不得反问目标／网址／进度的硬性口径，直到会话
         // 终结或新任务开始才清除。

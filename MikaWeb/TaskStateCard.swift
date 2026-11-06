@@ -1,5 +1,32 @@
 import Foundation
 
+/// 一条可跨任务保存的事实主张。sourceTaskID 是硬边界；verifiedByUser
+/// 一旦置位便只能保持终局，任何待核查写入都会被拒绝。
+struct TaskStateClaim: Codable, Equatable, Identifiable {
+    enum Status: String, Codable { case unverified, verified }
+    var id: UUID
+    var sourceTaskID: UUID
+    var text: String
+    private(set) var status: Status
+    private(set) var verifiedByUser: Bool
+
+    init(id: UUID = UUID(), sourceTaskID: UUID, text: String,
+         status: Status = .unverified, verifiedByUser: Bool = false) {
+        self.id = id; self.sourceTaskID = sourceTaskID; self.text = text
+        self.status = verifiedByUser ? .verified : status
+        self.verifiedByUser = verifiedByUser
+    }
+
+    @discardableResult mutating func setStatus(_ newStatus: Status, verifiedByUser: Bool = false) -> Bool {
+        if self.verifiedByUser && newStatus != .verified { return false }
+        status = verifiedByUser ? .verified : newStatus
+        self.verifiedByUser = self.verifiedByUser || verifiedByUser
+        return true
+    }
+
+    var displayText: String { verifiedByUser ? "\(text)（据用户确认）" : text }
+}
+
 // 结构化任务状态卡（H1，2026-11-02）：程序维护的任务事实账，随会话快照
 // 持久化、每轮 prompt 注入。它与「模型散文摘要」的区别是硬性的：每个字段
 // 都由程序在确定事件点更新（任务开始、动作记账、用户答复、用户跳过、
@@ -26,6 +53,9 @@ struct TaskStateCard: Codable, Equatable {
     /// 页面写入尝试的短记录；尝试与核实结果分列，可选键使旧快照照常解码。
     var writes: [String]? = nil
     var updatedAt: Date = Date()
+
+    /// 只由程序维护的任务归属主张；可选键保证旧快照兼容。
+    var claims: [TaskStateClaim]? = nil
 
     /// 防爆值：已完成里程碑滚动保留最近 30 条（更早的里程碑仍在原始步流
     /// 记录里，可回溯；卡片只承担「当前事实速览」，不能无限长）。
@@ -80,6 +110,25 @@ struct TaskStateCard: Codable, Equatable {
         if !openQuestions.isEmpty { lines.append("未决问题：" + openQuestions.joined(separator: "；")) }
         if !outcomeRefs.isEmpty { lines.append("成果台账引用：" + outcomeRefs.joined(separator: "；")) }
         if let writes, !writes.isEmpty { lines.append("【页面写入版本账】（type 语义固定为 replace／整段替换；attempt 不等于已写入，核实仅取 verified/failed/unknown）\n" + writes.map { "· " + $0 }.joined(separator: "\n")) }
+        return lines.joined(separator: "\n")
+    }
+
+    /// 任务级呈现：本任务主张全部可见；跨任务只允许已核实事实作为只读
+    /// 背景。旧任务未核实项只给一行存在性提示，不泄露细节也不派生待办。
+    func claimPromptBlock(currentTaskID: UUID) -> String {
+        let all = claims ?? []
+        let current = all.filter { $0.sourceTaskID == currentTaskID }
+        let background = all.filter { $0.sourceTaskID != currentTaskID && $0.status == .verified }
+        let hasForeignUnverified = all.contains { $0.sourceTaskID != currentTaskID && $0.status == .unverified }
+        guard !current.isEmpty || !background.isEmpty || hasForeignUnverified else { return "" }
+        var lines = ["【任务主张账】（按任务隔离）"]
+        if !background.isEmpty {
+            lines.append("已核实事实（背景，只读；本任务不得重开或降级）：" + background.map(\.displayText).joined(separator: "；"))
+        }
+        if !current.isEmpty {
+            lines.append("本任务主张：" + current.map { "\($0.displayText)［\($0.status == .verified ? "已核实" : "待核查")］" }.joined(separator: "；"))
+        }
+        if hasForeignUnverified { lines.append("上个任务有未核实记录（不属于本任务）") }
         return lines.joined(separator: "\n")
     }
 }

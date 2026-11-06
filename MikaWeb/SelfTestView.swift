@@ -363,6 +363,24 @@ struct SelfTestView: View {
                 }
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检五十三：任务级主张隔离") {
+                for line in engine.verifyTaskClaimIsolation() { conversation.localFeedback("自检五十三：\(line)") }
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检五十三预期：任务甲未核实主张的细节不进入任务乙 prompt，只留一行不属于本任务的提示；甲的已核实事实以只读背景出现；乙自产主张照常在场。")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("自检五十四：用户确认终局") {
+                for line in engine.verifyUserFinalClaim() { conversation.localFeedback("自检五十四：\(line)") }
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检五十四预期：主张标 verifiedByUser 后终局化，任何降回未核实/待核查的写入均被拒，呈现注明据用户确认。")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("自检五十五：FIX3 系统规则") {
+                for line in engine.verifyFix3SystemRules() { conversation.localFeedback("自检五十五：\(line)") }
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检五十五预期：系统提示同时含新任务不反问、旧账同站同题至多一步、任务内证据一致与用户确认终局的硬规则。")
+                .font(.caption).foregroundStyle(.secondary)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true
