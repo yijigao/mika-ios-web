@@ -355,6 +355,14 @@ struct SelfTestView: View {
                 conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检五十一：FAIL" : "自检五十一：engine 行已落盘可导出")
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检五十二：几何关闭与 URL 直达") {
+                Task { @MainActor in
+                    let lines = await WebController().verifyGeometricBlockerCloseAndDirectURL()
+                    for line in lines { conversation.localFeedback("自检五十二：\(line)") }
+                    conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检五十二：FAIL" : "自检五十二：DOM 指纹、几何关闭、直达绕行 PASS")
+                }
+                dismiss()
+            }.disabled(!engine.active)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true

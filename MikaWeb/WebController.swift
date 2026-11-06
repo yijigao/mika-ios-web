@@ -363,7 +363,20 @@ enum SiteMode: String {
       var nodePath = function(n){var p=[];for(;n&&n.nodeType===1;n=n.parentElement){var peers=n.parentElement?Array.from(n.parentElement.children).filter(function(x){return x.tagName===n.tagName;}):[];p.unshift(n.tagName.toLowerCase()+(n.id?'#'+n.id:'')+':nth-of-type('+(peers.indexOf(n)+1)+')');}return p.join(' > ');};
       var blockerDescription = function(h){
         var r=h.getBoundingClientRect(),st=getComputedStyle(h);
-        var fingerprint={kind:'hit-blocker',path:nodePath(h),tag:h.tagName.toLowerCase(),class:clsOf(h).slice(0,80),text:lab(h).slice(0,80),rect:[r.left,r.top,r.width,r.height],position:st.position,zIndex:st.zIndex,framePath:framePath()};
+        var cover=h;
+        for(var n=h;n&&n!==document.body;n=n.parentElement){var ns=getComputedStyle(n);if((ns.position==='fixed'||ns.position==='absolute')&&!n.contains(hitTarget)){cover=n;break;}}
+        var dialogs=dialogElements().filter(function(x){return cover===x||cover.contains(x);});
+        var modal=dialogs.find(function(x){var q=x.getBoundingClientRect();return q.width<innerWidth*.9||q.height<innerHeight*.9;})||dialogs[0]||cover;
+        var chain=[],cn=modal;
+        for(var depth=0;cn&&cn.nodeType===1&&depth<3;depth++,cn=cn.parentElement){chain.push(cn.tagName.toLowerCase()+(clsOf(cn)?'.'+clsOf(cn).trim().replace(/\s+/g,'.').slice(0,40):''));}
+        var clickable=[],all=modal.querySelectorAll('*');
+        for(var i=0;i<all.length&&clickable.length<12;i++){
+          var c=all[i],cs=getComputedStyle(c),clickish=c.matches('a,button,[role="button"]')||typeof c.onclick==='function'||c.hasAttribute('onclick')||cs.cursor==='pointer'||!!c.querySelector('svg');
+          if(!vis(c)||!clickish)continue;var cr=c.getBoundingClientRect();
+          clickable.push({tag:c.tagName.toLowerCase(),class:clsOf(c).slice(0,40),rect:[Math.round(cr.left),Math.round(cr.top),Math.round(cr.width),Math.round(cr.height)],hasSvg:!!c.querySelector('svg'),ariaLabel:(c.getAttribute('aria-label')||'').slice(0,40),role:(c.getAttribute('role')||'').slice(0,30),text:lab(c).slice(0,20)});
+        }
+        var modalDOM={chain:chain,clickables:clickable};
+        var fingerprint={kind:'hit-blocker',path:nodePath(h),tag:h.tagName.toLowerCase(),class:clsOf(h).slice(0,80),text:lab(h).slice(0,80),rect:[r.left,r.top,r.width,r.height],position:st.position,zIndex:st.zIndex,framePath:framePath(),modalDOM:modalDOM};
         return {sig:'hit-blocker:'+JSON.stringify(fingerprint),text:JSON.stringify(fingerprint),buttons:[],fingerprint:fingerprint};
       };
       var closeHitBlocker = function(d){
@@ -385,8 +398,24 @@ enum SiteMode: String {
           if(!pick)return cb(false);var el=document.elementFromPoint(pick[0],pick[1]);if(!el||!safe(el))return cb(false);
           stages.push('hit-blocker-mask-outside');seqOn(el,'pointer',function(){poll(cb);},{x:pick[0],y:pick[1]});
         };
+        var geometricCloser=function(){
+          var dialogs=dialogElements().filter(function(x){return container===x||container.contains(x);});
+          var dlg=dialogs.find(function(x){var r=x.getBoundingClientRect();return r.width<innerWidth*.9||r.height<innerHeight*.9;})||dialogs[0]||container;
+          var dr=dlg.getBoundingClientRect(),left=dr.right-dr.width*.18,bottom=dr.top+dr.height*.25,cands=[];
+          var all=dlg.querySelectorAll('*');
+          for(var i=0;i<all.length;i++){
+            var c=all[i];if(!vis(c))continue;var r=c.getBoundingClientRect(),s=getComputedStyle(c);
+            if(r.width<=0||r.height<=0||r.width>56||r.height>56||r.left<left||r.top<dr.top||r.right>dr.right+1||r.bottom>bottom)continue;
+            var clickish=c.matches('a,button,[role="button"]')||typeof c.onclick==='function'||c.hasAttribute('onclick')||s.cursor==='pointer'||!!c.querySelector('svg');
+            if(!clickish)continue;
+            var score=Math.hypot(dr.right-r.right,r.top-dr.top)+(r.width*r.height)/3136;
+            cands.push({el:c,score:score,area:r.width*r.height});
+          }
+          cands.sort(function(a,b){return a.score-b.score||a.area-b.area;});return cands.length?cands[0].el:null;
+        };
         var plan=[
           function(cb){var c=findCloser(container,null);if(!c)return cb(false);if(!safe(c)){finish(false,'refused-sensitive');return;}stages.push('hit-blocker-close');seqOn(c,'pointer',function(){poll(cb);});},
+          function(cb){var c=geometricCloser();if(!c)return cb(false);if(!safe(c)){finish(false,'refused-sensitive');return;}stages.push('hit-blocker-geometric-close');seqOn(c,'pointer',function(){poll(cb);});},
           function(cb){maskOutsideDialog(cb);},
           function(cb){stages.push('hit-blocker-escape');document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}));document.dispatchEvent(new KeyboardEvent('keyup',{key:'Escape',code:'Escape',bubbles:true}));poll(cb);}
         ];
@@ -3035,6 +3064,46 @@ enum TCProbeLogStore {
         return lines
     }
 
+    /// 自检五十二：真页同形的纯 SVG 右上关闭件，以及关闭全败后的 href 直达。
+    func verifyGeometricBlockerCloseAndDirectURL() async -> [String] {
+        let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        tab.webView.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        var lines: [String] = []
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        func load(_ html: String, marker: String) async throws -> (AgentAction, PageElement) {
+            tab.webView.loadHTMLString(html, baseURL: nil)
+            for _ in 0..<100 {
+                if (try? await evaluate("window.__fixture==='\(marker)'&&window.__mikaFrameProbe===true", on: tab)) as? Bool == true { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            guard let raw = try await evaluate(PageScript.extract, on: tab) as? String,
+                  let page = try? JSONDecoder().decode(PageState.self, from: Data(raw.utf8)),
+                  let target = page.elements.first(where: { $0.text == "被挡链接" }),
+                  let action = Self.selfTestClickAction(index: target.index) else { throw MikaError("五十二 fixture 无目标链接") }
+            return (action, target)
+        }
+        do {
+            let svgCloser = "<span onclick='this.closest(\".fixture-veil\").remove()' style='position:absolute;right:8px;top:8px;width:28px;height:28px;cursor:pointer'><svg viewBox='0 0 20 20'><path d='M3 3L17 17M17 3L3 17'/></svg></span>"
+            let geometricHTML = "<html><body><a href='#destination' id='target' style='display:block;margin:180px'>被挡链接</a><div class='fixture-veil' style='position:fixed;inset:0;z-index:999;background:#0004'><section role='dialog' aria-modal='true' style='position:absolute;left:30%;top:25%;width:40%;height:35%;background:white'>修改我的头像\(svgCloser)</section></div><script>window.__fixture='geometry'</script></body></html>"
+            let (action, target) = try await load(geometricHTML, marker: "geometry")
+            let census = await probeFrames(on: tab, targetIndex: target.index, targetLabel: "被挡链接")
+            let fingerprintHasSVG = census.hits.contains { $0.sig.hasPrefix("hit-blocker:") && $0.sig.contains("\"hasSvg\":true") }
+            check(fingerprintHasSVG, "普查 DOM 指纹含纯图标元素 hasSvg=true")
+            try await dispatchClick(action, expected: target, approved: false, tab: tab)
+            let geometricGone = (try await evaluate("!document.querySelector('.fixture-veil')", on: tab)) as? Bool == true
+            check(geometricGone, "右上几何候选关闭零按钮模态")
+
+            let directHTML = "<html><body><a href='#destination' id='target' style='display:block;margin:180px'>被挡链接</a><div class='fixture-veil' style='position:fixed;inset:0;z-index:999;background:#0004'><section role='dialog' aria-modal='true' style='position:absolute;left:30%;top:25%;width:40%;height:35%;background:white'>修改我的头像</section></div><script>window.__fixture='direct';window.__continued=false;addEventListener('hashchange',()=>{document.querySelector('.fixture-veil')?.remove();window.__continued=location.hash==='#destination';});</script></body></html>"
+            let (directAction, directTarget) = try await load(directHTML, marker: "direct")
+            try await dispatchClick(directAction, expected: directTarget, approved: false, tab: tab)
+            let directOK = (try await evaluate("window.__continued===true&&!document.querySelector('.fixture-veil')", on: tab)) as? Bool == true
+            check(directOK, "模态关不掉时直达 href，复查后任务可继续")
+        } catch {
+            lines.append("✗ 自检五十二异常：\(error.localizedDescription)")
+        }
+        return lines
+    }
+
     /// 自检四十五同源，只读 Draft committed 状态；不包装站点函数。
     private func readDraftCommitted(action: AgentAction, tab: BrowserTab) async -> Bool? {
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: ["index":action.index,"text":action.text])) ?? Data(), as: UTF8.self)
@@ -3694,9 +3763,22 @@ enum TCProbeLogStore {
                 if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) { break }
             }
             if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
-                let evidence = blockerCensus.summary
-                await captureFailureSnapshot(context: "命中阻挡层关闭失败：\(evidence)", tab: tab)
-                throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)。已试关闭手段：模态子树关闭 affordance → 对话框外遮罩角点 → Escape；每次均重新普查，指纹仍在")
+                if let directURL = directClickURL(action: action, expected: expected, currentURL: tab.webView.url) {
+                    let before = blockerCensus.hits.filter { $0.sig.hasPrefix("hit-blocker:") }.map(\.sig)
+                    try await navigateDirectly(to: directURL, on: tab)
+                    let after = await probeFrames(on: tab)
+                    let persisted = after.hits.contains { before.contains($0.sig) }
+                    AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-direct-url", targetFingerprint: before.joined(separator: " | "),
+                        method: "direct-navigation", result: persisted ? "persisted" : "success",
+                        pageURL: tab.webView.url?.absoluteString ?? directURL.absoluteString)
+                    if !persisted { return }
+                    blockerCensus = after
+                }
+                if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+                    let evidence = blockerCensus.summary
+                    await captureFailureSnapshot(context: "命中阻挡层关闭失败：\(evidence)", tab: tab)
+                    throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)。已试关闭手段：模态子树关闭 affordance → 右上几何候选 → 对话框外遮罩角点 → Escape → 可解析目标 URL 直达；每次均重新普查，指纹仍在")
+                }
             }
         }
         if probe == "ready-dialog" {
@@ -3751,6 +3833,32 @@ enum TCProbeLogStore {
         }
         await captureFailureSnapshot(context: "click 目标缺失：\(action.reason)", tab: tab)
         throw MikaError("页面上找不到可点的按钮「\(label)」（\(reveal.triedSummary)；可能还没渲染出来或已经关闭）")
+    }
+
+    /// 关闭阻挡层全败后的窄口绕行：只消费这次 click 自己携带的 URL，
+    /// 不猜路由。相对 href 按当前页解析；禁用 javascript/data 等可执行 scheme。
+    private func directClickURL(action: AgentAction, expected: PageElement, currentURL: URL?) -> URL? {
+        let raw = expected.href.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? action.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            : expected.href.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, let url = URL(string: raw, relativeTo: currentURL)?.absoluteURL else { return nil }
+        if ["http", "https"].contains(url.scheme?.lowercased() ?? "") { return url }
+        // 自身页内锚点也是浏览器原生可解析 href；允许它走无网络的同文档导航。
+        if raw.hasPrefix("#"), url.deletingLastPathComponent() == currentURL?.deletingLastPathComponent() { return url }
+        return nil
+    }
+
+    private func navigateDirectly(to url: URL, on tab: BrowserTab) async throws {
+        if let current = tab.webView.url,
+           url.scheme == current.scheme, url.host == current.host, url.path == current.path,
+           url.query == current.query, url.fragment != current.fragment {
+            let encoded = String(decoding: try JSONEncoder().encode(url.absoluteString), as: UTF8.self)
+            _ = try await evaluate("location.href=\(encoded);true", on: tab)
+        } else {
+            try tab.load(url.absoluteString)
+        }
+        try await ready(in: tab)
+        await waitForStability(in: tab)
     }
 
     // MARK: - 自检十一 Tier A（COVER-CONSENT）：弹窗点按升级的程序化核查
