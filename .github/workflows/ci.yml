@@ -14,11 +14,14 @@ jobs:
       - name: Xcode version
         run: xcodebuild -version
       - name: Build for iOS Simulator (no signing)
+        shell: bash
         run: |
+          set -euo pipefail
           xcodebuild build \
             -project MikaWeb.xcodeproj \
             -scheme MikaWeb \
             -destination 'generic/platform=iOS Simulator' \
+            MIKA_BUILD_SHA="$(git rev-parse HEAD)" \
             CODE_SIGNING_ALLOWED=NO \
             | tee build.log
       - name: Upload build log

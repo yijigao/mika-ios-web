@@ -92,7 +92,12 @@ final class AgentTraceStore: ObservableObject {
         }
     }
 
-    static var buildSHA: String { Bundle.main.object(forInfoDictionaryKey: "MikaBuildSHA") as? String ?? "b8cdb8e75608357a09f6fed56d7e53ecfba5916d" }
+    static var buildSHA: String {
+        let value = (Bundle.main.object(forInfoDictionaryKey: "MikaBuildSHA") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else { return "unknown" }
+        return value
+    }
     static var buildNumber: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unobservable" }
     static var device: String { UIDevice.current.model + " / " + UIDevice.current.systemName + " " + UIDevice.current.systemVersion }
     static var webViewVersion: String { Bundle(identifier: "com.apple.WebKit")?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unobservable" }

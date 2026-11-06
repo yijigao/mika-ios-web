@@ -19,6 +19,7 @@ workflows:
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build/DerivedData \
             -resultBundlePath build/SimulatorBuild.xcresult \
+            MIKA_BUILD_SHA="$(git rev-parse HEAD)" \
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/xcodebuild.log
     artifacts:
       - build/xcodebuild.log
@@ -38,6 +39,7 @@ workflows:
           set -euo pipefail
           xcodebuild build -project MikaWeb.xcodeproj -scheme MikaWeb -configuration Debug \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath build/Type4 \
+            MIKA_BUILD_SHA="$(git rev-parse HEAD)" \
             CODE_SIGNING_ALLOWED=NO > build-type4.log 2>&1
       - name: Boot isolated simulator and run self-test 42 without model
         script: |
@@ -54,7 +56,7 @@ workflows:
           xcrun simctl install "$SIM" "$APP"
           xcrun simctl launch "$SIM" "$BUNDLE" --mika-type4-selftest
           CONTAINER=$(xcrun simctl get_app_container "$SIM" "$BUNDLE" data)
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 300); do
             test ! -f "$CONTAINER/Documents/type4-result.json" || break
             sleep 2
           done

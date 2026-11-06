@@ -45,8 +45,18 @@ struct MikaWebApp: App {
                 .task {
                     #if DEBUG && targetEnvironment(simulator)
                     if ProcessInfo.processInfo.arguments.contains("--mika-type4-selftest") {
-                        let lines = await graph.web.verifyDraftType4()
-                        let result: [String: Any] = ["runtime":"WKWebView", "passed":!lines.contains(where: { $0.hasPrefix("✗") }), "lines":lines]
+                        let type4 = await graph.web.verifyDraftType4()
+                        let selfTest56 = await graph.web.verifyZhihuPublishControl()
+                        let production = await graph.engine.verifyZhihuProductionOrchestration()
+                        let localForm = await graph.web.verifyBasicLocalFormTask()
+                        let lines = type4 + selfTest56 + production + localForm
+                        let result: [String: Any] = [
+                            "runtime":"WKWebView", "buildSHA":AgentTraceStore.buildSHA,
+                            "passed":!lines.contains(where: { $0.hasPrefix("✗") }),
+                            "lines":lines,
+                            "suites":["type4":type4, "selfTest56":selfTest56,
+                                      "productionOrchestration":production, "basicLocalForm":localForm]
+                        ]
                         if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted]),
                            let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
                             try? data.write(to: directory.appendingPathComponent("type4-result.json"), options: .atomic)

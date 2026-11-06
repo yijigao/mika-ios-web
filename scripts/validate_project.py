@@ -145,6 +145,7 @@ def validate():
     info = plistlib.loads((ROOT / "MikaWeb/Info.plist").read_bytes())
     assert info["CFBundleDisplayName"] == "Mika Web"
     assert info["CFBundleIdentifier"] == "$(PRODUCT_BUNDLE_IDENTIFIER)"
+    assert info["MikaBuildSHA"] == "$(MIKA_BUILD_SHA)"
     assert info["NSAppTransportSecurity"] == {"NSAllowsArbitraryLoadsInWebContent": True}
     assert info["UILaunchScreen"] == {}
     assert info["UIApplicationSceneManifest"] == {"UIApplicationSupportsMultipleScenes": False}
@@ -172,7 +173,11 @@ def validate():
         scale = float(e["scale"][:-1])
         assert (width,height) == tuple(int(x*scale) for x in size), f"Wrong PNG size: {e['filename']}"
     assert "scripts/validate_project.py" in (ROOT/"codemagic.yaml").read_text()
-    print(f"PASS: LICENSE, NOTICE, {len(entries)} icon PNGs and Codemagic validator path")
+    ci = (ROOT/".github/workflows/ci.yml").read_text()
+    assert "set -euo pipefail" in ci and 'MIKA_BUILD_SHA="$(git rev-parse HEAD)"' in ci
+    diagnostic = (ROOT/"MikaWeb/DiagnosticStore.swift").read_text()
+    assert 'else { return "unknown" }' in diagnostic and "b8cdb8e" not in diagnostic
+    print(f"PASS: LICENSE, NOTICE, {len(entries)} icon PNGs, Codemagic validator and fail-closed build identity")
     print("PASS: static project validation complete (no Swift compilation performed)")
 
 if __name__ == "__main__":

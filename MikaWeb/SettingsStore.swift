@@ -74,6 +74,11 @@ struct ModelNameValidationIssue {
     @Published var keepScreenAwakeDuringTask = UserDefaults.standard.object(forKey: "keepScreenAwakeDuringTask") as? Bool ?? true {
         didSet { UserDefaults.standard.set(keepScreenAwakeDuringTask, forKey: "keepScreenAwakeDuringTask") }
     }
+    /// 停线开关：安装与升级后的缺省值恒为关闭。只有用户在设置页明确开启
+    /// 才允许生产引擎进入知乎专用发布尝试；受控 WK fixture 另走构造参数。
+    @Published var zhihuAutoPublishEnabled = UserDefaults.standard.object(forKey: "zhihuAutoPublishEnabled") as? Bool ?? false {
+        didSet { UserDefaults.standard.set(zhihuAutoPublishEnabled, forKey: "zhihuAutoPublishEnabled") }
+    }
     @Published private(set) var provider: ModelProvider
     @Published private(set) var hasKey = !Keychain.read().isEmpty
     // MARK: ChatGPT 订阅通道（与 API Key 通道并存）
@@ -231,6 +236,9 @@ struct SettingsView: View {
                 Text("达到上限后暂停，可继续任务。").font(.caption).foregroundStyle(.secondary)
                 Toggle("任务运行时保持屏幕常亮", isOn: $settings.keepScreenAwakeDuringTask)
                 Text("开启时任务执行期间屏幕不会自动锁屏，任务结束自动恢复。").font(.caption).foregroundStyle(.secondary)
+                Toggle("知乎自动发表（停线，默认关闭）", isOn: $settings.zhihuAutoPublishEnabled)
+                Text("关闭时即使模型、授权与页面凭证都要求发表，引擎也会拦截并留痕，不会点击。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("任务执行时，网页内容及你的任务会发送至所选模型服务。切到后台时任务会驻停并保存进度，回到 App 自动接着跑；单步的页面小错误会自动重试，不再一步失败就停下。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("任务") }

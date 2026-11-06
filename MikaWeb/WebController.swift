@@ -2209,16 +2209,13 @@ enum TCProbeLogStore {
     /// Self-test 42: actual production injection and orchestration in an isolated WKWebView.
     func verifyDraftType4() async -> [String] {
         let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        let testHost = WKSelfTestHost(tab: tab, suite: "type4")
         var lines: [String] = []
         var records: [[String: Any]] = []
         defer { tab.type4IgnoredEvaluationErrors = nil }
         func js(_ value: String) -> String { String(decoding: try! JSONEncoder().encode(value), as: UTF8.self) }
         func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
         func bool(_ script: String) async throws -> Bool { (try await evaluate(script, on: tab)) as? Bool == true }
-        // This view is deliberately outside the browser UI. A zero frame gives the document
-        // a zero viewport and the unchanged production extractor removes its host index.
-        tab.webView.frame = CGRect(x:0, y:0, width:1024, height:768)
-        tab.webView.layoutIfNeeded()
         @MainActor func bindingProbe(_ script: String, deadline: TimeInterval) async throws -> String {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
@@ -2322,7 +2319,12 @@ enum TCProbeLogStore {
         @MainActor func loadFixture() async throws {
             // Wait for this navigation's didFinish, not the prior document's ready flag.
             let previousEpoch = tab.documentEpoch
-            try tab.loadLocal("test-draft")
+            let observation = try await testHost.loadLocalAndWait("test-draft",
+                readinessJavaScript: "window.__ready===true && !!window.__type4 && !!document.querySelector('[data-mika-slot=primary]')")
+            records.append(["case":"shared-wk-host","suite":"type4",
+                            "viewport":observation["viewport"] ?? [String: Any](),
+                            "documentEpoch":tab.documentEpoch,
+                            "finishedDocumentEpoch":tab.finishedDocumentEpoch ?? -1])
             _ = try await waitForHost("primary", afterEpoch:previousEpoch, snapshot:false)
         }
         do {
@@ -3028,6 +3030,7 @@ enum TCProbeLogStore {
     /// 桩喂给同一改写纯函数；不以提示词字符串存在作为通过条件。
     func verifyZhihuPublishControl() async -> [String] {
         let tab = activeTab
+        let testHost = WKSelfTestHost(tab: tab, suite: "zhihu-selftest-56")
         var lines: [String] = []
         func check(_ ok: Bool, _ text: String) { lines.append("\(ok ? "✓" : "✗") \(text)") }
         func action(_ name: String, index: Int, text: String = "") -> AgentAction? {
@@ -3037,11 +3040,8 @@ enum TCProbeLogStore {
         let body = "第一段：保留标点、数字 123 与  Space。\n\n第二段：正文讨论『审核中』这个词，但它不是回答状态。Markdown **原样**，不做模糊匹配。"
         let taskID = UUID()
         do {
-            try tab.loadLocal("test-draft")
-            for _ in 0..<100 {
-                if (try? await evaluate("window.__ready===true", on: tab)) as? Bool == true { break }
-                try await Task.sleep(for: .milliseconds(100))
-            }
+            _ = try await testHost.loadLocalAndWait("test-draft",
+                readinessJavaScript: "window.__ready===true && !!window.__type4 && !!document.querySelector('#editor-primary [contenteditable=true]')")
             _ = try await evaluate("""
             (()=>{const section=document.getElementById('editor-primary'),button=document.getElementById('update'),ed=section.querySelector('[contenteditable=true]');section.setAttribute('data-answer-editor','fixture-composer');section.setAttribute('data-question-id','4242');ed.setAttribute('data-editor-id','fixture-editor');button.textContent='发布回答';button.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','me');window.__pubCalls=0;button.addEventListener('click',()=>{window.__pubCalls++;document.querySelector('.AnswerItem')?.remove();const a=document.createElement('article');a.className='AnswerItem';a.setAttribute('data-answer-id','9001');a.setAttribute('data-question-id','4242');a.setAttribute('data-author-id','me');a.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/9001">详情</a><div class="RichContent-inner"></div>';a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));document.body.appendChild(a);});return true;})()
             """, on: tab)
@@ -3412,17 +3412,43 @@ enum TCProbeLogStore {
         return lines
     }
 
+    /// 能力保持：同一离屏 WK 宿主走生产 type/click 执行器完成普通本地表单。
+    func verifyBasicLocalFormTask() async -> [String] {
+        let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        let testHost = WKSelfTestHost(tab: tab, suite: "basic-local-form")
+        func action(_ name: String, index: Int, text: String = "") throws -> AgentAction {
+            let data = try JSONSerialization.data(withJSONObject: ["action":name, "index":index,
+                                                                    "text":text, "reason":"普通本地填表能力保持"])
+            return try JSONDecoder().decode(AgentAction.self, from:data)
+        }
+        do {
+            _ = try await testHost.loadLocalAndWait("test-form",
+                readinessJavaScript: "!!document.querySelector('input[name=name]') && !!document.querySelector('input[name=email]') && !!document.querySelector('button[type=submit]')")
+            var page = try await state(in: tab)
+            guard let name = page.elements.first(where: { $0.name == "name" }) else { throw MikaError("本地表单缺姓名输入框") }
+            try await performType(action("type", index:name.index, text:"张三"), expected:name, approved:false, tab:tab)
+            page = try await state(in: tab)
+            guard let email = page.elements.first(where: { $0.name == "email" }) else { throw MikaError("本地表单缺邮箱输入框") }
+            try await performType(action("type", index:email.index, text:"zhangsan@example.com"), expected:email, approved:false, tab:tab)
+            page = try await state(in: tab)
+            guard let submit = page.elements.first(where: { $0.text == "提交" }) else { throw MikaError("本地表单缺提交按钮") }
+            try await dispatchClick(action("click", index:submit.index), expected:submit, approved:false, tab:tab)
+            let passed = (try await evaluate("document.getElementById('result')?.textContent==='提交成功：姓名 张三，邮箱 zhangsan@example.com'", on:tab)) as? Bool == true
+            return ["\(passed ? "✓" : "✗") 普通本地填表：生产 type×2＋click 后结果全文一致"]
+        } catch {
+            return ["✗ 普通本地填表异常：\(error.localizedDescription)"]
+        }
+    }
+
     /// 为受控模型主循环准备站点端。处理器把实际 Draft DOM 收到的正文保存为
     /// 服务端响应源；详情页不会再从测试期望值凭空生成正文。
     func loadZhihuEngineFixture(outcome: String = "published") async throws -> (editor: PageElement, publish: PageElement) {
         let tab = executionTab
+        let testHost = WKSelfTestHost(tab: tab, suite: "zhihu-production-orchestration")
         controlledZhihuFixtureTabID = tab.id
         controlledZhihuFixtureOutcome = outcome
-        try tab.loadLocal("test-draft")
-        for _ in 0..<100 {
-            if (try? await evaluate("window.__ready===true", on: tab)) as? Bool == true { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
+        _ = try await testHost.loadLocalAndWait("test-draft",
+            readinessJavaScript: "window.__ready===true && !!window.__type4 && !!document.querySelector('#editor-primary [contenteditable=true]')")
         _ = try await evaluate("""
         (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update'),e=s.querySelector('[contenteditable=true]');s.setAttribute('data-answer-editor','engine-fixture-composer');s.setAttribute('data-question-id','4242');e.setAttribute('data-editor-id','engine-fixture-editor');b.textContent='发布回答';b.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','engine-me-id');window.__INITIAL_STATE__={people:{currentUser:{id:'engine-me-id',urlToken:'engine-me-token'}}};window.__pubCalls=0;window.__publishedBody='';b.addEventListener('click',()=>{window.__pubCalls++;window.__publishedBody=(e.innerText||'').replace(/\\r\\n?/g,'\\n');});return true;})()
         """, on: tab)

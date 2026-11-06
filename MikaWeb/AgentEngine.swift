@@ -844,6 +844,9 @@ struct OpenStall {
     private var currentZhihuPublishBinding: ZhihuPublishBinding?
     private var currentZhihuDecision: PublishDecision?
     private var currentZhihuDirective: ZhihuPublishDirective?
+    /// 可跨任务/导航/进程存在的稿件；不含任何页面凭证。
+    private var activePreservedDraft: PreservedDraft?
+    private let preservedDraftStore: PreservedDraftStore
     /// 当前任务的可追溯发布授权；只由任务目标与最新用户指令更新，网页正文
     /// 与回答草稿从不进入此状态。
     private var currentZhihuAuthorization = PublishAuthorization.initial(instruction: "")
@@ -863,6 +866,8 @@ struct OpenStall {
     /// 模拟点击落账后进程退出；只用于验证新 AgentEngine 的生产恢复入口。
     private var controlledSuspendAfterZhihuClick = false
     private var controlledDidSuspendAfterZhihuClick = false
+    /// 仅由原生 WK 自检构造器显式打开；生产对象图永远使用默认 false。
+    private let controlledZhihuPublishFixture: Bool
     private var zhihuPublishLedgerKeyOverride: String?
     /// 待决网页上传（F1，2026-11-02）：upload_file 动作的人在环现场——
     /// agent 定位文件控件后任务停在这里等用户：先过 SP-01 确认卡（非本
@@ -951,9 +956,13 @@ struct OpenStall {
     private var settingsCancellable: AnyCancellable?
     init(web: WebController, settings: SettingsStore,
          zhihuPublishLedgerKeyOverride: String? = nil,
+         preservedDraftStore: PreservedDraftStore = .shared,
+         controlledZhihuPublishFixture: Bool = false,
          restoreSession: Bool = true) {
         self.web = web; self.settings = settings
         self.zhihuPublishLedgerKeyOverride = zhihuPublishLedgerKeyOverride
+        self.preservedDraftStore = preservedDraftStore
+        self.controlledZhihuPublishFixture = controlledZhihuPublishFixture
         thermalGate.update(level: ThermalLevel(ProcessInfo.processInfo.thermalState), now: Date())
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
                                                                   object: nil, queue: nil) { [weak self] _ in
@@ -1046,10 +1055,12 @@ struct OpenStall {
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
+        activePreservedDraft = nil
         currentZhihuAuthorization = .initial(instruction: goal); matchedZhihuPublishRecord = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = newTaskID
+        attachPreservedDraft(to: goal)
         refreshPendingSteers()
         autoTitleSessionIfPlaceholder()
         // 任务绑定到该会话当时的活跃标签页：全程作用于它，用户中途切页／
@@ -1642,6 +1653,7 @@ struct OpenStall {
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
         currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
+        activePreservedDraft = nil
         discardPendingUpload()
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         runStartedAt = nil; activeRunContext = nil
@@ -1922,13 +1934,31 @@ struct OpenStall {
                         try await checkpoint(token)
                         try thermalCheckpoint()
                         if resolvedZhihuAction(proposedAction: action.action) == "attempt_publish_once" {
-                            try await attemptZhihuPublishOnce(proposed: action, token: token)
-                            if controlledDidSuspendAfterZhihuClick {
-                                status = .paused("受控进程退出点：发布点击已落账，尚未回读")
-                                persistSnapshot()
-                                return
+                            if !zhihuPublishExecutionAllowed {
+                                currentZhihuDecision = .blocked("知乎自动发表开关已关闭")
+                                traceFinalAction = ["action": "blocked", "proposed": "attempt_publish_once",
+                                                    "gate": "zhihuAutoPublishEnabled", "enabled": false]
+                                traceRewriteReason = "production auto-publish switch is off"
+                                appendStep("publish-decision", "知乎自动发表开关关闭：attempt_publish_once 已由引擎拦截，未调用网页点击")
+                                AgentTraceStore.shared.appendEngineAction(action: "attempt_publish_once",
+                                    targetFingerprint: currentZhihuPublishBinding?.buttonIdentity ?? "unbound",
+                                    method: "engine-production-switch", result: "blocked-switch-off",
+                                    pageURL: page.url, taskID: conversationTaskID?.uuidString ?? "unobservable",
+                                    runID: token.uuidString,
+                                    evidence: ["enabled": false, "controlledFixture": controlledZhihuPublishFixture,
+                                               "clickCount": 0])
+                                // wait/click 被吞掉；done 仍允许收口，否则关闭开关会
+                                // 让每轮重新派生 attempt 后永远无法完成任务。
+                                if action.action != "done" { continue }
+                            } else {
+                                try await attemptZhihuPublishOnce(proposed: action, token: token)
+                                if controlledDidSuspendAfterZhihuClick {
+                                    status = .paused("受控进程退出点：发布点击已落账，尚未回读")
+                                    persistSnapshot()
+                                    return
+                                }
+                                continue
                             }
-                            continue
                         }
                         // 同题已有未决或已核实记录时，连续模型点击也不能绕过
                         // 一次尝试账。非点击动作（尤其 done）照常由后续逻辑处理。
@@ -4258,6 +4288,20 @@ struct OpenStall {
             if let proof, proof.isValid {
                 currentZhihuWriteProof = proof
                 currentZhihuPublishBinding = nil
+                let identity = await web.readZhihuPageIdentity()
+                let account = resolveZhihuAccount(identity)
+                let target = PreservedDraftTarget(
+                    accountStableID: account?.stableID ?? identity.accountIdentity,
+                    accountAliases: account?.aliases ?? identity.accountAliases,
+                    questionID: proof.questionID)
+                do {
+                    activePreservedDraft = try preservedDraftStore.save(fullText: proof.expectedText,
+                                                                        target: target,
+                                                                        sourceTaskID: taskID)
+                    appendStep("draft-store", "独立稿件已保存：draft=\(activePreservedDraft!.id.uuidString)、version=\(activePreservedDraft!.version)、sourceTask=\(taskID.uuidString)、question=\(proof.questionID)；未保存 WriteProof")
+                } catch {
+                    appendStep("draft-store", "独立稿件保存失败：\(error.localizedDescription)；不得把任务快照或旧 WriteProof 冒充稿件存储")
+                }
                 verification = "verified"
                 stateCard.setZhihuStatus(write: "已核实", publication: "未尝试")
                 appendStep("write-proof", "正文凭证已生成：task=\(taskID.uuidString)、tab=\(proof.tabID.uuidString)、epoch=\(proof.documentEpoch)、question=\(proof.questionID)、editor=\(proof.editorIdentity)、composer=\(proof.composerIdentity)、bodyVersion=\(proof.bodyVersion)、expectedHash=\(proof.expectedTextHash)、committedHash=\(proof.committedTextHash)、rule=\(proof.comparisonRule)、result=\(proof.comparisonResult)")
@@ -4273,6 +4317,21 @@ struct OpenStall {
         let isEditor = element.editable || element.tag == "textarea"
         recentTyped.append((text: action.text, isEditor: isEditor))
         if recentTyped.count > 5 { recentTyped.removeFirst(recentTyped.count - 5) }
+    }
+
+    /// 真实聊天的新任务入口与冷启动恢复共用。仅把正文/版本/目标带入任务，
+    /// currentZhihuWriteProof 始终保持 nil，直到当前页面重新写入并严格复读。
+    private func attachPreservedDraft(to instruction: String) {
+        let zhihuIntent = ["知乎", "回答", "发布", "发表", "授权", "草稿", "继续"].contains { instruction.contains($0) }
+        guard zhihuIntent, let draft = preservedDraftStore.latestZhihuDraft() else {
+            activePreservedDraft = nil
+            return
+        }
+        activePreservedDraft = draft
+        currentZhihuWriteProof = nil
+        currentZhihuPublishBinding = nil
+        stateCard.addWrite(target: "独立稿件（待重新写入并核验）", body: draft.fullText, verification: "unknown")
+        appendStep("draft-restore", "已从独立存储取回稿件：draft=\(draft.id.uuidString)、version=\(draft.version)、sourceTask=\(draft.sourceTaskID.uuidString)、question=\(draft.target.questionID)；旧页面凭证未移植")
     }
 
     /// 提交类点击真正执行成功后的落记（runTargeted 自主路径与 runConfirmed
@@ -4656,9 +4715,12 @@ struct OpenStall {
         var lines: [String] = []
         let suffix = UUID().uuidString
         let ledgerKey = "zhihuPublishLedger.selftest.fix6.\(suffix)"
+        let draftOnlyKey = "zhihuPublishLedger.selftest.draft-only.\(suffix)"
+        let switchOffKey = "zhihuPublishLedger.selftest.switch-off.\(suffix)"
+        let revokeKey = "zhihuPublishLedger.selftest.revoke.\(suffix)"
         let recoveryKey = "zhihuPublishLedger.selftest.recovery.\(suffix)"
         let timeoutKey = "zhihuPublishLedger.selftest.timeout.\(suffix)"
-        var keys = [ledgerKey, recoveryKey, timeoutKey]
+        var keys = [ledgerKey, draftOnlyKey, switchOffKey, revokeKey, recoveryKey, timeoutKey]
         var directories: [URL] = []
         defer {
             for key in keys {
@@ -4670,34 +4732,133 @@ struct OpenStall {
 
         do {
             let paragraph = "这是一段用于验证真实知乎发布链的长文。它保留中文标点、数字 2026、大小写 MikaWeb 和空格；每一段都必须由生产 type 路径写进 Draft，再由站点处理器实际接收，不能从测试期望值反向生成详情页。"
-            let body = (1...16).map { "第\($0)段：\(paragraph)" }.joined(separator: "\n\n")
-            guard body.count >= 1200 else { throw MikaError("五十六长文不足 1200 字") }
+            let body = (1...22).map { "第\($0)段：\(paragraph)" }.joined(separator: "\n\n")
+            guard body.count >= 1500 else { throw MikaError("五十六长文不足 1500 字") }
 
-            // 56 主回归：真正 launch() 消费 type→wait→连续 click→done。
+            // 真实生产主循环先完成“只写草稿”任务；任务收口后不靠任务快照，
+            // 新建 Store/Engine 模拟进程退出，再从独立稿件文件取回正文。
+            let draftDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mika-draft-lifecycle-\(suffix)", isDirectory: true)
+            directories.append(draftDirectory)
+            let draftURL = draftDirectory.appendingPathComponent("drafts.json")
+            let sourceStore = PreservedDraftStore(fileURL: draftURL)
+            let sourceSession = UUID(), sourceTask = UUID()
+            directories.append(prepareDirectory(sourceSession))
+            let sourceWeb = WebController(); sourceWeb.beginExecution(sessionID: sourceSession)
+            let sourceFixture = try await sourceWeb.loadZhihuEngineFixture()
+            let sourceEngine = AgentEngine(web: sourceWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: sourceStore,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            configure(sourceEngine, web: sourceWeb, sessionID: sourceSession, taskID: sourceTask,
+                goal: "只写草稿，不发布这篇知乎回答", actions: [
+                    try action("type", index: sourceFixture.editor.index, text: body),
+                    try action("done", summary: "草稿任务已收口")
+                ])
+            sourceEngine.launch()
+            let sourceDone = await waitFor({ isDone(sourceEngine) }, seconds: 30)
+            let sourceProof = sourceEngine.currentZhihuWriteProof
+            let persistedBeforeRestart = sourceStore.latestZhihuDraft()
+
+            let restartedStore = PreservedDraftStore(fileURL: draftURL)
+            let restoredAfterRestart = restartedStore.latestZhihuDraft()
+            lines.append(line(sourceDone && sourceProof?.isValid == true && sourceProof?.taskID == sourceTask &&
+                              persistedBeforeRestart?.fullText == body &&
+                              restoredAfterRestart?.fullText == body &&
+                              restoredAfterRestart?.version == 1 &&
+                              restoredAfterRestart?.target.accountStableID == "engine-me-id" &&
+                              restoredAfterRestart?.target.questionID == "4242" &&
+                              restoredAfterRestart?.sourceTaskID == sourceTask,
+                              "稿件保全-A：真实主循环只写草稿→任务收口→新 Store 模拟进程重启，全文/版本/账号题目/来源任务仍在"))
+
+            // 56 主回归：新任务补授权，从独立稿件取回全文；旧 proof 不迁移，
+            // 当前页重新写入后才生成新 proof，再由 launch() 完成发布编排。
             let mainSession = UUID(), mainTask = UUID()
             directories.append(prepareDirectory(mainSession))
             let mainWeb = WebController()
             mainWeb.beginExecution(sessionID: mainSession)
             let mainFixture = try await mainWeb.loadZhihuEngineFixture()
             let mainEngine = AgentEngine(web: mainWeb, settings: SettingsStore(),
-                                         zhihuPublishLedgerKeyOverride: ledgerKey, restoreSession: false)
+                                         zhihuPublishLedgerKeyOverride: ledgerKey,
+                                         preservedDraftStore: restartedStore,
+                                         controlledZhihuPublishFixture: true, restoreSession: false)
             configure(mainEngine, web: mainWeb, sessionID: mainSession, taskID: mainTask,
                 goal: "把这篇知乎回答发出去", actions: [
-                    try action("type", index: mainFixture.editor.index, text: body),
+                    try action("type", index: mainFixture.editor.index, text: restoredAfterRestart?.fullText ?? ""),
                     try action("wait"), try action("click", index: -2),
                     try action("click", index: -2), try action("done", summary: "自检链已收口")
                 ])
+            mainEngine.attachPreservedDraft(to: "补授权：把这篇知乎回答发出去")
+            let oldProofWasNotMigrated = mainEngine.currentZhihuWriteProof == nil
             mainEngine.launch()
             let mainDone = await waitFor({ isDone(mainEngine) }, seconds: 30)
+            let mainProof = mainEngine.currentZhihuWriteProof
             let mainMetrics = await mainWeb.controlledZhihuFixtureMetrics()
             let mainRecord = mainEngine.zhihuPublishRecords.last
             let repeatedBlocked = mainEngine.steps.filter { $0.reason.contains("模型再次请求发布未执行") }.count >= 2
             lines.append(line(mainDone && mainRecord?.status == .verifiedPublished,
                               "五十六-引擎A：真实主循环完成 type→wait 改写→独立详情回读→done 结案"))
-            lines.append(line(mainRecord?.clickCallCount == 1 && mainMetrics.handlerCalls == 1 && mainMetrics.publishedBody == body,
-                              "五十六-引擎B：生产点击调用数=1、fixture handler 实收次数=1，详情正文因果来自实收长文（≥1200字）"))
+            let persistedAfterRewrite = restartedStore.latestZhihuDraft()
+            lines.append(line(oldProofWasNotMigrated && mainProof?.isValid == true &&
+                              mainProof?.taskID == mainTask && sourceProof?.taskID != mainProof?.taskID &&
+                              mainRecord?.sourceText == body && mainRecord?.clickCallCount == 1 &&
+                              mainMetrics.handlerCalls == 1 &&
+                              persistedAfterRewrite?.version == 2 && persistedAfterRewrite?.sourceTaskID == sourceTask &&
+                              ZhihuPublishPolicy.normalizeFullText(body) == ZhihuPublishPolicy.normalizeFullText(persistedAfterRewrite?.fullText ?? "") &&
+                              ZhihuPublishPolicy.normalizeFullText(body) == ZhihuPublishPolicy.normalizeFullText(mainMetrics.publishedBody),
+                              "五十六-引擎B：源稿＝持久稿＝重新写入 committed/handler 全文（≥1500字）；旧 proof 未迁移，新任务重验后仅点击一次"))
             lines.append(line(repeatedBlocked && mainEngine.stateCard.zhihuPublicationStatus == "已核实发布",
                               "五十七/六十三：连续 click 输入均被同题账拦截，状态卡仅在独立回读后晋级"))
+
+            // 默认关闭态使用同一真实 launch 入口，但不授予 controlled fixture
+            // 例外；引擎必须在 Web 点击入口之前留痕并允许 done 正常收口。
+            let previousSwitchValue = UserDefaults.standard.object(forKey: "zhihuAutoPublishEnabled")
+            let offSettings = SettingsStore(); offSettings.zhihuAutoPublishEnabled = false
+            let offSession = UUID(), offTask = UUID()
+            directories.append(prepareDirectory(offSession))
+            let offWeb = WebController(); offWeb.beginExecution(sessionID: offSession)
+            let offFixture = try await offWeb.loadZhihuEngineFixture()
+            let offEngine = AgentEngine(web: offWeb, settings: offSettings,
+                zhihuPublishLedgerKeyOverride: switchOffKey,
+                preservedDraftStore: restartedStore, restoreSession: false)
+            configure(offEngine, web: offWeb, sessionID: offSession, taskID: offTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: offFixture.editor.index, text: body),
+                    try action("wait"), try action("done", summary: "开关关闭，零点击收口")
+                ])
+            offEngine.launch()
+            let offDone = await waitFor({ isDone(offEngine) }, seconds: 20)
+            let offMetrics = await offWeb.controlledZhihuFixtureMetrics()
+            let switchTrace = offEngine.steps.contains { $0.action == "publish-decision" && $0.reason.contains("开关关闭") }
+            lines.append(line(offDone && switchTrace && offMetrics.handlerCalls == 0 &&
+                              offEngine.zhihuPublishRecords.allSatisfy { $0.clickCallCount == 0 },
+                              "自动发表开关：默认关闭的真实生产入口拦截 attempt_publish_once 并留痕，fixture handler/发布账点击数均为 0"))
+            if let previousSwitchValue { UserDefaults.standard.set(previousSwitchValue, forKey: "zhihuAutoPublishEnabled") }
+            else { UserDefaults.standard.removeObject(forKey: "zhihuAutoPublishEnabled") }
+
+            let revokeSession = UUID(), revokeTask = UUID()
+            directories.append(prepareDirectory(revokeSession))
+            let revokeWeb = WebController(); revokeWeb.beginExecution(sessionID: revokeSession)
+            let revokeFixture = try await revokeWeb.loadZhihuEngineFixture()
+            let revokeEngine = AgentEngine(web: revokeWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: revokeKey, preservedDraftStore: restartedStore,
+                controlledZhihuPublishFixture: true, restoreSession: false)
+            configure(revokeEngine, web: revokeWeb, sessionID: revokeSession, taskID: revokeTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: revokeFixture.editor.index, text: body),
+                    try action("wait"), try action("done", summary: "授权撤销，零点击收口")
+                ])
+            revokeEngine.controlledActionWillDispatch = { cursor, _ in
+                if cursor == 1, !revokeEngine.enqueueSteer("不要发布这篇知乎回答，保留草稿") {
+                    throw MikaError("撤销授权插话未接受")
+                }
+            }
+            revokeEngine.launch()
+            let revokeDone = await waitFor({ isDone(revokeEngine) }, seconds: 20)
+            let revokeMetrics = await revokeWeb.controlledZhihuFixtureMetrics()
+            lines.append(line(revokeDone && !revokeEngine.currentZhihuAuthorization.allowsZhihuAnswer &&
+                              revokeMetrics.handlerCalls == 0 &&
+                              restartedStore.latestZhihuDraft()?.fullText == body,
+                              "稿件保全-B：真实插话撤销授权后发布点击数=0，独立稿件全文仍保留"))
 
             // 重复任务：只暴露 token，旧记录来自 id+token；无当前发布授权仍先查账。
             let repeatSession = UUID(), repeatTask = UUID()
@@ -4706,7 +4867,8 @@ struct OpenStall {
             _ = try await repeatWeb.loadZhihuEngineFixture()
             try await repeatWeb.exposeOnlyControlledZhihuAlias("engine-me-token")
             let repeatEngine = AgentEngine(web: repeatWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: ledgerKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: ledgerKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(repeatEngine, web: repeatWeb, sessionID: repeatSession, taskID: repeatTask,
                 goal: "继续，检查刚才是否发布成功", actions: [try action("done", summary: "检查完成")])
             repeatEngine.launch()
@@ -4765,7 +4927,8 @@ struct OpenStall {
             let disabledWeb = WebController(); disabledWeb.beginExecution(sessionID: disabledSession)
             let disabledFixture = try await disabledWeb.loadZhihuEngineFixture(outcome: "native-disabled-fieldset-stale")
             let disabledEngine = AgentEngine(web: disabledWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: disabledKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: disabledKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(disabledEngine, web: disabledWeb, sessionID: disabledSession, taskID: disabledTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: disabledFixture.editor.index, text: body),
@@ -4800,7 +4963,8 @@ struct OpenStall {
                 let outcomeWeb = WebController(); outcomeWeb.beginExecution(sessionID: session)
                 let fixture = try await outcomeWeb.loadZhihuEngineFixture(outcome: mode)
                 let outcomeEngine = AgentEngine(web: outcomeWeb, settings: SettingsStore(),
-                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                    zhihuPublishLedgerKeyOverride: key,
+                    controlledZhihuPublishFixture: true, restoreSession: false)
                 configure(outcomeEngine, web: outcomeWeb, sessionID: session, taskID: task,
                     goal: "发布这篇知乎回答", actions: [
                         try action("type", index: fixture.editor.index, text: body),
@@ -4827,7 +4991,8 @@ struct OpenStall {
             let revealWeb = WebController(); revealWeb.beginExecution(sessionID: revealSession)
             let revealFixture = try await revealWeb.loadZhihuEngineFixture(outcome: "rejected-hidden-visible")
             let revealEngine = AgentEngine(web: revealWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: revealKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: revealKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(revealEngine, web: revealWeb, sessionID: revealSession, taskID: revealTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: revealFixture.editor.index, text: body),
@@ -4852,7 +5017,8 @@ struct OpenStall {
             let firstWeb = WebController(); firstWeb.beginExecution(sessionID: recoverySession)
             let firstFixture = try await firstWeb.loadZhihuEngineFixture()
             let firstEngine = AgentEngine(web: firstWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: recoveryKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: recoveryKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(firstEngine, web: firstWeb, sessionID: recoverySession, taskID: recoveryTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: firstFixture.editor.index, text: body), try action("wait")
@@ -4865,7 +5031,8 @@ struct OpenStall {
 
             let recoveredWeb = WebController()
             let recoveredEngine = AgentEngine(web: recoveredWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: recoveryKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: recoveryKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             recoveredEngine.runSessionID = recoverySession
             recoveredEngine.restoreSnapshot(for: recoverySession, allowLegacy: false)
             recoveredEngine.queuedTasks = []; recoveredEngine.acceptedSteerQueueIDs = []
@@ -4894,7 +5061,8 @@ struct OpenStall {
             let timeoutFirstWeb = WebController(); timeoutFirstWeb.beginExecution(sessionID: timeoutSession)
             let timeoutFixture = try await timeoutFirstWeb.loadZhihuEngineFixture()
             let timeoutFirst = AgentEngine(web: timeoutFirstWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: timeoutKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: timeoutKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(timeoutFirst, web: timeoutFirstWeb, sessionID: timeoutSession, taskID: timeoutTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: timeoutFixture.editor.index, text: body), try action("wait")
@@ -4906,7 +5074,8 @@ struct OpenStall {
 
             let timeoutWeb = WebController()
             let timeoutRecovered = AgentEngine(web: timeoutWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: timeoutKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: timeoutKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             timeoutRecovered.runSessionID = timeoutSession
             timeoutRecovered.restoreSnapshot(for: timeoutSession, allowLegacy: false)
             timeoutRecovered.queuedTasks = []; timeoutRecovered.acceptedSteerQueueIDs = []
@@ -4939,7 +5108,8 @@ struct OpenStall {
             let exceptionFixture = try await exceptionWeb.loadZhihuEngineFixture()
             try await exceptionWeb.injectControlledZhihuPostClickException()
             let exceptionEngine = AgentEngine(web: exceptionWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: exceptionKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: exceptionKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(exceptionEngine, web: exceptionWeb, sessionID: exceptionSession, taskID: exceptionTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: exceptionFixture.editor.index, text: body),
@@ -4966,7 +5136,8 @@ struct OpenStall {
             let mutationWeb = WebController(); mutationWeb.beginExecution(sessionID: mutationSession)
             let mutationFixture = try await mutationWeb.loadZhihuEngineFixture()
             let mutationEngine = AgentEngine(web: mutationWeb, settings: SettingsStore(),
-                zhihuPublishLedgerKeyOverride: mutationKey, restoreSession: false)
+                zhihuPublishLedgerKeyOverride: mutationKey,
+                controlledZhihuPublishFixture: true, restoreSession: false)
             configure(mutationEngine, web: mutationWeb, sessionID: mutationSession, taskID: mutationTask,
                 goal: "发布这篇知乎回答", actions: [
                     try action("type", index: mutationFixture.editor.index, text: body),
@@ -4993,7 +5164,8 @@ struct OpenStall {
                 let modalWeb = WebController(); modalWeb.beginExecution(sessionID: session)
                 let target = try await modalWeb.loadZhihuModalEngineFixture(mode: mode)
                 let modalEngine = AgentEngine(web: modalWeb, settings: SettingsStore(),
-                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                    zhihuPublishLedgerKeyOverride: key,
+                    controlledZhihuPublishFixture: true, restoreSession: false)
                 configure(modalEngine, web: modalWeb, sessionID: session, taskID: task,
                     goal: "点击继续", actions: [try action("click", index: target.index),
                                                  try action("done", summary: "模态处理完成")])
@@ -5019,7 +5191,8 @@ struct OpenStall {
                 let steerWeb = WebController(); steerWeb.beginExecution(sessionID: session)
                 let fixture = try await steerWeb.loadZhihuEngineFixture()
                 let steerEngine = AgentEngine(web: steerWeb, settings: SettingsStore(),
-                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                    zhihuPublishLedgerKeyOverride: key,
+                    controlledZhihuPublishFixture: true, restoreSession: false)
                 configure(steerEngine, web: steerWeb, sessionID: session, taskID: task,
                     goal: initialGoal, actions: [
                         try action("type", index: fixture.editor.index, text: "待发布正文"),
@@ -5151,6 +5324,10 @@ struct OpenStall {
 
     private func resolvedZhihuAction(proposedAction: String) -> String {
         ZhihuPublishPolicy.finalAction(for: currentZhihuDecision, proposedAction: proposedAction)
+    }
+
+    private var zhihuPublishExecutionAllowed: Bool {
+        settings.zhihuAutoPublishEnabled || controlledZhihuPublishFixture
     }
 
     /// 台账注入段：动作留痕、效果核查、模型自述分层表述。
@@ -5494,6 +5671,17 @@ struct OpenStall {
     /// 将模型动作改写为引擎的一次发布尝试。attemptStarted 必须先持久化；
     /// 专用 Web 路径只调用一次标准 click()，随后立即进入有界回读。
     private func attemptZhihuPublishOnce(proposed action: AgentAction, token: UUID) async throws {
+        guard zhihuPublishExecutionAllowed else {
+            currentZhihuDecision = .blocked("知乎自动发表开关已关闭")
+            appendStep("publish-decision", "知乎自动发表开关关闭：专用点击入口二次拦截，clickCallCount=0")
+            AgentTraceStore.shared.appendEngineAction(action: "attempt_publish_once",
+                targetFingerprint: currentZhihuPublishBinding?.buttonIdentity ?? "unbound",
+                method: "engine-production-switch-defense", result: "blocked-switch-off",
+                pageURL: web.executionTab.webView.url?.absoluteString ?? "",
+                taskID: conversationTaskID?.uuidString ?? "unobservable", runID: token.uuidString,
+                evidence: ["enabled": false, "clickCount": 0])
+            return
+        }
         guard let taskID = conversationTaskID, token == generation, let oldProof = currentZhihuWriteProof else {
             currentZhihuDecision = .blocked("点击前任务代次、正文版本或按钮绑定复核未通过")
             appendStep("publish-decision", "首次发布尝试未执行：点击前任务代次、正文版本或唯一按钮绑定复核未通过")
@@ -5685,6 +5873,19 @@ struct OpenStall {
         // ——原页面恢复结果＋不得反问目标／网址／进度的硬性口径，直到会话
         // 终结或新任务开始才清除。
         if let resumeNote { prompt += resumeNote + "\n" }
+        if let draft = activePreservedDraft {
+            prompt += """
+            【独立稿件（跨任务保全）】
+            draftID: \(draft.id.uuidString)
+            version: \(draft.version)
+            sourceTaskID: \(draft.sourceTaskID.uuidString)
+            targetAccount: \(draft.target.accountStableID)
+            targetQuestion: \(draft.target.questionID)
+            fullText:
+            \(draft.fullText)
+            硬性规则：稿件正文无需向用户再次索取；导航或旧任务结束不删除稿件。旧 WriteProof 不随稿件迁移，必须在当前页面重新写入并取得 committed 全文等值后才可形成新凭证。
+            """ + "\n"
+        }
         // 成果台账注入（OUTCOME-LEDGER）：与【中断恢复说明】并列——已留痕
         // 的提交逐条在目，附不得重复提交／先查列表／已核实结论不得无新
         // 证据改口的硬口径（见 outcomePromptBlock）
@@ -6022,7 +6223,8 @@ struct OpenStall {
                                        outcomes: outcomeLedger,
                                        stateCard: stateCard,
                                        sessionID: runSessionID,
-                                       zhihuWriteProof: currentZhihuWriteProof,
+                                       // 页面凭证不跨进程；正文由 PreservedDraftStore 独立保存。
+                                       zhihuWriteProof: nil,
                                        zhihuPublishRecords: zhihuPublishRecords,
                                        zhihuPublishAuthorization: currentZhihuAuthorization,
                                        upload: pendingUpload.map { upload in
@@ -6136,7 +6338,11 @@ struct OpenStall {
             for step in snapshot.steps { derived.addCompleted("\(step.action)：\(step.reason)") }
             stateCard = derived
         }
-        currentZhihuWriteProof = snapshot.zhihuWriteProof
+        // 页面/tab/document/editor 均会在进程恢复后重建。旧 WriteProof 只
+        // 用于旧快照解码，不恢复为有效凭证；正文从独立稿件存储取回。
+        currentZhihuWriteProof = nil
+        currentZhihuPublishBinding = nil
+        attachPreservedDraft(to: snapshot.goal)
         currentZhihuAuthorization = snapshot.zhihuPublishAuthorization ?? .initial(instruction: snapshot.goal)
         if let savedPublish = snapshot.zhihuPublishRecords {
             var changed = false
@@ -6253,6 +6459,7 @@ struct OpenStall {
         conversationTaskID = nil; pendingSteers = []; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
+        activePreservedDraft = nil
         discardPendingUpload()
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径
