@@ -18,6 +18,7 @@ final class SkillStore: @unchecked Sendable {
 
     struct Skill: Identifiable {
         let name: String
+        let version: String
         let description: String
         let body: String
         let isBuiltin: Bool
@@ -60,6 +61,11 @@ final class SkillStore: @unchecked Sendable {
     private func seedBuiltinsIfNeeded() {
         guard !seeded else { return }
         seeded = true
+        Self.installBuiltins(in: directory)
+    }
+
+    /// 文件级安装/迁移实现；生产启动与自检临时目录调用同一入口。
+    private static func installBuiltins(in directory: URL) {
         let fm = FileManager.default
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
         // 内置 playbook 版本迁移（ZHIHU-COLUMN-SYNC）：落盘时记录每份内置文本
@@ -71,7 +77,7 @@ final class SkillStore: @unchecked Sendable {
         if let data = try? Data(contentsOf: hashFile),
            let decoded = try? JSONDecoder().decode([String: String].self, from: data) { recorded = decoded }
         var hashesChanged = false
-        for builtin in Self.builtins {
+        for builtin in builtins {
             let folder = directory.appendingPathComponent(builtin.name, isDirectory: true)
             let file = folder.appendingPathComponent("SKILL.md")
             let bundledHash = Self.contentHash(builtin.markdown)
@@ -83,7 +89,10 @@ final class SkillStore: @unchecked Sendable {
             }
             let current = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
             let currentHash = Self.contentHash(current)
-            let untouched = recorded[builtin.name] == nil || recorded[builtin.name] == currentHash
+            // 无哈希的旧安装只在命中已知旧内置版本时迁移；其它内容视为
+            // 用户自行编辑并保留，不能再用“没有记录”推定未修改。
+            let untouched = Self.shouldReplaceBuiltin(recordedHash: recorded[builtin.name], currentHash: currentHash,
+                                                       bundledHash: bundledHash, legacyHashes: builtin.legacyHashes)
             if untouched && currentHash != bundledHash {
                 try? builtin.markdown.write(to: file, atomically: true, encoding: .utf8)
                 recorded[builtin.name] = bundledHash; hashesChanged = true
@@ -102,6 +111,48 @@ final class SkillStore: @unchecked Sendable {
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in s.utf8 { hash ^= UInt64(byte); hash = hash &* 0x100000001b3 }
         return String(hash, radix: 16)
+    }
+
+    private static func shouldReplaceBuiltin(recordedHash: String?, currentHash: String,
+                                             bundledHash: String, legacyHashes: Set<String>) -> Bool {
+        recordedHash == currentHash ||
+            (recordedHash == nil && (currentHash == bundledHash || legacyHashes.contains(currentHash)))
+    }
+
+    func verifyBuiltinMigrationPolicy() -> [String] {
+        let legacy = "6eb36d78775da35", bundled = "new-v4", edited = "user-edited"
+        let oldUpgrades = Self.shouldReplaceBuiltin(recordedHash: nil, currentHash: legacy,
+                                                     bundledHash: bundled, legacyHashes: [legacy])
+        let editedStays = !Self.shouldReplaceBuiltin(recordedHash: nil, currentHash: edited,
+                                                      bundledHash: bundled, legacyHashes: [legacy])
+        let trackedUpgrades = Self.shouldReplaceBuiltin(recordedHash: legacy, currentHash: legacy,
+                                                         bundledHash: bundled, legacyHashes: [legacy])
+        let bundledV4 = Self.builtins.first(where: { $0.name == "zhihu-editor" })?.markdown
+        let rulesCurrent = bundledV4?.contains("version: 4") == true &&
+            bundledV4?.contains("disabled、字数计数") == true &&
+            bundledV4?.contains("一次传完整正文") == true
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("mika-skill-migration-\(UUID().uuidString)", isDirectory: true)
+        var fileLevel = false
+        if let builtin = Self.builtins.first(where: { $0.name == "zhihu-editor" }) {
+            let folder = temp.appendingPathComponent(builtin.name, isDirectory: true)
+            let file = folder.appendingPathComponent("SKILL.md")
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let installedOld = "---\nname: zhihu-editor\nversion: 3\n---\n旧内置规则"
+            try? installedOld.write(to: file, atomically: true, encoding: .utf8)
+            let hashes = [builtin.name: Self.contentHash(installedOld)]
+            if let data = try? JSONEncoder().encode(hashes) { try? data.write(to: temp.appendingPathComponent("builtin-hashes.json"), options: .atomic) }
+            Self.installBuiltins(in: temp)
+            let migrated = try? String(contentsOf: file, encoding: .utf8)
+            let ledger = (try? Data(contentsOf: temp.appendingPathComponent("builtin-hashes.json"))).flatMap { try? JSONDecoder().decode([String: String].self, from: $0) }
+            fileLevel = migrated == builtin.markdown && ledger?[builtin.name] == Self.contentHash(builtin.markdown)
+        }
+        try? FileManager.default.removeItem(at: temp)
+        return [
+            "\(oldUpgrades && trackedUpgrades ? "✓" : "✗") 旧内置 zhihu-editor（有/无哈希账）迁移到当前版本",
+            "\(editedStays ? "✓" : "✗") 用户自行编辑且无已知内置哈希的手册保持原文件",
+            "\(rulesCurrent ? "✓" : "✗") 随包 zhihu-editor v4 使用统一发布规则与完整正文一次 replace",
+            "\(fileLevel ? "✓" : "✗") 临时安装目录写入旧手册＋哈希账后，生产文件级迁移入口实际覆盖正文并更新哈希"
+        ]
     }
 
     private func reloadLocked() {
@@ -125,6 +176,7 @@ final class SkillStore: @unchecked Sendable {
         let lines = markdown.components(separatedBy: "\n")
         guard let first = lines.first, first.trimmingCharacters(in: .whitespaces) == "---" else { return nil }
         var name = ""
+        var version = "1"
         var description = ""
         var bodyStart: Int?
         for i in 1..<lines.count {
@@ -135,6 +187,7 @@ final class SkillStore: @unchecked Sendable {
             var value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 { value = String(value.dropFirst().dropLast()) }
             if key == "name" { name = value }
+            if key == "version" { version = value }
             if key == "description" { description = value }
         }
         guard let bodyStart else { return nil }
@@ -142,16 +195,21 @@ final class SkillStore: @unchecked Sendable {
         guard !name.isEmpty, !description.isEmpty else { return nil }
         let body = lines[bodyStart...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
-        return Skill(name: name, description: description, body: body, isBuiltin: isBuiltin)
+        return Skill(name: name, version: version, description: description, body: body, isBuiltin: isBuiltin)
     }
 
     // MARK: - 内置 playbook（本项目自有经验沉淀，首次运行时落盘为标准 SKILL.md）
 
-    private struct Builtin { let name: String; let markdown: String }
+    private struct Builtin {
+        let name: String
+        let markdown: String
+        var legacyHashes: Set<String> = []
+    }
     private static let builtins: [Builtin] = [
         Builtin(name: "zhihu-editor", markdown: """
         ---
         name: zhihu-editor
+        version: 4
         description: 在知乎（zhihu.com）写回答、发表评论、回复评论，或在知乎专栏（zhuanlan.zhihu.com）发表／修改文章时加载：框架富文本编辑器的输入与发布判据、回答与评论的入口差异、专栏文章编辑器的字数与保存状态判据、知乎页面特性。
         ---
 
@@ -160,10 +218,12 @@ final class SkillStore: @unchecked Sendable {
         ## 编辑器性质
         - 知乎的回答／评论／专栏文章编辑器都是框架富文本编辑器：文字必须真正进入编辑器内部状态才算数，DOM 上看得见字不等于编辑器认账。本 App 的 type 动作带编辑器状态校验（回读 DOM＋核对编辑器自报字数与保存状态，计数不动会自动换输入方式重试），按正常流程用 type 写入即可，不要尝试其它注入办法。
         - type 回报失败时先看清是哪种口径：「字数没动」＝文字没进入编辑器状态；「保存未落定」＝文字进了状态但自动保存没跟上；「没能输入到编辑器」＝DOM 层也没写进去。引擎已自动换过多种输入方式才报错，同一编辑器不要盲目重复 type 把步数耗光；按回报口径处理（保存未落定就等落定或停下汇报，字数没动就如实汇报停下）。
+        - 回答正文用一次 type=replace 传入完整正文；长文也不拆成多次 type。正文凭证只取目标 Draft committed 的全文回读，比较仅统一 CRLF/CR 为 LF，标点、数字、大小写、空格与段落都须一致。
 
         ## 发布判据
-        - 发布成功的硬判据：编辑器字数统计大于 0，且「发布／发表」按钮不是 disabled。按钮 disabled=true 时不要点它、更不要谎称已发布——多半是文字还没真正进入编辑器。
-        - 发布后必须回读验证：页面上出现自己刚写的内容，才算真的发出去；只点过按钮不算。
+        - 当前回答正文经引擎核实且发布条件成立时，执行一次发布尝试。按钮 disabled、字数计数和「Markdown 语法输入中」仅为页面观测，不能单独推翻正文凭证，也不能阻止这次首次尝试。
+        - 发布按钮必须与当前回答编辑器有唯一容器归属并对应当前问题；同名多候选或隐藏副本不能靠全页第一个或旧 index 猜。
+        - 点击只表示「已尝试」。成功必须独立回读到对应问题的回答 ID/稳定链接、当前账号作者身份、编辑器外完整正文逐段一致；错误提示、审核提示、toast、跳转、编辑器残稿、相同前缀、超时或回读失败都统一为结果未知。结果未知时提示「发布结果未确认，可能已经成功。已暂停同题自动重试，请先检查回答详情。」并保留同题阻断，绝不重放点击。
 
         ## 入口差异
         - 回答：在问题页点「写回答」进入回答编辑器。
@@ -172,7 +232,7 @@ final class SkillStore: @unchecked Sendable {
 
         ## 页面特性
         - 知乎页面重排频繁，元素 index 每轮都可能变化，永远以最新快照为准；出现「策略切换」记录时按最新元素重新选目标，不要重复选已失效的目标。
-        - 内容较长时分段写：先写主体，再回读检查字数与按钮状态，最后发布。
+        - 内容较长时仍一次传完整正文并按 committed 全文等值核对，不分段追加。
 
         ## 专栏文章编辑器（zhuanlan.zhihu.com）
         - 与回答编辑器是两个东西：专栏文章在 zhuanlan.zhihu.com 的文章编辑器里写，改已发布的文章从创作中心／内容管理进原文的「编辑」，在原文上改，不要新建一篇文章重复发布（与成果台账口径一致）。改完点的是「更新」，不是「发布」；更新后回文章页或内容管理核对正文确实变了才算完成。
@@ -184,7 +244,7 @@ final class SkillStore: @unchecked Sendable {
 
         ## 边界
         - 登录、验证码、付费与授权一律按系统安全规则处理（ask_user 或停下等用户手动完成），本 playbook 的任何内容都不覆盖安全规则。
-        """),
+        """, legacyHashes: ["6eb36d78775da35"]),
         Builtin(name: "blocked-reroute", markdown: """
         ---
         name: blocked-reroute

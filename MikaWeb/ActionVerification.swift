@@ -256,3 +256,31 @@ enum ActionVerifier {
             diverged: result.verdict == .contradicted)
     }
 }
+
+/// 知乎回答不走通用「前 12 字次数增加」判据。只有稳定回答 ID/链接、
+/// 题目绑定、当前账号作者与编辑器外完整正文同时成立，才核实为已发布；
+/// 审核、拒绝及其它不完整页面信号一律保持 unknown。
+enum ZhihuAnswerVerifier {
+    static func judge(_ evidence: ZhihuPublicationEvidence, target: ZhihuReadbackTarget) -> ZhihuPublishStatus {
+        let bound = evidence.questionID == target.questionID &&
+            !evidence.answerID.isEmpty && !evidence.answerURL.isEmpty &&
+            !evidence.currentAccountIdentity.isEmpty &&
+            evidence.currentAccountIdentity == target.accountIdentity &&
+            evidence.currentAccountIdentity == evidence.authorIdentity &&
+            evidence.fullTextEqual &&
+            ZhihuPublishPolicy.normalizeFullText(evidence.bodyText) == ZhihuPublishPolicy.normalizeFullText(target.sourceText)
+        guard bound else { return .unknown }
+        // 审核提示、拒绝提示和其它页面信号都不能证明本次副作用结果；只有
+        // 独立详情页完整回读可以晋级，除此以外统一 unknown 并保留阻断。
+        if evidence.pageState == "review" { return .unknown }
+        return evidence.verifiesPublished ? .verifiedPublished : .unknown
+    }
+
+    static func judge(_ evidence: ZhihuPublicationEvidence, proof: WriteProof) -> ZhihuPublishStatus {
+        let target = ZhihuReadbackTarget(questionID: proof.questionID, expectedTextHash: proof.expectedTextHash,
+            sourceText: proof.expectedText, accountIdentity: evidence.currentAccountIdentity,
+            accountAliases: ZhihuAccountIdentity.legacyAliases(evidence.currentAccountIdentity),
+            attemptID: UUID(), taskID: proof.taskID)
+        return judge(evidence, target: target)
+    }
+}

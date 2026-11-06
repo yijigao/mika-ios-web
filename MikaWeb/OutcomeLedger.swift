@@ -57,3 +57,97 @@ enum SubmissionClassifier {
         return (LoopDetector.textFingerprint(normalized), String(normalized.prefix(24)))
     }
 }
+
+/// FIX6 账号别名等价类。stableID 一经建立保持不变；后续页面同时暴露新旧别名
+/// 时只扩充 aliases 并集，不重算主键。这样 id|token、token 两种页面表示仍命中
+/// 同一发布账。无法和既有同题记录确认连续性时 resolve 返回 nil（fail-closed）。
+struct ZhihuAccountRegistry: Codable, Equatable {
+    var identities: [ZhihuAccountIdentity] = []
+
+    private mutating func register(aliases raw: [String], preferredStableID: String? = nil) -> ZhihuAccountIdentity? {
+        let aliases = ZhihuAccountIdentity.normalizedAliases(raw)
+        guard !aliases.isEmpty else { return nil }
+        let hits = identities.indices.filter { identities[$0].intersects(aliases) }
+        let stableID = hits.compactMap { identities[$0].stableID.isEmpty ? nil : identities[$0].stableID }.first ??
+            preferredStableID.flatMap { $0.isEmpty ? nil : $0 } ??
+            "zhacct-\(ZhihuPublishPolicy.hash(aliases.joined(separator: "|")))"
+        let union = ZhihuAccountIdentity.normalizedAliases(aliases + hits.flatMap { identities[$0].aliases })
+        for index in hits.sorted(by: >) { identities.remove(at: index) }
+        let identity = ZhihuAccountIdentity(stableID: stableID, aliases: union)
+        identities.append(identity)
+        return identity
+    }
+
+    /// 兼容读取旧 accountIdentity 拼接键，并把迁移结果回填到记录的新字段。
+    mutating func migrate(records: inout [ZhihuPublishRecord]) {
+        for index in records.indices {
+            let aliases = ZhihuAccountIdentity.normalizedAliases(
+                (records[index].accountAliases ?? []) + ZhihuAccountIdentity.legacyAliases(records[index].accountIdentity))
+            guard let identity = register(aliases: aliases,
+                                          preferredStableID: records[index].accountStableID) else { continue }
+            records[index].accountStableID = identity.stableID
+            records[index].accountAliases = identity.aliases
+        }
+        // 前面逐条扩并集后，按别名交集回填最终等价类。旧记录原先各自带着
+        // 不同拼接键时也会统一到合并后的 stableID，而非只补 aliases。
+        for index in records.indices {
+            let aliases = ZhihuAccountIdentity.normalizedAliases(
+                (records[index].accountAliases ?? []) + ZhihuAccountIdentity.legacyAliases(records[index].accountIdentity))
+            guard let identity = identities.first(where: { $0.intersects(aliases) }) else { continue }
+            records[index].accountStableID = identity.stableID
+            records[index].accountAliases = identity.aliases
+        }
+    }
+
+    mutating func resolve(observedAliases raw: [String], questionID: String,
+                          records: [ZhihuPublishRecord]) -> ZhihuAccountIdentity? {
+        let aliases = ZhihuAccountIdentity.normalizedAliases(raw)
+        guard !aliases.isEmpty else { return nil }
+        let cached = identities.filter { $0.intersects(aliases) }
+        let candidateAliases = ZhihuAccountIdentity.normalizedAliases(
+            aliases + cached.flatMap(\.aliases))
+        let candidateStableIDs = Set(cached.map(\.stableID).filter { !$0.isEmpty })
+
+        // 缓存命中也必须先核对同题旧账。跨题分别见过 me-id / me-token 只会
+        // 建立两个候选身份，不构成“它们属于不同账号”的区分证据；回到有
+        // me-id 未决账的题目而页面仅暴露 me-token 时必须 fail-closed。
+        let hasAmbiguousSameQuestion = records.contains { record in
+            guard record.questionID == questionID,
+                  let recorded = ZhihuPublishLedger.identity(for: record) else { return false }
+            return !candidateStableIDs.contains(recorded.stableID) &&
+                !recorded.intersects(candidateAliases)
+        }
+        guard !hasAmbiguousSameQuestion else { return nil }
+        return register(aliases: aliases)
+    }
+}
+
+/// 发布账按「稳定账号等价类＋题目＋全文哈希」查询；taskID 不能解除同题未决。
+enum ZhihuPublishLedger {
+    static func identity(for record: ZhihuPublishRecord) -> ZhihuAccountIdentity? {
+        let aliases = ZhihuAccountIdentity.normalizedAliases(
+            (record.accountAliases ?? []) + ZhihuAccountIdentity.legacyAliases(record.accountIdentity))
+        guard !aliases.isEmpty else { return nil }
+        let stableID = record.accountStableID.flatMap { $0.isEmpty ? nil : $0 } ??
+            "zhacct-\(ZhihuPublishPolicy.hash(aliases.joined(separator: "|")))"
+        return ZhihuAccountIdentity(stableID: stableID, aliases: aliases)
+    }
+
+    static func accountMatches(_ record: ZhihuPublishRecord, account: ZhihuAccountIdentity) -> Bool {
+        guard let recorded = identity(for: record) else { return false }
+        return recorded.stableID == account.stableID || recorded.intersects(account.aliases)
+    }
+
+    static func pending(account: ZhihuAccountIdentity, questionID: String,
+                        in records: [ZhihuPublishRecord]) -> ZhihuPublishRecord? {
+        records.last { accountMatches($0, account: account) && $0.questionID == questionID && $0.status.isPending }
+    }
+
+    static func verified(account: ZhihuAccountIdentity, questionID: String, textHash: String? = nil,
+                         in records: [ZhihuPublishRecord]) -> ZhihuPublishRecord? {
+        records.last {
+            accountMatches($0, account: account) && $0.questionID == questionID &&
+            (textHash == nil || $0.expectedTextHash == textHash) && $0.status == .verifiedPublished
+        }
+    }
+}

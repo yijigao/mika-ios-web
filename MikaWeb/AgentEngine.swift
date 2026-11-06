@@ -799,6 +799,7 @@ struct OpenStall {
     /// 本任务已加载的 playbook（ADOPTION-TOP3 第 3 条）：名称防重复加载，正文
     /// 随每次模型调用注入任务上下文；playbook 只是提示层，安全判定不读它。
     private var loadedSkillNames: [String] = []
+    private var loadedSkillVersions: [String: String] = [:]
     private var loadedSkillBodies = ""
     /// 中断恢复现场（RESUME-CONTEXT-FIX）：冷启动按快照恢复出的会话，浏览器
     /// 标签现场还没重建——快照里的标签地址先存放在这里，第一次 resume 时才
@@ -837,6 +838,32 @@ struct OpenStall {
     /// 编辑器／textarea 的输入，回退任意字段的最近输入。start() 清空——新
     /// 任务的提交若无打字记录，软门按页面＋按钮标识匹配（追问场景正是此路）。
     private var recentTyped: [(text: String, isEditor: Bool)] = []
+    /// FIX4：当前可复用的正文凭证只属于当前 task/tab/document/editor/body
+    /// 版本；历史写入事实留在状态卡，当前凭证失效时不会被历史事实补造。
+    private var currentZhihuWriteProof: WriteProof?
+    private var currentZhihuPublishBinding: ZhihuPublishBinding?
+    private var currentZhihuDecision: PublishDecision?
+    private var currentZhihuDirective: ZhihuPublishDirective?
+    /// 当前任务的可追溯发布授权；只由任务目标与最新用户指令更新，网页正文
+    /// 与回答草稿从不进入此状态。
+    private var currentZhihuAuthorization = PublishAuthorization.initial(instruction: "")
+    /// alreadyPublished 命中的实际旧记录，结案不能再按新 taskID 反查。
+    private var matchedZhihuPublishRecord: ZhihuPublishRecord?
+    /// 发布尝试账跨任务、跨恢复保存；同题未决记录不因换 taskID/正文而清除。
+    private var zhihuPublishRecords: [ZhihuPublishRecord] = []
+    /// 稳定账号主键与已验证别名关系；与发布账同寿命持久化。
+    private var zhihuAccountRegistry = ZhihuAccountRegistry()
+    private var controlledZhihuReadback = false
+    private var controlledZhihuReadbackBodyOverride: String?
+    /// 原生自检的受控模型动作源：非 nil 时 launch() 主循环从这里取动作，
+    /// 其余派发、记账、回读与 done 收口完全走生产代码。
+    private var controlledActions: [AgentAction]?
+    private var controlledActionCursor = 0
+    private var controlledActionWillDispatch: ((Int, AgentAction) async throws -> Void)?
+    /// 模拟点击落账后进程退出；只用于验证新 AgentEngine 的生产恢复入口。
+    private var controlledSuspendAfterZhihuClick = false
+    private var controlledDidSuspendAfterZhihuClick = false
+    private var zhihuPublishLedgerKeyOverride: String?
     /// 待决网页上传（F1，2026-11-02）：upload_file 动作的人在环现场——
     /// agent 定位文件控件后任务停在这里等用户：先过 SP-01 确认卡（非本
     /// 任务生成的私有文件必经，凭据在 AttachmentStore 一次性登记表里、
@@ -893,6 +920,8 @@ struct OpenStall {
     private var traceStateCardBefore = ""
     private var traceInterjection = ""
     private var traceInputStrategies: [String] = []
+    private var traceFinalAction: [String: Any]?
+    private var traceRewriteReason = "none"
     static let foldStepThreshold = 12
     /// 组装 prompt 的字符预算（H1）：保守默认值——组装后超此值先逐级加大
     /// 折叠再发送；它管的是「我们发出去的体量有界」，不是某个模型的窗口
@@ -920,8 +949,11 @@ struct OpenStall {
     private let continuedBox = ContinuedProcessingBox()
     /// 任务期防锁屏开关（层 4）的订阅：开关变化时立即按当前会话状态重新应用。
     private var settingsCancellable: AnyCancellable?
-    init(web: WebController, settings: SettingsStore) {
+    init(web: WebController, settings: SettingsStore,
+         zhihuPublishLedgerKeyOverride: String? = nil,
+         restoreSession: Bool = true) {
         self.web = web; self.settings = settings
+        self.zhihuPublishLedgerKeyOverride = zhihuPublishLedgerKeyOverride
         thermalGate.update(level: ThermalLevel(ProcessInfo.processInfo.thermalState), now: Date())
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
                                                                   object: nil, queue: nil) { [weak self] _ in
@@ -940,10 +972,11 @@ struct OpenStall {
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
         loadOutcomeLedger()
+        loadZhihuPublishRecords()
         loadTaskClaims()
         saveTaskClaims()
         loadQueue()
-        restoreSnapshotIfNeeded()
+        if restoreSession { restoreSnapshotIfNeeded() }
     }
     deinit {
         if let thermalObserver { NotificationCenter.default.removeObserver(thermalObserver) }
@@ -1002,7 +1035,7 @@ struct OpenStall {
         applyUserClaimStatement(taskText)
         let newTaskID = startingID ?? UUID()
         goal = taskText; limit = min(50, max(5, settings.maxSteps)); stepBudget = StepBudget(limit: limit); recoveryBudget = RecoveryBudget(); stepLimitPaused = false; thermalPaused = false; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil; lastStaleKey = nil; staleStreak = 0; transientStreak = 0
-        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillVersions = [:]; loadedSkillBodies = ""
         // 状态卡与折叠/重试状态随新任务重置（台账不清，见下方既有口径）
         stateCard = TaskStateCard(goal: goal, claims: taskClaims); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         // 绕行梯随新任务重置（AUTONOMY-FIX）：每个任务从梯级①重新开始
@@ -1012,6 +1045,8 @@ struct OpenStall {
         // 成果台账不清（跨任务存活，见 outcomeLedger 声明处）；只清本任务的
         // 打字记录与未消费的软门提醒——新任务的提交指纹从本任务的输入重算
         recentTyped = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
+        currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
+        currentZhihuAuthorization = .initial(instruction: goal); matchedZhihuPublishRecord = nil
         // 新任务开始：上一会话的中断恢复现场一并作废，不带进新会话
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         conversationTaskID = newTaskID
@@ -1144,6 +1179,9 @@ struct OpenStall {
                 return false
             }
             try saveSidecar(file, in: runSessionID) // 写前日志是接受边界。
+            // 接受边界即刻更新授权，尤其让“只存草稿/不要发布”在正在进行的
+            // proof 复读或按钮绑定 await 期间也能撤销点击资格。
+            currentZhihuAuthorization.apply(instruction: text, source: "steer:\(file.tasks[i].items.last?.id.uuidString ?? "unknown")")
             do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
             persistSnapshot()
             return true
@@ -1157,10 +1195,18 @@ struct OpenStall {
         for item in file.tasks[i].items where item.disposition == .applied && hint?.contains(item.text) == true {
             applyUserClaimStatement(item.text)
         }
+        rebuildZhihuAuthorization(from: file.tasks[i])
         try saveSidecar(file, in: runSessionID) // 消费标记先持久化，快照旧镜像不能复活它。
         do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
         persistSnapshot()
         return hint
+    }
+    private func rebuildZhihuAuthorization(from state: SteerState?) {
+        var rebuilt = PublishAuthorization.initial(instruction: goal)
+        for item in state?.items ?? [] where item.disposition == .pending || item.disposition == .frozen || item.disposition == .applied {
+            rebuilt.apply(instruction: item.text, source: "steer:\(item.id.uuidString)")
+        }
+        currentZhihuAuthorization = rebuilt
     }
     func withdrawSteer(_ id: UUID, draft: String) -> String? {
         guard !interruptInFlight, let taskID = conversationTaskID else { return nil }
@@ -1169,6 +1215,7 @@ struct OpenStall {
             guard let i = file.tasks.firstIndex(where: { $0.taskID == taskID }),
                   let item = file.tasks[i].move(id, to: .withdrawn) else { return nil }
             try saveSidecar(file, in: runSessionID)
+            rebuildZhihuAuthorization(from: file.tasks[i])
             do { try steeringConversation?.materializeSteering(file.tasks[i]) } catch { steeringError(error) }
             persistSnapshot()
             return SteerState.restoredDraft(draft, text: item.text)
@@ -1191,6 +1238,7 @@ struct OpenStall {
             let item = file.tasks[i].move(id, to: .queued) ?? file.tasks[i].items.first { $0.id == id && $0.disposition == .queued }
             guard let item else { return false }
             try saveSidecar(file, in: runSessionID)
+            rebuildZhihuAuthorization(from: file.tasks[i])
             try enqueueTask(sessionID: runSessionID, steerTransfer: item)
             try steeringConversation?.materializeSteering(file.tasks[i])
             persistSnapshot()
@@ -1589,10 +1637,11 @@ struct OpenStall {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
         goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         lastStaleKey = nil; staleStreak = 0; transientStreak = 0
-        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillVersions = [:]; loadedSkillBodies = ""
         conversationTaskID = nil; pendingSteers = []; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
         recentTyped = []; outcomeGateFired = []; pendingOutcomeHint = nil; pendingOutcomeStep = nil; pendingVerificationStep = nil
+        currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
         discardPendingUpload()
         stateCard = TaskStateCard(); forcedFoldLevel = 0; contextRetryUsed = false; finalAuditFired = false
         runStartedAt = nil; activeRunContext = nil
@@ -1748,6 +1797,41 @@ struct OpenStall {
         }
         launch(confirmed: saved)
     }
+
+    private func nextAgentAction(prompt: String, page: PageState) async throws -> AgentAction {
+        if let controlledActions {
+            guard controlledActionCursor < controlledActions.count else {
+                throw MikaError("受控动作源已耗尽但生产主循环尚未结案")
+            }
+            let cursor = controlledActionCursor
+            var action = controlledActions[cursor]
+            controlledActionCursor += 1
+            // -2 是自检专用的“按当前生产快照重新定位知乎发布按钮”，避免把旧 index
+            // 手工塞给派发器；重定位后仍由主循环的共用发布门裁决。
+            if action.action == "click", action.index == -2,
+               let target = page.elements.first(where: { Self.isZhihuAnswerPublishTarget($0, pageURL: page.url) }),
+               let data = try? JSONSerialization.data(withJSONObject: [
+                    "action": action.action, "index": target.index, "text": action.text,
+                    "url": action.url, "direction": action.direction, "seconds": action.seconds,
+                    "reason": action.reason, "summary": action.summary, "question": action.question,
+                    "skill": action.skill, "mode": action.mode, "subtitle": action.subtitle,
+                    "template": action.template, "askKind": action.askKind
+               ]), let rebound = try? JSONDecoder().decode(AgentAction.self, from: data) {
+                action = rebound
+            }
+            if let controlledActionWillDispatch { try await controlledActionWillDispatch(cursor, action) }
+            return action
+        }
+        if settings.modelSource == .chatGPT {
+            return try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel,
+                prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(),
+                trace: { [weak self] in self?.traceModel = $0 })
+        }
+        return try await ModelClient().next(baseURL: settings.baseURL, model: settings.model,
+            key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(),
+            trace: { [weak self] in self?.traceModel = $0 })
+    }
+
     private func launch(confirmed: (AgentAction, PageElement, String, Int)? = nil) {
         guard !interruptInFlight else { return }
         // 恢复会话的现场重建在此兜底：resume() 已先行调用过则守卫使其为空操作；
@@ -1797,10 +1881,9 @@ struct OpenStall {
                     do {
                         try await checkpoint(token)
                         try thermalCheckpoint()
-                        let page = try await web.state()
+                        var page = try await web.state()
                         try await checkpoint(token)
                         try thermalCheckpoint()
-                        let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                         let answers = String(decoding: try JSONEncoder().encode(answerContext), as: UTF8.self)
                         // 一次性提示在本轮组装前消费（组装可能因预算多遍重建，
                         // 消费动作不能放进组装函数里重复执行）
@@ -1808,6 +1891,18 @@ struct OpenStall {
                         let outcomeHint = pendingOutcomeHint; pendingOutcomeHint = nil
                         let steerHint = try consumePendingSteers()
                         traceInterjection = steerHint ?? ""
+                        page = await refreshZhihuPublishContext(page: page)
+                        // 崩溃/超时恢复出的 attemptStarted/attempted 先走一次有界
+                        // 只读回读，绝不先问模型要不要再点。
+                        if case .some(.readbackOnly(_)) = currentZhihuDecision,
+                           let record = matchedZhihuPublishRecord, record.status.needsReadback,
+                           record.readbackCompletedAt == nil {
+                            _ = await runZhihuReadback(recordID: record.id, token: token)
+                            try await checkpoint(token)
+                            page = try await web.state()
+                            page = await refreshZhihuPublishContext(page: page)
+                        }
+                        let json = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
                         // prompt 组装（H1）：任务→状态卡→恢复说明→成果台账→
                         // 历史（确定性折叠）→问答→playbook→提示→当前页面；
                         // 体量由 promptCharBudget 约束，超预算逐级加大折叠
@@ -1816,12 +1911,9 @@ struct OpenStall {
                         tracePageBefore = page
                         traceModel = nil
                         traceInputStrategies = []
-                        let action: AgentAction
-                        if settings.modelSource == .chatGPT {
-                            action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(), trace: { [weak self] in self?.traceModel = $0 })
-                        } else {
-                            action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(), trace: { [weak self] in self?.traceModel = $0 })
-                        }
+                        traceFinalAction = nil
+                        traceRewriteReason = "none"
+                        let action = try await nextAgentAction(prompt: prompt, page: page)
                         // 预算计数点（Part C）：模型返回一个动作＝一次决策，
                         // 全引擎只在此一处计数（runConfirmed 执行的是已计数的
                         // 已确认动作，后续动作回到主循环同一计数点取得）；
@@ -1829,6 +1921,34 @@ struct OpenStall {
                         stepBudget.consumeDecision()
                         try await checkpoint(token)
                         try thermalCheckpoint()
+                        if resolvedZhihuAction(proposedAction: action.action) == "attempt_publish_once" {
+                            try await attemptZhihuPublishOnce(proposed: action, token: token)
+                            if controlledDidSuspendAfterZhihuClick {
+                                status = .paused("受控进程退出点：发布点击已落账，尚未回读")
+                                persistSnapshot()
+                                return
+                            }
+                            continue
+                        }
+                        // 同题已有未决或已核实记录时，连续模型点击也不能绕过
+                        // 一次尝试账。非点击动作（尤其 done）照常由后续逻辑处理。
+                        if action.action == "click", action.index >= 0, action.index < page.elements.count,
+                           Self.isZhihuAnswerPublishTarget(page.elements[action.index], pageURL: page.url) {
+                            switch currentZhihuDecision {
+                            case .some(.readbackOnly(let why)), .some(.alreadyPublished(let why)):
+                                record(action, suffix: "（未执行：知乎专用发布账拦截——\(why)）")
+                                appendStep("publish-decision", "模型再次请求发布未执行：\(why)；点击次数保持不变，只允许回读/报告")
+                                continue
+                            case .some(.blocked(let why)):
+                                record(action, suffix: "（未执行：知乎发布证据缺口——\(why)）")
+                                appendStep("publish-decision", "模型发布点击未执行：\(why)；不得借 disabled、计数或旧 verified 绕过 WriteProof/唯一绑定")
+                                continue
+                            default: break
+                            }
+                            record(action, suffix: "（未执行：知乎回答提交只允许走专用一次点击门）")
+                            appendStep("publish-decision", "知乎发布点击未执行：授权=\(currentZhihuAuthorization.explanation)；通用 click 不得旁路专用策略/未决账")
+                            continue
+                        }
                         if action.action == "done" {
                             // done 梯门（LADDER-FIX F2）：有在开卡点且绕行
                             // 梯未尽时 done 不得直接结案——引擎先推进梯
@@ -1846,10 +1966,26 @@ struct OpenStall {
                                 pendingLoopHint = "【结案自证门】本轮提交仍待核查。请去内容列表/记录页回读对应条目，引用页面原文；确认生效就在总结里写明证据来源；找不到或对不上就如实写未核实。不得再次提交同一内容。"
                                 continue
                             }
+                            var finalSummary = action.summary
+                            if let currentTaskID = conversationTaskID,
+                               URL(string: page.url)?.host?.contains("zhihu.com") == true {
+                                let publish = matchedZhihuPublishRecord ?? zhihuPublishRecords.last(where: { $0.taskID == currentTaskID })
+                                if publish != nil || currentZhihuAuthorization.allowsZhihuAnswer {
+                                    let writeText = currentZhihuWriteProof?.taskID == currentTaskID && currentZhihuWriteProof?.isValid == true
+                                        ? "已核实" : (publish?.sourceText.isEmpty == false ? "已核实" : "未核实")
+                                    let publicationText = publish?.status.display ?? "未尝试"
+                                    let evidence = publish?.answerURL.map { "；结案证据：\($0)" } ?? ""
+                                    let truthful = "正文：\(writeText)；发布：\(publicationText)\(evidence)"
+                                    finalSummary = Self.containsCompletionClaim(summary: action.summary)
+                                        ? truthful
+                                        : truthful + (action.summary.isEmpty ? "" : "。\(action.summary)")
+                                    appendStep("audit", "知乎结案门修正：正文核实与发布结果分开；最终口径固定为「\(truthful)」")
+                                }
+                            }
                             recordCompletionClaim(summary: action.summary, since: runStartedAt)
                             record(action)
                             let pendingNote = Self.pendingOutcomes(outcomeLedger, since: runStartedAt).isEmpty ? "" : "（注：本任务有提交未经回读核实，见步流）"
-                            status = .done(action.summary + pendingNote)
+                            status = .done(finalSummary + pendingNote)
                             sessionActive = false; applyIdleTimerPolicy()
                             endBackgroundGrace(); completeContinuedProcessing(success: true)
                             await recycleReadbackTabs(for: conversationTaskID, expectedGeneration: token)
@@ -1898,7 +2034,8 @@ struct OpenStall {
                                 outcome = "already-loaded"
                             } else if let skill = SkillStore.shared.skill(named: name) {
                                 loadedSkillNames.append(skill.name)
-                                loadedSkillBodies += "\n【playbook：\(skill.name)】\n\(skill.body)"
+                                loadedSkillVersions[skill.name] = skill.version
+                                loadedSkillBodies += "\n【playbook：\(skill.name) v\(skill.version)】\n\(skill.body)"
                                 appendStep("skill", "已加载 playbook《\(skill.name)》：\(skill.description)")
                                 outcome = "loaded"
                             } else {
@@ -2163,6 +2300,16 @@ struct OpenStall {
 
     private enum ConfirmedOutcome { case proceed, halted }
 
+    private static func isZhihuAnswerPublishTarget(_ element: PageElement, pageURL: String) -> Bool {
+        guard URL(string: pageURL)?.host?.contains("zhihu.com") == true else { return false }
+        let parts = [element.text, element.ariaLabel, element.name, element.placeholder]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let label = parts.joined(separator: " ")
+        if label.range(of: "(发布回答|提交回答|发表回答)", options: .regularExpression) != nil { return true }
+        let onQuestion = URL(string: pageURL)?.path.contains("/question/") == true
+        return onQuestion && parts.contains(where: { ["发布", "发表", "提交"].contains($0) })
+    }
+
     /// 已确认动作的执行段（launch 的前置段）：复核目标后只执行一次。确认等待期间
     /// 页面可能已重排：先认原 index 处逐字段相等的元素，认不到再按稳定描述重找；
     /// 网址已变（导航离开）或描述也认不到，才按「目标已变化」安全失败——不会误执行
@@ -2182,6 +2329,11 @@ struct OpenStall {
                 confirmedTarget = resolveTarget(descriptor: ElementDescriptor(saved.1), original: saved.1, in: page.elements, coverageComplete: page.coverageComplete)
             }
             guard let target = confirmedTarget else { throw MikaError("确认期间页面目标已变化，请重新开始或继续") }
+            if saved.0.action == "click", Self.isZhihuAnswerPublishTarget(target, pageURL: page.url) {
+                record(saved.0, suffix: "（未执行：确认/恢复入口不能绕过知乎专用一次点击门）")
+                appendStep("publish-decision", "确认/恢复的知乎回答提交已拦截；将按当前授权、账号未决账、WriteProof 与唯一绑定重新编排")
+                return .proceed
+            }
             if SafetyPolicy.check(saved.0, target) == .manual {
                 waitingInput = .manual(id: UUID(), text: "请手动填写密码或验证码后继续")
                 status = .waitingManual("请手动填写密码或验证码后继续")
@@ -2194,7 +2346,7 @@ struct OpenStall {
             if saved.0.action == "type" {
                 let trace = web.takeEditorTypeTrace()
                 traceInputStrategies = trace
-                noteTypedContent(action: saved.0, element: target)
+                await noteTypedContent(action: saved.0, element: target)
             }
             record(saved.0, suffix: typeVerificationSuffix(for: saved.0, trace: traceInputStrategies, page: page))
             if saved.0.action == "type", !traceInputStrategies.isEmpty {
@@ -2520,6 +2672,11 @@ struct OpenStall {
                 }
                 return try registerStrategySwitch(key: descriptor.key, label: label)
             }
+            if action.action == "click", Self.isZhihuAnswerPublishTarget(target, pageURL: snapshot.url) {
+                record(action, suffix: "（未执行：runTargeted 不能绕过知乎专用一次点击门）")
+                appendStep("publish-decision", "runTargeted 的知乎回答提交已拦截；授权/未决账/WriteProof/绑定统一由专用门裁决")
+                return .strategySwitch
+            }
             switch SafetyPolicy.check(action, target) {
             case .manual:
                 record(action, suffix: "（未执行，请手动输入）")
@@ -2546,11 +2703,14 @@ struct OpenStall {
                 executionSerial += 1
                 try await web.execute(action, expected: target)
                 try await checkpoint(token)
+                if action.action == "click", let resolution = web.takeBlockerResolution() {
+                    appendStep("modal-resolution", "生产点击阻挡处理分账：\(resolution)")
+                }
                 lastStaleKey = nil
                 staleStreak = 0
                 // 台账记账点：打字成功先记内容（提交指纹来源），提交类点击
                 // 成功再落台账条目（说明经 pendingOutcomeStep 由调用方补步）
-                if action.action == "type" { noteTypedContent(action: action, element: target) }
+                if action.action == "type" { await noteTypedContent(action: action, element: target) }
                 if action.action == "click" {
                     if let outcome = noteSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url) {
                         pendingOutcomeStep = outcome.note
@@ -3822,7 +3982,7 @@ struct OpenStall {
     private func typeVerificationSuffix(for action: AgentAction, trace: [String], page: PageState) -> String {
         guard action.action == "type" else { return "" }
         if trace.contains(where: { $0.contains("committed-override") }) {
-            return "（已核实：Draft committed 包含所写全文，committed-override）"
+            return "（已核实：Draft committed 与整段源稿全文等值，committed-override）"
         }
         return trace.contains(where: { $0.contains("count-ok") }) ? "（已核实：全文与编辑器信号一致）" : ""
     }
@@ -3859,6 +4019,10 @@ struct OpenStall {
         guard let model = traceModel else { return }
         let page = tracePageBefore
         let actionObject = ((try? JSONSerialization.jsonObject(with: JSONEncoder().encode(action))) as? [String: Any]) ?? [:]
+        let proof = currentZhihuWriteProof
+        let publishRecord = matchedZhihuPublishRecord ?? proof.flatMap { p in
+            zhihuPublishRecords.last(where: { $0.taskID == p.taskID && $0.questionID == p.questionID && $0.expectedTextHash == p.expectedTextHash })
+        }
         let unknown: [String: Any] = ["observability": "unobservable", "value": NSNull()]
         let attempted = suffix.contains("未执行") ? "not-executed" : "attempted"
         let verified = traceInputStrategies.contains(where: { $0.contains("count-ok") || $0.contains("committed-override") }) ? "verified" : "unknown"
@@ -3875,7 +4039,11 @@ struct OpenStall {
                 "outputLimit": "not-sent", "stepLimit": limit
             ],
             "rawInput": [
-                "task": goal, "interjections": traceInterjection, "draftVersion": unknown,
+                "task": goal, "interjections": traceInterjection, "draftVersion": proof?.bodyVersion ?? "unobservable",
+                "publishAuthorization": ["authorized": currentZhihuAuthorization.authorized,
+                    "scopes": currentZhihuAuthorization.scopes, "revision": currentZhihuAuthorization.revision,
+                    "source": currentZhihuAuthorization.source, "reason": currentZhihuAuthorization.reason,
+                    "sourceInstruction": currentZhihuAuthorization.sourceInstruction],
                 "actualRequestBody": model.requestBody, "requestBodyAttachment": requestAttachment, "prompt": tracePrompt,
                 "historyBeforeFold": traceHistoryBefore, "historyAfterFold": traceHistoryAfter,
                 "segmentCharacterCounts": ["task": goal.count, "stateCard": traceStateCardBefore.count,
@@ -3889,7 +4057,7 @@ struct OpenStall {
                 "usage": model.usage ?? unknown, "parsedAction": actionObject, "completeText": action.text
             ],
             "actualExecution": [
-                "proposedAction": actionObject, "finalAction": actionObject, "rewriteReason": "none",
+                "proposedAction": actionObject, "finalAction": traceFinalAction ?? actionObject, "rewriteReason": traceRewriteReason,
                 "attemptStatus": attempted, "verificationResult": verified,
                 "tabID": web.executionTab.id.uuidString, "frame": unknown, "documentEpoch": page?.epoch.map { $0 as Any } ?? NSNull(),
                 "targetIdentity": action.index >= 0 ? "page-element-index:\(action.index)" : "not-applicable",
@@ -3900,6 +4068,17 @@ struct OpenStall {
                 "domTextBefore": page?.text ?? "unobservable", "domTextAfter": unknown,
                 "counterNode": unknown, "candidateState": unknown, "committedState": unknown,
                 "buttonState": page?.elements.filter { $0.tag == "button" }.map { ["index": $0.index, "text": $0.text, "disabled": $0.disabled] } ?? [],
+                "writeProof": proof.map { ["taskID": $0.taskID.uuidString, "tabID": $0.tabID.uuidString,
+                    "documentEpoch": $0.documentEpoch, "frameID": $0.frameID, "questionID": $0.questionID,
+                    "editorIdentity": $0.editorIdentity, "composerIdentity": $0.composerIdentity,
+                    "bodyVersion": $0.bodyVersion, "expectedTextHash": $0.expectedTextHash,
+                    "committedTextHash": $0.committedTextHash, "comparisonRule": $0.comparisonRule,
+                    "comparisonResult": $0.comparisonResult, "observedAt": ISO8601DateFormatter().string(from: $0.observedAt),
+                    "sourceText": $0.expectedText, "committedText": $0.committedText] } ?? unknown,
+                "publishBinding": currentZhihuPublishBinding.map { ["questionID": $0.questionID,
+                    "editorIdentity": $0.editorIdentity, "composerIdentity": $0.composerIdentity,
+                    "buttonIdentity": $0.buttonIdentity, "buttonIndex": $0.buttonIndex,
+                    "candidateCount": $0.candidateCount, "disabledObservation": $0.disabledSummary] } ?? unknown,
                 "saveSignal": unknown, "reopenedTextAfterSave": unknown,
                 "source": "PageState + execution trace", "observedAt": AgentTraceStore.shared.timestamp(),
                 "observability": ["afterDOM": "unobservable", "committedState": "unobservable"]
@@ -3907,19 +4086,28 @@ struct OpenStall {
             "stateAndResult": [
                 "stateCardBefore": traceStateCardBefore, "stateCardAfter": stateCard.promptBlock(),
                 "stateEvidenceSource": "program-maintained TaskStateCard", "nextRoundActualInput": "pending",
-                "finalBody": unknown, "draftOrPublishReceipt": unknown, "failureType": unknown,
+                "finalBody": proof?.expectedText ?? "unobservable",
+                "draftOrPublishReceipt": publishRecord.map { ["status": $0.status.rawValue,
+                    "clickCount": $0.clickCallCount, "answerLink": $0.answerURL ?? "",
+                    "author": $0.authorIdentity ?? "", "questionID": $0.questionID,
+                    "sourceText": $0.sourceText, "readbackFullText": $0.readbackText ?? "",
+                    "resultDetail": $0.resultDetail] } ?? unknown, "failureType": unknown,
                 "manualIntervention": suffix.contains("手动输入"),
                 "totalElapsedSeconds": runStartedAt.map { Date().timeIntervalSince($0) } ?? 0
             ]
         ]
         AgentTraceStore.shared.append(record)
         traceModel = nil
+        traceFinalAction = nil
+        traceRewriteReason = "none"
     }
 
     // MARK: - 成果台账（OUTCOME-LEDGER-2026-11-02.md）
 
     private static let outcomeLedgerKey = "outcomeLedger.v1"
     private static let taskClaimsKey = "taskStateClaims.v1"
+    private static let zhihuPublishLedgerKey = "zhihuPublishLedger.v1"
+    private static let zhihuAccountRegistryKey = "zhihuAccountRegistry.v1"
     private static let outcomeTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
@@ -3944,6 +4132,53 @@ struct OpenStall {
         if let data = try? JSONEncoder().encode(outcomeLedger) {
             UserDefaults.standard.set(data, forKey: Self.outcomeLedgerKey)
         }
+    }
+
+    private func loadZhihuPublishRecords() {
+        let key = zhihuPublishLedgerKeyOverride ?? Self.zhihuPublishLedgerKey
+        let registryKey = zhihuPublishLedgerKeyOverride.map { $0 + ".accounts" } ?? Self.zhihuAccountRegistryKey
+        if let data = UserDefaults.standard.data(forKey: registryKey),
+           let saved = try? JSONDecoder().decode(ZhihuAccountRegistry.self, from: data) {
+            zhihuAccountRegistry = saved
+        }
+        guard let data = UserDefaults.standard.data(forKey: key),
+              var records = try? JSONDecoder().decode([ZhihuPublishRecord].self, from: data) else { return }
+        zhihuAccountRegistry.migrate(records: &records)
+        zhihuPublishRecords = Self.prunedZhihuPublishRecords(records)
+        _ = saveZhihuPublishRecords()
+    }
+
+    /// 未决提交没有时间失效口径：unknown/review/attemptStarted 均永久保留，
+    /// 不能因为七天过去或终态条目挤满容量而重新获得点击资格。终态只留近 50 条。
+    private static func prunedZhihuPublishRecords(_ records: [ZhihuPublishRecord]) -> [ZhihuPublishRecord] {
+        let pending = records.filter { $0.status.isPending }
+        let pendingIDs = Set(pending.map(\.id))
+        let terminal = records.filter { !pendingIDs.contains($0.id) }
+        return (Array(terminal.suffix(50)) + pending).sorted { $0.attemptStartedAt < $1.attemptStartedAt }
+    }
+
+    /// 写后立即从同一持久化槽回读并逐项比对。失败时调用方不得执行发布 click。
+    @discardableResult private func saveZhihuPublishRecords() -> Bool {
+        let key = zhihuPublishLedgerKeyOverride ?? Self.zhihuPublishLedgerKey
+        let registryKey = zhihuPublishLedgerKeyOverride.map { $0 + ".accounts" } ?? Self.zhihuAccountRegistryKey
+        zhihuPublishRecords = Self.prunedZhihuPublishRecords(zhihuPublishRecords)
+        zhihuAccountRegistry.migrate(records: &zhihuPublishRecords)
+        guard let data = try? JSONEncoder().encode(zhihuPublishRecords),
+              let registryData = try? JSONEncoder().encode(zhihuAccountRegistry) else { return false }
+        UserDefaults.standard.set(data, forKey: key)
+        UserDefaults.standard.set(registryData, forKey: registryKey)
+        guard let stored = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([ZhihuPublishRecord].self, from: stored),
+              let storedRegistry = UserDefaults.standard.data(forKey: registryKey),
+              let decodedRegistry = try? JSONDecoder().decode(ZhihuAccountRegistry.self, from: storedRegistry) else { return false }
+        return decoded == zhihuPublishRecords && decodedRegistry == zhihuAccountRegistry
+    }
+
+    private func resolveZhihuAccount(_ pageIdentity: WebController.ZhihuPageIdentity) -> ZhihuAccountIdentity? {
+        let resolved = zhihuAccountRegistry.resolve(observedAliases: pageIdentity.accountAliases,
+            questionID: pageIdentity.questionID, records: zhihuPublishRecords)
+        if resolved != nil { _ = saveZhihuPublishRecords() }
+        return resolved
     }
 
     private func loadTaskClaims() {
@@ -4013,11 +4248,28 @@ struct OpenStall {
         let source = recentTyped.last(where: { $0.isEditor })?.text ?? recentTyped.last?.text ?? ""
         return SubmissionClassifier.contentFingerprint(of: source)
     }
-    private func noteTypedContent(action: AgentAction, element: PageElement) {
+    private func noteTypedContent(action: AgentAction, element: PageElement) async {
         guard !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let target = [element.text, element.ariaLabel, element.placeholder, element.name]
             .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? "（目标未名）"
-        stateCard.addWrite(target: target, body: action.text, verification: "verified")
+        var verification = traceInputStrategies.contains(where: { $0.contains("count-ok") || $0.contains("committed-override") }) ? "verified" : "unknown"
+        if element.editable, let taskID = conversationTaskID {
+            let proof = await web.captureZhihuWriteProof(action: action, taskID: taskID)
+            if let proof, proof.isValid {
+                currentZhihuWriteProof = proof
+                currentZhihuPublishBinding = nil
+                verification = "verified"
+                stateCard.setZhihuStatus(write: "已核实", publication: "未尝试")
+                appendStep("write-proof", "正文凭证已生成：task=\(taskID.uuidString)、tab=\(proof.tabID.uuidString)、epoch=\(proof.documentEpoch)、question=\(proof.questionID)、editor=\(proof.editorIdentity)、composer=\(proof.composerIdentity)、bodyVersion=\(proof.bodyVersion)、expectedHash=\(proof.expectedTextHash)、committedHash=\(proof.committedTextHash)、rule=\(proof.comparisonRule)、result=\(proof.comparisonResult)")
+            } else if currentZhihuAuthorization.allowsZhihuAnswer {
+                currentZhihuWriteProof = nil
+                currentZhihuPublishBinding = nil
+                stateCard.setZhihuStatus(write: "未核实", publication: "未尝试")
+                verification = "unknown"
+                appendStep("write-proof", "正文凭证未生成：目标 Draft committed 全文不可观测或与源稿不全等；计数、DOM 文本及旧任务 verified 均不放行发布")
+            }
+        }
+        stateCard.addWrite(target: target, body: action.text, verification: verification)
         let isEditor = element.editable || element.tag == "textarea"
         recentTyped.append((text: action.text, isEditor: isEditor))
         if recentTyped.count > 5 { recentTyped.removeFirst(recentTyped.count - 5) }
@@ -4294,6 +4546,613 @@ struct OpenStall {
         ]
     }
 
+    /// 自检六十四的引擎半边：直接经过主循环使用的动作改写入口与 prompt
+    /// 组装器，证明 wait/done 不能夺回发布决策，且历史折叠、超长页面 JSON
+    /// 不会吞掉每轮程序派生指令。现场在 defer 中逐项恢复。
+    func verifyZhihuPublishOrchestration() -> [String] {
+        let savedDecision = currentZhihuDecision
+        let savedDirective = currentZhihuDirective
+        let savedSteps = steps
+        let savedGoal = goal
+        defer {
+            currentZhihuDecision = savedDecision
+            currentZhihuDirective = savedDirective
+            steps = savedSteps
+            goal = savedGoal
+        }
+        currentZhihuDecision = .attemptOnce
+        currentZhihuDirective = ZhihuPublishDirective(writeStatus: "verified", publicationStatus: "ready_to_attempt",
+            publishTarget: "fixture-button", evidenceSource: "Draft committed full equality",
+            disabledObservation: "native=true, source=native-disabled",
+            disabledTrustForThisDecision: "non_blocking", nextAction: "attempt_publish_once", blockingReason: nil)
+        goal = "发布这个知乎回答"
+        steps = (1...20).map { AgentStep(id: $0, action: "observe", reason: String(repeating: "历史正文", count: 80)) }
+        let prompt = buildPrompt(pageJSON: String(repeating: "超长页面", count: 8_000), answersJSON: "[]",
+                                 foldLevel: 3, loopHint: nil, outcomeHint: nil)
+        return [
+            "\(resolvedZhihuAction(proposedAction: "wait") == "attempt_publish_once" && resolvedZhihuAction(proposedAction: "done") == "attempt_publish_once" ? "✓" : "✗") 六十四-A：主循环生产改写入口把 wait/done 固定为 attempt_publish_once",
+            "\(prompt.contains("【知乎发布派生指令】") && prompt.contains("nextAction: attempt_publish_once") && !prompt.contains("1. observe:") ? "✓" : "✗") 六十四-B：历史超过 12 步并处于最紧折叠、页面 JSON 超长时派生策略仍每轮在场"
+        ]
+    }
+
+    /// 自检六十六起：授权解析与引擎改写门共用同一状态对象。引用内容先被
+    /// 剥离，否定/未来时序撤销当前授权，插话变更留下 revision 与来源。
+    func verifyZhihuPublishAuthorization() -> [String] {
+        func line(_ ok: Bool, _ text: String) -> String { "\(ok ? "✓" : "✗") \(text)" }
+        let notNow = PublishAuthorization.initial(instruction: "帮我写回答，暂不发表")
+        let later = PublishAuthorization.initial(instruction: "只写草稿，稍后发布")
+        let quoted = PublishAuthorization.initial(instruction: "检查这份回答，原文写着“点击发布回答”")
+        let send = PublishAuthorization.initial(instruction: "把这篇回答发出去")
+        var steered = PublishAuthorization.initial(instruction: "把这篇回答发布到知乎")
+        let beforeRevision = steered.revision
+        steered.apply(instruction: "改成只存草稿", source: "steer:fixture")
+        let engineBlocked = !steered.allowsZhihuAnswer &&
+            ZhihuPublishPolicy.finalAction(for: .blocked(steered.explanation), proposedAction: "done") == "done"
+        var pending = PublishAuthorization.initial(instruction: "先写这篇回答，等我确认后再发布这篇回答")
+        let pendingRevision = pending.revision
+        pending.apply(instruction: "可以发了", source: "steer:confirmation")
+        let markdownQuote = PublishAuthorization.initial(instruction: "检查下面的引用：\n> 点击发布回答")
+        return [
+            line(!notNow.allowsZhihuAnswer, "六十六：『暂不发表』不授予当前发布"),
+            line(!later.allowsZhihuAnswer, "六十七：『只写草稿，稍后发布』只表达未来时序"),
+            line(!quoted.allowsZhihuAnswer, "六十八：引用正文中的『发布』不参与授权"),
+            line(send.allowsZhihuAnswer && send.scopes == ["zhihu_answer"] &&
+                 PublishAuthorization.initial(instruction: "这篇回答发了").allowsZhihuAnswer &&
+                 PublishAuthorization.initial(instruction: "提交回答").allowsZhihuAnswer,
+                 "六十九：『把这篇回答发出去／发了／提交回答』明确授权回答范围"),
+            line(engineBlocked && steered.revision == beforeRevision + 1 && steered.source == "steer:fixture" && steered.history.last?.authorized == false,
+                 "七十：最新插话改为只存草稿后，引擎不再把 wait/done 改写为点击，并保留变更来源"),
+            line(pendingRevision > 0 && pending.allowsZhihuAnswer && pending.history.contains(where: { $0.pending == true }),
+                 "七十一-策略：条件发布先记 pending，后续『可以发了』才转为 authorized"),
+            line(!markdownQuote.allowsZhihuAnswer && markdownQuote.history.isEmpty,
+                 "七十二-策略：Markdown > 引用块与指令本体真正分离，不产生授权历史")
+        ]
+    }
+
+    /// FIX6：受控动作源直接接入 launch() 生产主循环。这里不直接调用
+    /// noteTypedContent/attemptZhihuPublishOnce/runZhihuReadback；type→wait→连续
+    /// click→done 全由主循环消费。恢复分支创建新的 AgentEngine，并调用同一个
+    /// restoreSnapshot(for:) 生产入口。
+    func verifyZhihuProductionOrchestration() async -> [String] {
+        func line(_ ok: Bool, _ text: String) -> String { "\(ok ? "✓" : "✗") \(text)" }
+        func action(_ name: String, index: Int = -1, text: String = "", summary: String = "") throws -> AgentAction {
+            let data = try JSONSerialization.data(withJSONObject: ["action": name, "index": index,
+                "text": text, "reason": "FIX6 controlled production loop", "summary": summary])
+            return try JSONDecoder().decode(AgentAction.self, from: data)
+        }
+        func isDone(_ engine: AgentEngine) -> Bool { if case .done = engine.status { return true }; return false }
+        func isPaused(_ engine: AgentEngine) -> Bool { if case .paused = engine.status { return true }; return false }
+        func waitFor(_ predicate: @escaping () -> Bool, seconds: Double) async -> Bool {
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline {
+                if predicate() { return true }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            return predicate()
+        }
+        func prepareDirectory(_ sessionID: UUID) -> URL {
+            let directory = SessionStore.shared.snapshotURL(for: sessionID).deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        }
+        func configure(_ engine: AgentEngine, web: WebController, sessionID: UUID, taskID: UUID,
+                       goal: String, actions: [AgentAction], readbackBody: String? = nil) {
+            engine.runSessionID = sessionID
+            engine.goal = goal; engine.taskText = goal; engine.conversationTaskID = taskID
+            engine.stateCard = TaskStateCard(goal: goal); engine.steps = []; engine.stepSeq = 0
+            engine.limit = 25; engine.stepBudget = StepBudget(limit: 25)
+            engine.queuedTasks = []; engine.acceptedSteerQueueIDs = []
+            engine.currentZhihuWriteProof = nil; engine.currentZhihuPublishBinding = nil
+            engine.currentZhihuDecision = nil; engine.currentZhihuDirective = nil
+            engine.currentZhihuAuthorization = .initial(instruction: goal)
+            engine.matchedZhihuPublishRecord = nil
+            engine.controlledActions = actions; engine.controlledActionCursor = 0
+            engine.controlledZhihuReadback = true
+            engine.controlledZhihuReadbackBodyOverride = readbackBody
+            engine.controlledDidSuspendAfterZhihuClick = false
+            web.beginExecution(sessionID: sessionID)
+        }
+
+        var lines: [String] = []
+        let suffix = UUID().uuidString
+        let ledgerKey = "zhihuPublishLedger.selftest.fix6.\(suffix)"
+        let recoveryKey = "zhihuPublishLedger.selftest.recovery.\(suffix)"
+        let timeoutKey = "zhihuPublishLedger.selftest.timeout.\(suffix)"
+        var keys = [ledgerKey, recoveryKey, timeoutKey]
+        var directories: [URL] = []
+        defer {
+            for key in keys {
+                UserDefaults.standard.removeObject(forKey: key)
+                UserDefaults.standard.removeObject(forKey: key + ".accounts")
+            }
+            for directory in directories { try? FileManager.default.removeItem(at: directory) }
+        }
+
+        do {
+            let paragraph = "这是一段用于验证真实知乎发布链的长文。它保留中文标点、数字 2026、大小写 MikaWeb 和空格；每一段都必须由生产 type 路径写进 Draft，再由站点处理器实际接收，不能从测试期望值反向生成详情页。"
+            let body = (1...16).map { "第\($0)段：\(paragraph)" }.joined(separator: "\n\n")
+            guard body.count >= 1200 else { throw MikaError("五十六长文不足 1200 字") }
+
+            // 56 主回归：真正 launch() 消费 type→wait→连续 click→done。
+            let mainSession = UUID(), mainTask = UUID()
+            directories.append(prepareDirectory(mainSession))
+            let mainWeb = WebController()
+            mainWeb.beginExecution(sessionID: mainSession)
+            let mainFixture = try await mainWeb.loadZhihuEngineFixture()
+            let mainEngine = AgentEngine(web: mainWeb, settings: SettingsStore(),
+                                         zhihuPublishLedgerKeyOverride: ledgerKey, restoreSession: false)
+            configure(mainEngine, web: mainWeb, sessionID: mainSession, taskID: mainTask,
+                goal: "把这篇知乎回答发出去", actions: [
+                    try action("type", index: mainFixture.editor.index, text: body),
+                    try action("wait"), try action("click", index: -2),
+                    try action("click", index: -2), try action("done", summary: "自检链已收口")
+                ])
+            mainEngine.launch()
+            let mainDone = await waitFor({ isDone(mainEngine) }, seconds: 30)
+            let mainMetrics = await mainWeb.controlledZhihuFixtureMetrics()
+            let mainRecord = mainEngine.zhihuPublishRecords.last
+            let repeatedBlocked = mainEngine.steps.filter { $0.reason.contains("模型再次请求发布未执行") }.count >= 2
+            lines.append(line(mainDone && mainRecord?.status == .verifiedPublished,
+                              "五十六-引擎A：真实主循环完成 type→wait 改写→独立详情回读→done 结案"))
+            lines.append(line(mainRecord?.clickCallCount == 1 && mainMetrics.handlerCalls == 1 && mainMetrics.publishedBody == body,
+                              "五十六-引擎B：生产点击调用数=1、fixture handler 实收次数=1，详情正文因果来自实收长文（≥1200字）"))
+            lines.append(line(repeatedBlocked && mainEngine.stateCard.zhihuPublicationStatus == "已核实发布",
+                              "五十七/六十三：连续 click 输入均被同题账拦截，状态卡仅在独立回读后晋级"))
+
+            // 重复任务：只暴露 token，旧记录来自 id+token；无当前发布授权仍先查账。
+            let repeatSession = UUID(), repeatTask = UUID()
+            directories.append(prepareDirectory(repeatSession))
+            let repeatWeb = WebController(); repeatWeb.beginExecution(sessionID: repeatSession)
+            _ = try await repeatWeb.loadZhihuEngineFixture()
+            try await repeatWeb.exposeOnlyControlledZhihuAlias("engine-me-token")
+            let repeatEngine = AgentEngine(web: repeatWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: ledgerKey, restoreSession: false)
+            configure(repeatEngine, web: repeatWeb, sessionID: repeatSession, taskID: repeatTask,
+                goal: "继续，检查刚才是否发布成功", actions: [try action("done", summary: "检查完成")])
+            repeatEngine.launch()
+            let repeatDone = await waitFor({ isDone(repeatEngine) }, seconds: 10)
+            let repeatMetrics = await repeatWeb.controlledZhihuFixtureMetrics()
+            lines.append(line(repeatDone && repeatMetrics.handlerCalls == 0 &&
+                              repeatEngine.stateCard.zhihuPublicationStatus == "已核实发布" &&
+                              repeatEngine.stateCard.pinnedFacts.contains(where: { $0.contains("作者/问题/全文独立回读一致") }),
+                              "B.1/B.2/D.1：授权门前查旧账；id+token→仅 token 仍命中稳定账号，重复任务零新增点击并同步状态卡/结案证据"))
+            if var legacy = mainRecord {
+                legacy.accountIdentity = "engine-me-id|engine-me-token"
+                legacy.accountStableID = nil; legacy.accountAliases = nil
+                var legacyRecords = [legacy]
+                var registry = ZhihuAccountRegistry()
+                registry.migrate(records: &legacyRecords)
+                let partial = registry.resolve(observedAliases: ["engine-me-token"],
+                    questionID: legacy.questionID, records: legacyRecords)
+                lines.append(line(partial.flatMap { ZhihuPublishLedger.verified(account: $0,
+                    questionID: legacy.questionID, textHash: legacy.expectedTextHash,
+                    in: legacyRecords) }?.id == legacy.id,
+                    "B.2-迁移：FIX5 旧拼接键兼容读取后写入 stableID＋别名并集，仅 token 仍命中旧 verified 账"))
+
+                // Astra B② 指定的跨题缓存反例，三步按原序列执行：
+                // 1. 问题 4242 的旧 unknown 记录只保存 `me-id`；
+                // 2. 访问问题 9999，该页只暴露同账号 `me-token`，因该题无旧账，注册表允许建立另一个身份；
+                // 3. 返回问题 4242，页面仍只暴露 `me-token`，命中缓存直接返回，旧 `me-id` 未决记录匹配失败 → 漏账后可重新取得发布资格。
+                var oldUnknown = legacy
+                oldUnknown.id = UUID(); oldUnknown.accountIdentity = "me-id"
+                oldUnknown.accountStableID = nil; oldUnknown.accountAliases = ["me-id"]
+                oldUnknown.questionID = "4242"; oldUnknown.status = .unknown
+                oldUnknown.readbackCompletedAt = Date(); oldUnknown.clickCallCount = 1
+                var sequenceRecords = [oldUnknown]
+                var sequenceRegistry = ZhihuAccountRegistry()
+                sequenceRegistry.migrate(records: &sequenceRecords)
+                let crossQuestion = sequenceRegistry.resolve(observedAliases: ["me-token"],
+                    questionID: "9999", records: sequenceRecords)
+                let cachedReturn = sequenceRegistry.resolve(observedAliases: ["me-token"],
+                    questionID: "4242", records: sequenceRecords)
+                lines.append(line(sequenceRecords[0].accountAliases == ["me-id"],
+                    "七十三-1：问题 4242 的旧 unknown 记录只保存 `me-id`；"))
+                lines.append(line(crossQuestion != nil && sequenceRegistry.identities.count == 2,
+                    "七十三-2：访问问题 9999，该页只暴露同账号 `me-token`，因该题无旧账，注册表允许建立另一个身份；"))
+                lines.append(line(cachedReturn == nil,
+                    "七十三-3：返回问题 4242，页面仍只暴露 `me-token`，命中缓存仍先查同题旧 `me-id` 未决记录，缺少关联或区分证据时 fail-closed"))
+            } else {
+                lines.append("✗ B.2-迁移：主回归未产生可迁移记录")
+            }
+
+            // 57 + D.2：原生 disabled 与 disabled fieldset 同时在真实
+            // launch() 主循环中落一次 attempt。旧错误已进入点击前基线，
+            // handler 不执行，二次模型 click 输入也不得新增落账点击。
+            let disabledKey = "zhihuPublishLedger.selftest.disabled.\(suffix)"
+            keys.append(disabledKey)
+            let disabledSession = UUID(), disabledTask = UUID()
+            directories.append(prepareDirectory(disabledSession))
+            let disabledWeb = WebController(); disabledWeb.beginExecution(sessionID: disabledSession)
+            let disabledFixture = try await disabledWeb.loadZhihuEngineFixture(outcome: "native-disabled-fieldset-stale")
+            let disabledEngine = AgentEngine(web: disabledWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: disabledKey, restoreSession: false)
+            configure(disabledEngine, web: disabledWeb, sessionID: disabledSession, taskID: disabledTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: disabledFixture.editor.index, text: body),
+                    try action("wait"), try action("click", index: -2),
+                    try action("click", index: -2), try action("done", summary: "disabled 结果未知收口")
+                ])
+            disabledEngine.controlledZhihuReadback = false
+            disabledEngine.launch()
+            let disabledDone = await waitFor({ isDone(disabledEngine) }, seconds: 35)
+            let disabledMetrics = await disabledWeb.controlledZhihuFixtureMetrics()
+            let disabledRecord = disabledEngine.zhihuPublishRecords.last
+            let disabledObserved = disabledEngine.steps.contains {
+                $0.reason.contains("native=true") && $0.reason.contains("fieldset=true")
+            }
+            let disabledRepeatBlocks = disabledEngine.steps.filter {
+                $0.reason.contains("模型再次请求发布未执行")
+            }.count
+            lines.append(line(disabledDone && disabledObserved && disabledMetrics.handlerCalls == 0 &&
+                              disabledEngine.zhihuPublishRecords.count == 1 &&
+                              disabledRecord?.clickCallCount == 1 && disabledRepeatBlocks == 2 &&
+                              disabledRecord?.status == .unknown &&
+                              disabledEngine.stateCard.zhihuPublicationStatus == ZhihuPublishPolicy.unknownNotice,
+                              "五十七-引擎：native disabled＋fieldset 进入完整主循环；首次标准调用落账 1，handler=0，后续两个 click 输入新增落账点击=0，旧错误未被归因且以 unknown 结案"))
+
+            // 62：拒绝/审核都从真实 click handler 生成站点反馈，但在保守
+            // 规格下只能作为诊断；没有独立详情完整回读时统一 unknown。
+            for (mode, label) in [("rejected", "拒绝"), ("review", "审核")] {
+                let key = "zhihuPublishLedger.selftest.62.\(mode).\(suffix)"
+                keys.append(key)
+                let session = UUID(), task = UUID()
+                directories.append(prepareDirectory(session))
+                let outcomeWeb = WebController(); outcomeWeb.beginExecution(sessionID: session)
+                let fixture = try await outcomeWeb.loadZhihuEngineFixture(outcome: mode)
+                let outcomeEngine = AgentEngine(web: outcomeWeb, settings: SettingsStore(),
+                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                configure(outcomeEngine, web: outcomeWeb, sessionID: session, taskID: task,
+                    goal: "发布这篇知乎回答", actions: [
+                        try action("type", index: fixture.editor.index, text: body),
+                        try action("wait"), try action("done", summary: "\(label)场景结案")
+                    ])
+                if mode == "rejected" { outcomeEngine.controlledZhihuReadback = false }
+                outcomeEngine.launch()
+                let done = await waitFor({ isDone(outcomeEngine) }, seconds: 30)
+                let metrics = await outcomeWeb.controlledZhihuFixtureMetrics()
+                let record = outcomeEngine.zhihuPublishRecords.last
+                let oneAttempt = outcomeEngine.steps.filter { $0.action == "publish-attempt" }.count == 1
+                lines.append(line(done && metrics.handlerCalls == 1 && oneAttempt &&
+                                  record?.clickCallCount == 1 && record?.status == .unknown &&
+                                  outcomeEngine.stateCard.zhihuPublicationStatus == ZhihuPublishPolicy.unknownNotice,
+                                  "六十二-引擎\(label)：真实点击→attempted 落账→生产回读 unknown＋同题阻断→done 结案，handler=1、clickCallCount=1"))
+            }
+
+            // D.2：把“点击前隐藏、点击后首次可见”的真实拒绝接入 launch()。
+            // 观察器输出只作诊断；无独立详情完整回读必须 unknown 并保留阻断。
+            let revealKey = "zhihuPublishLedger.selftest.d2-reveal.\(suffix)"
+            keys.append(revealKey)
+            let revealSession = UUID(), revealTask = UUID()
+            directories.append(prepareDirectory(revealSession))
+            let revealWeb = WebController(); revealWeb.beginExecution(sessionID: revealSession)
+            let revealFixture = try await revealWeb.loadZhihuEngineFixture(outcome: "rejected-hidden-visible")
+            let revealEngine = AgentEngine(web: revealWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: revealKey, restoreSession: false)
+            configure(revealEngine, web: revealWeb, sessionID: revealSession, taskID: revealTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: revealFixture.editor.index, text: body),
+                    try action("wait"), try action("done", summary: "隐藏反馈拒绝场景结案")
+                ])
+            revealEngine.controlledZhihuReadback = false
+            revealEngine.launch()
+            let revealDone = await waitFor({ isDone(revealEngine) }, seconds: 30)
+            let revealMetrics = await revealWeb.controlledZhihuFixtureMetrics()
+            let revealRecord = revealEngine.zhihuPublishRecords.last
+            let revealAttempts = revealEngine.steps.filter { $0.action == "publish-attempt" }.count
+            lines.append(line(revealDone && revealMetrics.handlerCalls == 1 &&
+                              revealEngine.zhihuPublishRecords.count == 1 && revealAttempts == 1 &&
+                              revealRecord?.clickCallCount == 1 &&
+                              revealRecord?.status == .unknown &&
+                              revealEngine.stateCard.zhihuPublicationStatus == ZhihuPublishPolicy.unknownNotice,
+                              "七十七-引擎：隐藏→可见真实拒绝进入 launch() 主循环；总点击=1、unknown 账＋同题阻断、done 正常结案"))
+
+            // 63/64 恢复：第一次引擎真实点击落账后在回读前模拟进程退出。
+            let recoverySession = UUID(), recoveryTask = UUID()
+            directories.append(prepareDirectory(recoverySession))
+            let firstWeb = WebController(); firstWeb.beginExecution(sessionID: recoverySession)
+            let firstFixture = try await firstWeb.loadZhihuEngineFixture()
+            let firstEngine = AgentEngine(web: firstWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: recoveryKey, restoreSession: false)
+            configure(firstEngine, web: firstWeb, sessionID: recoverySession, taskID: recoveryTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: firstFixture.editor.index, text: body), try action("wait")
+                ])
+            firstEngine.controlledSuspendAfterZhihuClick = true
+            firstEngine.launch()
+            let suspended = await waitFor({ isPaused(firstEngine) }, seconds: 15)
+            let firstMetrics = await firstWeb.controlledZhihuFixtureMetrics()
+            let attempted = firstEngine.zhihuPublishRecords.last
+
+            let recoveredWeb = WebController()
+            let recoveredEngine = AgentEngine(web: recoveredWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: recoveryKey, restoreSession: false)
+            recoveredEngine.runSessionID = recoverySession
+            recoveredEngine.restoreSnapshot(for: recoverySession, allowLegacy: false)
+            recoveredEngine.queuedTasks = []; recoveredEngine.acceptedSteerQueueIDs = []
+            recoveredEngine.applyPendingTabRestore()
+            recoveredWeb.beginExecution(sessionID: recoverySession)
+            _ = try await recoveredWeb.loadZhihuEngineFixture()
+            recoveredEngine.controlledActions = [try action("click", index: -2),
+                try action("click", index: -2), try action("done", summary: "恢复回读完成")]
+            recoveredEngine.controlledActionCursor = 0
+            recoveredEngine.controlledZhihuReadback = true
+            recoveredEngine.controlledZhihuReadbackBodyOverride = firstMetrics.publishedBody
+            recoveredEngine.launch()
+            let recoveredDone = await waitFor({ isDone(recoveredEngine) }, seconds: 30)
+            let recoveredMetrics = await recoveredWeb.controlledZhihuFixtureMetrics()
+            let recoveredDetailCalls = await recoveredWeb.controlledZhihuDetailPublishCalls()
+            let recoveredRecord = recoveredEngine.zhihuPublishRecords.first(where: { $0.id == attempted?.id })
+            lines.append(line(suspended && firstMetrics.handlerCalls == 1 && attempted?.status == .attempted &&
+                              recoveredDone && recoveredRecord?.status == .verifiedPublished &&
+                              recoveredRecord?.clickCallCount == 1 && recoveredMetrics.handlerCalls == 0 &&
+                              recoveredDetailCalls == 0,
+                              "六十三/六十四：新 AgentEngine 经生产恢复入口只回读；恢复后连续 click 不重发，编辑器页 handler=0 且详情页 handler=0，原记录 clickCallCount 恒为 1"))
+
+            // 61：attempted 必须由真实点击链产生，再由新引擎跑满 20 秒窗口。
+            let timeoutSession = UUID(), timeoutTask = UUID()
+            directories.append(prepareDirectory(timeoutSession))
+            let timeoutFirstWeb = WebController(); timeoutFirstWeb.beginExecution(sessionID: timeoutSession)
+            let timeoutFixture = try await timeoutFirstWeb.loadZhihuEngineFixture()
+            let timeoutFirst = AgentEngine(web: timeoutFirstWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: timeoutKey, restoreSession: false)
+            configure(timeoutFirst, web: timeoutFirstWeb, sessionID: timeoutSession, taskID: timeoutTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: timeoutFixture.editor.index, text: body), try action("wait")
+                ])
+            timeoutFirst.controlledSuspendAfterZhihuClick = true
+            timeoutFirst.launch()
+            let timeoutSuspended = await waitFor({ isPaused(timeoutFirst) }, seconds: 15)
+            let timeoutAttempt = timeoutFirst.zhihuPublishRecords.last
+
+            let timeoutWeb = WebController()
+            let timeoutRecovered = AgentEngine(web: timeoutWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: timeoutKey, restoreSession: false)
+            timeoutRecovered.runSessionID = timeoutSession
+            timeoutRecovered.restoreSnapshot(for: timeoutSession, allowLegacy: false)
+            timeoutRecovered.queuedTasks = []; timeoutRecovered.acceptedSteerQueueIDs = []
+            timeoutRecovered.applyPendingTabRestore()
+            timeoutWeb.beginExecution(sessionID: timeoutSession)
+            _ = try await timeoutWeb.loadZhihuEngineFixture()
+            timeoutRecovered.controlledActions = [try action("click", index: -2), try action("done", summary: "未知结果收口")]
+            timeoutRecovered.controlledActionCursor = 0
+            timeoutRecovered.controlledZhihuReadback = true
+            timeoutRecovered.controlledZhihuReadbackBodyOverride = "与源稿不一致"
+            let timeoutStarted = Date()
+            timeoutRecovered.launch()
+            let timeoutDone = await waitFor({ isDone(timeoutRecovered) }, seconds: 35)
+            let timeoutElapsed = Date().timeIntervalSince(timeoutStarted)
+            let timeoutRecord = timeoutRecovered.zhihuPublishRecords.first(where: { $0.id == timeoutAttempt?.id })
+            let timeoutMetrics = await timeoutWeb.controlledZhihuFixtureMetrics()
+            lines.append(line(timeoutSuspended && timeoutDone && timeoutElapsed >= ZhihuPublishPolicy.readbackWindow - 0.5 &&
+                              timeoutRecord?.status == .unknown && timeoutRecord?.readbackCompletedAt != nil &&
+                              timeoutRecord?.clickCallCount == 1 && timeoutMetrics.handlerCalls == 0,
+                              "六十一：attempted 由真实点击链生成；新引擎真实 20 秒窗口收口 unknown，连续 click 仍零重发"))
+
+            // 76：点击已让站点 handler 执行，但 evaluateJavaScript 在
+            // click() 返回后抛异常。生产 catch 必须只进一次有界回读，
+            // 不重放点击，最终 unknown。该场景直接纳入“全套”调用的本函数。
+            let exceptionKey = "zhihuPublishLedger.selftest.exception.\(suffix)"
+            keys.append(exceptionKey)
+            let exceptionSession = UUID(), exceptionTask = UUID()
+            directories.append(prepareDirectory(exceptionSession))
+            let exceptionWeb = WebController(); exceptionWeb.beginExecution(sessionID: exceptionSession)
+            let exceptionFixture = try await exceptionWeb.loadZhihuEngineFixture()
+            try await exceptionWeb.injectControlledZhihuPostClickException()
+            let exceptionEngine = AgentEngine(web: exceptionWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: exceptionKey, restoreSession: false)
+            configure(exceptionEngine, web: exceptionWeb, sessionID: exceptionSession, taskID: exceptionTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: exceptionFixture.editor.index, text: body),
+                    try action("wait"), try action("done", summary: "异常后未知收口")
+                ], readbackBody: "异常场景的不匹配回读正文")
+            let exceptionStarted = Date()
+            exceptionEngine.launch()
+            let exceptionDone = await waitFor({ isDone(exceptionEngine) }, seconds: 35)
+            let exceptionElapsed = Date().timeIntervalSince(exceptionStarted)
+            let exceptionMetrics = await exceptionWeb.controlledZhihuFixtureMetrics()
+            let exceptionRecord = exceptionEngine.zhihuPublishRecords.last
+            let exceptionReadbacks = exceptionEngine.steps.filter { $0.action == "publish-readback" }.count
+            lines.append(line(exceptionDone && exceptionElapsed >= ZhihuPublishPolicy.readbackWindow - 0.5 &&
+                              exceptionMetrics.handlerCalls == 1 && exceptionRecord?.clickCallCount == 1 &&
+                              exceptionRecord?.clickResult.hasPrefix("call-failed-or-unknown") == true &&
+                              exceptionRecord?.status == .unknown && exceptionRecord?.readbackCompletedAt != nil &&
+                              exceptionReadbacks == 1 &&
+                              exceptionEngine.stateCard.zhihuPublicationStatus == ZhihuPublishPolicy.unknownNotice,
+                              "七十六：受控主循环点击后异常→一次 20 秒有界回读→unknown 结案；handler=1、回读收口步=1、点击总数恒为 1"))
+
+            // 59：动作已经从受控源排队，在主循环实际派发前改变 Draft committed。
+            let mutationSession = UUID(), mutationTask = UUID(), mutationKey = "zhihuPublishLedger.selftest.mutation.\(suffix)"
+            keys.append(mutationKey); directories.append(prepareDirectory(mutationSession))
+            let mutationWeb = WebController(); mutationWeb.beginExecution(sessionID: mutationSession)
+            let mutationFixture = try await mutationWeb.loadZhihuEngineFixture()
+            let mutationEngine = AgentEngine(web: mutationWeb, settings: SettingsStore(),
+                zhihuPublishLedgerKeyOverride: mutationKey, restoreSession: false)
+            configure(mutationEngine, web: mutationWeb, sessionID: mutationSession, taskID: mutationTask,
+                goal: "发布这篇知乎回答", actions: [
+                    try action("type", index: mutationFixture.editor.index, text: body),
+                    try action("wait"), try action("done", summary: "正文变化后未点击")
+                ])
+            mutationEngine.controlledActionWillDispatch = { cursor, _ in
+                if cursor == 1 {
+                    try await mutationWeb.mutateControlledZhihuBodyBeforeDispatch("派发前正文已变化")
+                }
+            }
+            mutationEngine.launch()
+            let mutationDone = await waitFor({ isDone(mutationEngine) }, seconds: 15)
+            let mutationMetrics = await mutationWeb.controlledZhihuFixtureMetrics()
+            lines.append(line(mutationDone && mutationMetrics.handlerCalls == 0 &&
+                              mutationEngine.zhihuPublishRecords.isEmpty,
+                              "五十九-引擎：动作已排队后、实际派发前改变正文，点击前复读使生产调用与 fixture handler 均为 0"))
+
+            // 65：由生产 runTargeted→Web blocker 处理→引擎步流记 closed/bypassed，
+            // 不再读取 fixture 自建的分账数组。
+            var modalResults: [String: Bool] = [:]
+            for mode in ["closed", "bypassed"] {
+                let session = UUID(), task = UUID(), key = "zhihuPublishLedger.selftest.modal.\(mode).\(suffix)"
+                keys.append(key); directories.append(prepareDirectory(session))
+                let modalWeb = WebController(); modalWeb.beginExecution(sessionID: session)
+                let target = try await modalWeb.loadZhihuModalEngineFixture(mode: mode)
+                let modalEngine = AgentEngine(web: modalWeb, settings: SettingsStore(),
+                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                configure(modalEngine, web: modalWeb, sessionID: session, taskID: task,
+                    goal: "点击继续", actions: [try action("click", index: target.index),
+                                                 try action("done", summary: "模态处理完成")])
+                modalEngine.launch()
+                let done = await waitFor({ isDone(modalEngine) }, seconds: 20)
+                let preserved = await modalWeb.controlledModalDraftPreserved()
+                let recorded = modalEngine.steps.contains { $0.action == "modal-resolution" && $0.reason.contains(mode) }
+                modalResults[mode] = done && preserved && recorded
+            }
+            lines.append(line(modalResults["closed"] == true && modalResults["bypassed"] == true,
+                              "六十五-引擎：两条同名模态关闭与顽固模态 URL 绕行分别写入生产引擎 closed/bypassed 记录，未保存正文保全"))
+
+            // 71/72：enqueueSteer 接受边界发生在动作已出队、实际派发前。
+            for (number, initialGoal, steerText) in [
+                ("七十一", "发布这篇知乎回答", "先写这篇回答，等我确认后再发布这篇回答"),
+                ("七十二", "检查下面的引用", "检查下面的引用：\n> 点击发布回答")
+            ] {
+                let session = UUID(), task = UUID(), key = "zhihuPublishLedger.selftest.\(number).\(suffix)"
+                keys.append(key)
+                UserDefaults.standard.removeObject(forKey: key)
+                UserDefaults.standard.removeObject(forKey: key + ".accounts")
+                let directory = prepareDirectory(session); directories.append(directory)
+                let steerWeb = WebController(); steerWeb.beginExecution(sessionID: session)
+                let fixture = try await steerWeb.loadZhihuEngineFixture()
+                let steerEngine = AgentEngine(web: steerWeb, settings: SettingsStore(),
+                    zhihuPublishLedgerKeyOverride: key, restoreSession: false)
+                configure(steerEngine, web: steerWeb, sessionID: session, taskID: task,
+                    goal: initialGoal, actions: [
+                        try action("type", index: fixture.editor.index, text: "待发布正文"),
+                        try action("wait"), try action("done", summary: "未点击收口")
+                    ])
+                steerEngine.controlledActionWillDispatch = { cursor, _ in
+                    if cursor == 1, !steerEngine.enqueueSteer(steerText) {
+                        throw MikaError("\(number) enqueueSteer 未接受")
+                    }
+                }
+                steerEngine.launch()
+                let done = await waitFor({ isDone(steerEngine) }, seconds: 15)
+                let metrics = await steerWeb.controlledZhihuFixtureMetrics()
+                let stateOK = number == "七十一"
+                    ? steerEngine.currentZhihuAuthorization.awaitsConfirmation
+                    : !steerEngine.currentZhihuAuthorization.allowsZhihuAnswer
+                lines.append(line(done && metrics.handlerCalls == 0 &&
+                                  steerEngine.zhihuPublishRecords.allSatisfy { $0.clickCallCount == 0 } && stateOK,
+                                  "\(number)：真实 enqueueSteer 插入已排队动作的派发前窗口，授权保持 \(number == "七十一" ? "pending" : "blocked")，生产/fixture 点击均为 0"))
+                UserDefaults.standard.removeObject(forKey: key)
+                UserDefaults.standard.removeObject(forKey: key + ".accounts")
+            }
+        } catch {
+            lines.append("✗ FIX6 生产编排异常：\(error.localizedDescription)")
+        }
+        return lines
+    }
+
+    /// FIX5：保留原有局部编排测试供源码回归；SelfTestView 不再把它冒充主循环证据。
+    /// 网页侧仍是 WKWebView/生产写入与点击/独立详情回读；账本使用临时
+    /// UserDefaults 槽完成真实序列化回读，不污染用户发布账或任务快照。
+    private func verifyZhihuLegacyOrchestration() async -> [String] {
+        let savedGoal = goal, savedTaskID = conversationTaskID, savedProof = currentZhihuWriteProof
+        let savedBinding = currentZhihuPublishBinding, savedDecision = currentZhihuDecision
+        let savedDirective = currentZhihuDirective, savedAuthorization = currentZhihuAuthorization
+        let savedMatched = matchedZhihuPublishRecord, savedRecords = zhihuPublishRecords
+        let savedStateCard = stateCard, savedSteps = steps, savedOverride = zhihuPublishLedgerKeyOverride
+        let savedControlled = controlledZhihuReadback, savedTraceFinal = traceFinalAction
+        let savedControlledBody = controlledZhihuReadbackBodyOverride
+        let savedRewrite = traceRewriteReason
+        let temporaryKey = "zhihuPublishLedger.selftest.\(UUID().uuidString)"
+        defer {
+            goal = savedGoal; conversationTaskID = savedTaskID; currentZhihuWriteProof = savedProof
+            currentZhihuPublishBinding = savedBinding; currentZhihuDecision = savedDecision
+            currentZhihuDirective = savedDirective; currentZhihuAuthorization = savedAuthorization
+            matchedZhihuPublishRecord = savedMatched; zhihuPublishRecords = savedRecords
+            stateCard = savedStateCard; steps = savedSteps; zhihuPublishLedgerKeyOverride = savedOverride
+            controlledZhihuReadback = savedControlled; traceFinalAction = savedTraceFinal
+            controlledZhihuReadbackBodyOverride = savedControlledBody
+            traceRewriteReason = savedRewrite
+            UserDefaults.standard.removeObject(forKey: temporaryKey)
+        }
+        func line(_ ok: Bool, _ text: String) -> String { "\(ok ? "✓" : "✗") \(text)" }
+        do {
+            let taskID = UUID(), token = generation
+            goal = "把这篇知乎回答发出去"
+            conversationTaskID = taskID
+            currentZhihuAuthorization = .initial(instruction: goal)
+            stateCard = TaskStateCard(goal: goal)
+            steps = []; zhihuPublishRecords = []; matchedZhihuPublishRecord = nil
+            zhihuPublishLedgerKeyOverride = temporaryKey
+            controlledZhihuReadback = true
+            let body = "FIX5 引擎编排第一段：计数观测可以为零。\n\n第二段：只有独立详情全文一致才结案。"
+            let (typeAction, _) = try await web.prepareZhihuEngineFixture(body: body, taskID: taskID)
+            let typedPage = try await web.state()
+            guard let editor = typedPage.elements.first(where: { $0.editable }) else { throw MikaError("受控编排找不到编辑器") }
+            await noteTypedContent(action: typeAction, element: editor)
+            let restoredProof = currentZhihuWriteProof.flatMap { try? JSONEncoder().encode($0) }.flatMap { try? JSONDecoder().decode(WriteProof.self, from: $0) }
+            let restoredAuthorization = (try? JSONEncoder().encode(currentZhihuAuthorization)).flatMap { try? JSONDecoder().decode(PublishAuthorization.self, from: $0) }
+            let restoredRoundTrip = restoredProof != nil && restoredAuthorization?.allowsZhihuAnswer == true
+            currentZhihuWriteProof = restoredProof
+            if let restoredAuthorization { currentZhihuAuthorization = restoredAuthorization }
+            var page = try await web.state()
+            page = await refreshZhihuPublishContext(page: page)
+            let actionData = try JSONSerialization.data(withJSONObject: ["action": "wait", "seconds": 1, "reason": "controlled model wait"])
+            let controlledAction = try JSONDecoder().decode(AgentAction.self, from: actionData)
+            let rewritten = resolvedZhihuAction(proposedAction: controlledAction.action) == "attempt_publish_once"
+            try await web.injectControlledZhihuPostClickException()
+            try await attemptZhihuPublishOnce(proposed: controlledAction, token: token)
+            let stored = UserDefaults.standard.data(forKey: temporaryKey).flatMap { try? JSONDecoder().decode([ZhihuPublishRecord].self, from: $0) }
+            let record = stored?.last
+            let firstCardVerified = stateCard.zhihuPublicationStatus == "已核实发布"
+            let timeoutID = UUID()
+            zhihuPublishRecords.append(ZhihuPublishRecord(id: timeoutID, taskID: taskID, runID: token,
+                accountIdentity: "engine-me", accountStableID: "zhacct-engine-me", accountAliases: ["engine-me"],
+                questionID: "4243", expectedTextHash: ZhihuPublishPolicy.hash("窗口源稿"),
+                bodyVersion: "timeout-fixture", sourceText: "窗口源稿", status: .attempted,
+                attemptStartedAt: Date(), clickCallCount: 1, clickResult: "standard-click-called",
+                answerID: nil, answerURL: nil, authorIdentity: nil, readbackText: nil,
+                resultDetail: "等待真实 20 秒有界回读"))
+            _ = saveZhihuPublishRecords()
+            controlledZhihuReadbackBodyOverride = "不匹配正文"
+            let timeoutStarted = Date()
+            let timeoutStatus = await runZhihuReadback(recordID: timeoutID, token: token)
+            let timeoutElapsed = Date().timeIntervalSince(timeoutStarted)
+            let timeoutRecord = zhihuPublishRecords.first(where: { $0.id == timeoutID })
+            let rebuiltRecords = UserDefaults.standard.data(forKey: temporaryKey).flatMap { try? JSONDecoder().decode([ZhihuPublishRecord].self, from: $0) } ?? []
+            var recoveryProof = currentZhihuWriteProof
+            recoveryProof?.questionID = "4243"
+            recoveryProof?.expectedText = "窗口源稿"
+            recoveryProof?.committedText = "窗口源稿"
+            recoveryProof?.expectedTextHash = ZhihuPublishPolicy.hash("窗口源稿")
+            recoveryProof?.committedTextHash = ZhihuPublishPolicy.hash("窗口源稿")
+            let rebuiltDecision = ZhihuPublishPolicy.shouldAttemptPublish(taskID: taskID,
+                authorization: currentZhihuAuthorization, proof: recoveryProof, binding: nil,
+                account: ZhihuAccountIdentity(stableID: "zhacct-engine-me", aliases: ["engine-me"]),
+                records: rebuiltRecords)
+            let rebuiltReadbackOnly: Bool
+            if case .readbackOnly = rebuiltDecision { rebuiltReadbackOnly = true } else { rebuiltReadbackOnly = false }
+            return [
+                line(currentZhihuWriteProof?.isValid == true, "五十六-引擎A：任务建立→生产写入→WriteProof 由 AgentEngine 状态接收"),
+                line(rewritten, "五十六-引擎B：受控模型 wait 被真实引擎改写为 attempt_publish_once"),
+                line(record?.clickCallCount == 1 && record?.status == .verifiedPublished && record?.clickResult.hasPrefix("call-failed-or-unknown") == true,
+                     "五十六-引擎C：落账→一次点击后异常注入→一次有界独立详情回读→已核实发布"),
+                line(firstCardVerified,
+                     "五十六-引擎D：结案状态卡只在独立详情回读后晋级"),
+                line(restoredRoundTrip && record?.clickCallCount == 1,
+                     "六十四-引擎：旧任务 proof/授权序列化恢复后，在生产编排内实际执行一次点击"),
+                line(timeoutStatus == .unknown && timeoutElapsed >= ZhihuPublishPolicy.readbackWindow - 0.5 &&
+                     timeoutRecord?.readbackCompletedAt != nil && timeoutRecord?.clickCallCount == 1,
+                     "六十一-引擎：真实 20 秒只读窗口耗尽收口 unknown，点击总次数仍为 1"),
+                line(rebuiltReadbackOnly,
+                     "六十三-引擎：发布记录序列化→重建后仍只允许回读，连续模型点击不能重放")
+            ]
+        } catch {
+            return ["✗ 五十六-引擎编排异常：\(error.localizedDescription)"]
+        }
+    }
+
+    private func resolvedZhihuAction(proposedAction: String) -> String {
+        ZhihuPublishPolicy.finalAction(for: currentZhihuDecision, proposedAction: proposedAction)
+    }
+
     /// 台账注入段：动作留痕、效果核查、模型自述分层表述。
     private func outcomePromptBlock() -> String {
         let records = Self.prunedOutcomes(outcomeLedger)
@@ -4392,6 +5251,367 @@ struct OpenStall {
         outcomeLedger.last.map { "\($0.host.isEmpty ? "本地页面" : $0.host) · \($0.contentPrefix.isEmpty ? "（无正文指纹）" : $0.contentPrefix) · \(Self.displayedOutcomeStatus($0.statusNote))" }
     }
 
+    private func syncZhihuStateCard(from record: ZhihuPublishRecord) {
+        stateCard.setZhihuStatus(write: record.sourceText.isEmpty ? "未核实" : "已核实",
+                                 publication: record.status.display)
+        let link = record.answerURL ?? "问题 \(record.questionID)"
+        let attempt = String(record.id.uuidString.prefix(8))
+        let evidence = "知乎回答：发布账命中 \(record.status.display)；attempt=\(attempt)；\(link)"
+        if !stateCard.completed.contains(where: { $0.contains("attempt=\(attempt)") }) {
+            stateCard.addCompleted(evidence)
+        }
+        if record.status == .verifiedPublished {
+            stateCard.pinFact("知乎回答结案证据：\(link)；作者/问题/全文独立回读一致")
+        }
+    }
+
+    /// 每轮页面快照后刷新知乎发布派生段。未决尝试优先于编辑器现场：即使
+    /// 点击后跳页或崩溃恢复，也只会回读，不会因失去按钮绑定而重新发布。
+    private func refreshZhihuPublishContext(page: PageState) async -> PageState {
+        var enriched = page
+        currentZhihuPublishBinding = nil
+        currentZhihuDecision = nil
+        currentZhihuDirective = nil
+        matchedZhihuPublishRecord = nil
+        guard let taskID = conversationTaskID else { return enriched }
+        let pageIdentity = await web.readZhihuPageIdentity()
+        let account = resolveZhihuAccount(pageIdentity)
+
+        // 查旧账位于首次发布授权门之前：撤销授权、"继续"或"检查是否发布成功"
+        // 都仍会按当前账号＋问题回读/报告；授权只控制新的 click。
+        if let account, let unresolved = ZhihuPublishLedger.pending(account: account,
+                                                                    questionID: pageIdentity.questionID,
+                                                                    in: zhihuPublishRecords) {
+            matchedZhihuPublishRecord = unresolved
+            syncZhihuStateCard(from: unresolved)
+            let decision = PublishDecision.readbackOnly("同题存在\(unresolved.status.display)记录")
+            currentZhihuDecision = decision
+            let next = unresolved.status.needsReadback && unresolved.readbackCompletedAt == nil
+                ? "readback_only" : "report_attempted_unverified"
+            let directive = ZhihuPublishDirective(writeStatus: currentZhihuWriteProof?.isValid == true ? "verified" : "historically_verified",
+                publicationStatus: unresolved.status.rawValue, publishTarget: "已尝试的同题回答",
+                evidenceSource: "persisted account+question ZhihuPublishRecord (independent of current WriteProof)",
+                disabledObservation: "not_applicable_after_attempt",
+                disabledTrustForThisDecision: "non_blocking", nextAction: next,
+                blockingReason: "同题未决提交禁止重复点击")
+            currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+            return enriched
+        }
+
+        let proof = currentZhihuWriteProof
+        if let account, let published = ZhihuPublishLedger.verified(account: account,
+            questionID: pageIdentity.questionID,
+            textHash: proof?.questionID == pageIdentity.questionID ? proof?.expectedTextHash : nil,
+            in: zhihuPublishRecords) {
+            matchedZhihuPublishRecord = published
+            syncZhihuStateCard(from: published)
+            currentZhihuDecision = .alreadyPublished("同题同文已有回答 \(published.answerURL ?? "")")
+            let directive = ZhihuPublishDirective(writeStatus: "verified", publicationStatus: "verifiedPublished",
+                publishTarget: published.answerURL ?? "稳定回答链接", evidenceSource: "independent full-answer readback",
+                disabledObservation: "not_applicable", disabledTrustForThisDecision: "non_blocking",
+                nextAction: "report_existing_answer", blockingReason: nil)
+            currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+            return enriched
+        }
+
+        if account == nil, zhihuPublishRecords.contains(where: { $0.questionID == pageIdentity.questionID }) {
+            currentZhihuDecision = .blocked("当前页账号别名与同题旧账无法确认连续性；保持阻断")
+            let directive = ZhihuPublishDirective(writeStatus: proof?.isValid == true ? "verified" : "unverified",
+                publicationStatus: "identity_unresolved", publishTarget: "unbound",
+                evidenceSource: "persisted account alias registry",
+                disabledObservation: "not_applicable", disabledTrustForThisDecision: "non_blocking",
+                nextAction: "resolve_account_identity", blockingReason: "账号连续性无法确认，禁止新点击")
+            currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+            return enriched
+        }
+
+        guard currentZhihuAuthorization.allowsZhihuAnswer else {
+            if currentZhihuAuthorization.awaitsConfirmation {
+                currentZhihuDecision = .blocked(currentZhihuAuthorization.explanation)
+                let directive = ZhihuPublishDirective(writeStatus: proof?.isValid == true ? "verified" : "unverified",
+                    publicationStatus: "pending_authorization", publishTarget: "condition_not_met",
+                    evidenceSource: "PublishAuthorization pending state",
+                    disabledObservation: "not_applicable", disabledTrustForThisDecision: "non_blocking",
+                    nextAction: "wait_for_user_confirmation", blockingReason: currentZhihuAuthorization.reason)
+                currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+            }
+            return enriched
+        }
+
+        guard let proof else { return enriched }
+
+        guard let refreshed = await web.revalidateZhihuWriteProof(proof) else {
+            currentZhihuWriteProof = nil
+            stateCard.setZhihuStatus(write: "未核实", publication: "未尝试")
+            currentZhihuDecision = .blocked("发布前复读发现页面代次、编辑器或正文版本已变化")
+            let directive = ZhihuPublishDirective(writeStatus: "invalidated", publicationStatus: "not_attempted",
+                publishTarget: "unbound", evidenceSource: "pre-publish committed reread",
+                disabledObservation: "unobserved", disabledTrustForThisDecision: "non_blocking",
+                nextAction: "relocate_and_reverify", blockingReason: "旧 WriteProof 已失效")
+            currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+            return enriched
+        }
+        currentZhihuWriteProof = refreshed
+        let binding = await web.bindZhihuPublishTarget(to: refreshed)
+        currentZhihuPublishBinding = binding
+        let decision = ZhihuPublishPolicy.shouldAttemptPublish(taskID: taskID, authorization: currentZhihuAuthorization,
+                                                               proof: refreshed, binding: binding,
+                                                               account: account,
+                                                               records: zhihuPublishRecords)
+        currentZhihuDecision = decision
+        let publicationStatus: String, target: String, disabled: String, next: String, reason: String?
+        switch decision {
+        case .attemptOnce:
+            publicationStatus = "ready_to_attempt"; target = binding?.buttonIdentity ?? "unbound"
+            disabled = binding?.disabledSummary ?? "unobserved"; next = "attempt_publish_once"; reason = nil
+        case .readbackOnly(let why):
+            publicationStatus = "attempted"; target = "existing attempt"; disabled = "not_applicable"; next = "readback_only"; reason = why
+        case .alreadyPublished(let why):
+            publicationStatus = "verifiedPublished"; target = "existing answer"; disabled = "not_applicable"; next = "report_existing_answer"; reason = why
+        case .blocked(let why):
+            publicationStatus = "not_ready"; target = binding?.buttonIdentity ?? "unbound"
+            disabled = binding?.disabledSummary ?? "unobserved"; next = "resolve_evidence_gap"; reason = why
+        }
+        let directive = ZhihuPublishDirective(writeStatus: "verified", publicationStatus: publicationStatus,
+            publishTarget: target, evidenceSource: "Draft committed full equality + unique composer binding",
+            disabledObservation: disabled, disabledTrustForThisDecision: "non_blocking",
+            nextAction: next, blockingReason: reason)
+        currentZhihuDirective = directive; enriched.zhihuPublishDirective = directive
+        return enriched
+    }
+
+    /// 同题已开始的发布只做只读回读。一个窗口最多 20 秒；窗口耗尽即记
+    /// 结果未知，后续任务仍被同题记录挡住，绝不会重放点击。
+    private func runZhihuReadback(recordID: UUID, token: UUID) async -> ZhihuPublishStatus {
+        guard let index = zhihuPublishRecords.firstIndex(where: {
+            $0.id == recordID && $0.status.needsReadback && $0.readbackCompletedAt == nil
+        })
+        else { return zhihuPublishRecords.first(where: { $0.id == recordID })?.status ?? .unknown }
+        let attempted = zhihuPublishRecords[index]
+        guard let account = ZhihuPublishLedger.identity(for: attempted), account.isResolved else {
+            zhihuPublishRecords[index].status = .unknown
+            zhihuPublishRecords[index].resultDetail = "旧记录缺少账号键，不能跨账号补造回读绑定"
+            _ = saveZhihuPublishRecords()
+            return .unknown
+        }
+        let target = ZhihuReadbackTarget(questionID: attempted.questionID,
+            expectedTextHash: attempted.expectedTextHash, sourceText: attempted.sourceText,
+            accountIdentity: account.stableID, accountAliases: account.aliases,
+            attemptID: attempted.id, taskID: attempted.taskID)
+        if controlledZhihuReadback {
+            do { try await web.openControlledZhihuDetail(target, bodyOverride: controlledZhihuReadbackBodyOverride) }
+            catch {
+                zhihuPublishRecords[index].status = .unknown
+                zhihuPublishRecords[index].readbackCompletedAt = Date()
+                zhihuPublishRecords[index].resultDetail = "受控独立详情页未能建立：\(error.localizedDescription)"
+                _ = saveZhihuPublishRecords()
+                return .unknown
+            }
+        }
+        let deadline = Date().addingTimeInterval(ZhihuPublishPolicy.readbackWindow)
+        var last = ZhihuPublicationEvidence(status: .unknown, questionID: "", answerID: "", answerURL: "",
+            currentAccountIdentity: "", authorIdentity: "", bodyText: "", fullTextEqual: false,
+            pageState: "unobservable", rejectionText: "", observedAt: Date())
+        var openedDetail = false
+        while Date() < deadline {
+            do { try await checkpoint(token) } catch { return .unknown }
+            last = await web.readZhihuPublication(for: target)
+            let verdict = ZhihuAnswerVerifier.judge(last, target: target)
+            let currentURL = web.executionTab.webView.url?.absoluteString ?? ""
+            let alreadyOnDetail = controlledZhihuReadback ||
+                (!last.answerID.isEmpty && currentURL.contains("/answer/\(last.answerID)"))
+            // 列表页只发现候选。稳定链接出现后优先打开独立详情页，随后
+            // 再次满足题目、作者、全文与页面状态才允许晋级。
+            if !last.answerURL.isEmpty, !alreadyOnDetail, !openedDetail {
+                do {
+                    let sourceID = web.executionTab.id
+                    let tab = try web.openTabForExecution(urlString: last.answerURL)
+                    if let taskID = conversationTaskID {
+                        _ = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "zhihu-answer-detail")
+                    }
+                    openedDetail = true
+                    try? await Task.sleep(for: .milliseconds(500))
+                    continue
+                } catch { /* 保留当前页继续只读探测，但不得在列表页晋级 */ }
+            }
+            if verdict == .verifiedPublished {
+                if !alreadyOnDetail {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    continue
+                }
+                zhihuPublishRecords[index].status = verdict
+                zhihuPublishRecords[index].answerID = last.answerID.isEmpty ? nil : last.answerID
+                zhihuPublishRecords[index].answerURL = last.answerURL.isEmpty ? nil : last.answerURL
+                zhihuPublishRecords[index].authorIdentity = last.authorIdentity.isEmpty ? nil : last.authorIdentity
+                zhihuPublishRecords[index].readbackText = last.bodyText
+                zhihuPublishRecords[index].readbackCompletedAt = Date()
+                zhihuPublishRecords[index].resultDetail = "question/author/full-body readback matched; pageState=\(last.pageState)"
+                _ = saveZhihuPublishRecords()
+                stateCard.setZhihuStatus(write: "已核实", publication: verdict.display)
+                AgentTraceStore.shared.appendEngineAction(action: "zhihu-publish-readback",
+                    targetFingerprint: last.answerID.isEmpty ? target.questionID : last.answerID,
+                    method: "question-author-full-body", result: verdict.rawValue,
+                    pageURL: last.answerURL, taskID: target.taskID.uuidString, runID: token.uuidString,
+                    evidence: ["questionID": last.questionID, "answerLink": last.answerURL,
+                               "currentAccount": last.currentAccountIdentity, "author": last.authorIdentity,
+                               "sourceText": target.sourceText, "readbackFullText": last.bodyText,
+                               "fullTextEqual": last.fullTextEqual, "pageState": last.pageState])
+                appendStep("publish-readback", "知乎回答回读：\(verdict.display)；answerID=\(last.answerID)、link=\(last.answerURL)、question=\(last.questionID)、currentAccount=\(last.currentAccountIdentity)、author=\(last.authorIdentity)、fullTextEqual=\(last.fullTextEqual)、pageState=\(last.pageState)\(last.rejectionText.isEmpty ? "" : "、rejection=\(last.rejectionText)")")
+                return verdict
+            }
+            if !openedDetail, !last.answerURL.isEmpty,
+               last.answerURL != web.executionTab.webView.url?.absoluteString {
+                do {
+                    let sourceID = web.executionTab.id
+                    let tab = try web.openTabForExecution(urlString: last.answerURL)
+                    if let taskID = conversationTaskID {
+                        _ = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "zhihu-answer-detail")
+                    }
+                    openedDetail = true
+                } catch { /* 保留当前页继续只读回读 */ }
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        zhihuPublishRecords[index].status = .unknown
+        zhihuPublishRecords[index].answerID = last.answerID.isEmpty ? nil : last.answerID
+        zhihuPublishRecords[index].answerURL = last.answerURL.isEmpty ? nil : last.answerURL
+        zhihuPublishRecords[index].authorIdentity = last.authorIdentity.isEmpty ? nil : last.authorIdentity
+        zhihuPublishRecords[index].readbackText = last.bodyText
+        zhihuPublishRecords[index].readbackCompletedAt = Date()
+        zhihuPublishRecords[index].resultDetail = ZhihuPublishPolicy.unknownNotice
+        _ = saveZhihuPublishRecords()
+        stateCard.setZhihuStatus(write: "已核实", publication: ZhihuPublishPolicy.unknownNotice)
+        AgentTraceStore.shared.appendEngineAction(action: "zhihu-publish-readback",
+            targetFingerprint: target.questionID, method: "bounded-read-only-20s", result: "unknown",
+            pageURL: last.answerURL, taskID: target.taskID.uuidString, runID: token.uuidString,
+            evidence: ["questionID": last.questionID, "answerLink": last.answerURL,
+                       "sourceText": target.sourceText, "readbackFullText": last.bodyText,
+                       "author": last.authorIdentity, "fullTextEqual": last.fullTextEqual])
+        appendStep("publish-readback", "\(ZhihuPublishPolicy.unknownNotice) 点击未重放。现场 answerLink=\(last.answerURL.isEmpty ? "无" : last.answerURL)、author=\(last.authorIdentity.isEmpty ? "不可观测" : last.authorIdentity)、fullTextEqual=\(last.fullTextEqual)")
+        return .unknown
+    }
+
+    /// 将模型动作改写为引擎的一次发布尝试。attemptStarted 必须先持久化；
+    /// 专用 Web 路径只调用一次标准 click()，随后立即进入有界回读。
+    private func attemptZhihuPublishOnce(proposed action: AgentAction, token: UUID) async throws {
+        guard let taskID = conversationTaskID, token == generation, let oldProof = currentZhihuWriteProof else {
+            currentZhihuDecision = .blocked("点击前任务代次、正文版本或按钮绑定复核未通过")
+            appendStep("publish-decision", "首次发布尝试未执行：点击前任务代次、正文版本或唯一按钮绑定复核未通过")
+            return
+        }
+        guard let proof = await web.revalidateZhihuWriteProof(oldProof) else {
+            currentZhihuDecision = .blocked("点击前正文复读失败")
+            return
+        }
+        try await checkpoint(token)
+        guard conversationTaskID == taskID, let binding = await web.bindZhihuPublishTarget(to: proof) else {
+            currentZhihuDecision = .blocked("点击前按钮绑定失败")
+            return
+        }
+        try await checkpoint(token)
+        let pageIdentity = await web.readZhihuPageIdentity()
+        let account = resolveZhihuAccount(pageIdentity)
+        try await checkpoint(token)
+        guard conversationTaskID == taskID, currentZhihuAuthorization.allowsZhihuAnswer,
+              ZhihuPublishPolicy.shouldAttemptPublish(taskID: taskID, authorization: currentZhihuAuthorization,
+                proof: proof, binding: binding, account: account,
+                records: zhihuPublishRecords) == .attemptOnce else {
+            currentZhihuDecision = .blocked("点击前授权、账号未决账或绑定复核未通过：\(currentZhihuAuthorization.explanation)")
+            appendStep("publish-decision", "首次发布尝试未执行：\(currentZhihuAuthorization.explanation)")
+            return
+        }
+        let safetyPage = try await web.state()
+        try await checkpoint(token)
+        guard let safetyTarget = safetyPage.elements.first(where: { $0.index == binding.buttonIndex }) else {
+            currentZhihuDecision = .blocked("安全复核时目标已变化")
+            return
+        }
+        let safetyAllowed: Bool
+        switch SafetyPolicy.check(action, safetyTarget) { case .allow: safetyAllowed = true; default: safetyAllowed = false }
+        guard safetyAllowed else {
+            currentZhihuDecision = .blocked("现有 SafetyPolicy 要求确认或目标已变化")
+            appendStep("publish-decision", "首次发布尝试未执行：专用路径未通过现有授权守卫")
+            return
+        }
+        // 两个关键 await（proof 复读、按钮绑定）及安全快照之后、落账之前，
+        // 再核对任务代次/取消和最新插话授权。
+        try await checkpoint(token)
+        guard conversationTaskID == taskID, currentZhihuAuthorization.allowsZhihuAnswer else { return }
+        guard let account else {
+            currentZhihuDecision = .blocked("落账前账号连续性无法确认")
+            return
+        }
+        let recordID = UUID()
+        let record = ZhihuPublishRecord(id: recordID, taskID: taskID, runID: token,
+            accountIdentity: pageIdentity.accountIdentity, accountStableID: account.stableID,
+            accountAliases: account.aliases, questionID: proof.questionID, expectedTextHash: proof.expectedTextHash,
+            bodyVersion: proof.bodyVersion, sourceText: proof.expectedText, status: .attemptStarted,
+            attemptStartedAt: Date(), clickCallCount: 0, clickResult: "not-called",
+            answerID: nil, answerURL: nil, authorIdentity: nil, readbackText: nil,
+            resultDetail: "attemptStarted 已持久化，尚未调用 click")
+        zhihuPublishRecords.append(record)
+        guard saveZhihuPublishRecords() else {
+            zhihuPublishRecords.removeAll { $0.id == recordID }
+            throw MikaError("发布 attemptStarted 持久化失败，按策略未点击")
+        }
+        if zhihuPublishLedgerKeyOverride == nil { persistSnapshot() }
+        traceFinalAction = ["action": "attempt_publish_once", "buttonIndex": binding.buttonIndex,
+                            "buttonIdentity": binding.buttonIdentity, "questionID": proof.questionID]
+        traceRewriteReason = "WriteProof 有效且按钮归属唯一；disabled/计数/编辑提示为 non_blocking"
+        appendStep("publish-decision", "原动作=\(action.action)，最终动作=attempt_publish_once；改写原因：\(traceRewriteReason)。按钮归属 question=\(binding.questionID)、editor=\(binding.editorIdentity)、composer=\(binding.composerIdentity)、button=\(binding.buttonIdentity)；disabled 观测：\(binding.disabledSummary)")
+        // attemptStarted 已持久化后仍做最后一次授权/代次复核。若此刻被撤销，
+        // 保留未决账防止恢复误点，但绝不调用 click。
+        try await checkpoint(token)
+        guard conversationTaskID == taskID, currentZhihuAuthorization.allowsZhihuAnswer else {
+            if let i = zhihuPublishRecords.firstIndex(where: { $0.id == recordID }) {
+                zhihuPublishRecords[i].status = .unknown
+                zhihuPublishRecords[i].readbackCompletedAt = Date()
+                zhihuPublishRecords[i].resultDetail = "落账后点击前授权被撤销或代次过期；click 未调用"
+            }
+            _ = saveZhihuPublishRecords()
+            return
+        }
+        executionSerial += 1
+        do {
+            let result = try await web.attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: recordID)
+            if let i = zhihuPublishRecords.firstIndex(where: { $0.id == recordID }) {
+                zhihuPublishRecords[i].status = .attempted
+                zhihuPublishRecords[i].clickCallCount = 1
+                zhihuPublishRecords[i].clickResult = result
+                zhihuPublishRecords[i].resultDetail = "标准 click() 已调用一次，等待独立回读"
+            }
+            _ = saveZhihuPublishRecords()
+            stateCard.setZhihuStatus(write: "已核实", publication: "已尝试")
+            AgentTraceStore.shared.appendEngineAction(action: "attempt_publish_once",
+                targetFingerprint: binding.buttonIdentity, method: "standard-click-once",
+                result: result, pageURL: web.executionTab.webView.url?.absoluteString ?? "",
+                taskID: taskID.uuidString, runID: token.uuidString,
+                evidence: ["questionID": proof.questionID, "editorIdentity": proof.editorIdentity,
+                           "composerIdentity": proof.composerIdentity, "bodyVersion": proof.bodyVersion,
+                           "comparisonRule": proof.comparisonRule, "comparisonResult": proof.comparisonResult,
+                           "disabledObservation": binding.disabledSummary, "clickCount": 1,
+                           "sourceText": proof.expectedText, "committedText": proof.committedText])
+            record(action, suffix: "（引擎改写为 attempt_publish_once；标准 click() 调用一次）")
+            appendStep("publish-attempt", "发布尝试已执行：clickCallCount=1、result=\(result)；不进入通用重扫/模态升级/自动重试")
+            if controlledSuspendAfterZhihuClick {
+                controlledDidSuspendAfterZhihuClick = true
+                return
+            }
+            _ = await runZhihuReadback(recordID: recordID, token: token)
+        } catch {
+            if let i = zhihuPublishRecords.firstIndex(where: { $0.id == recordID }) {
+                zhihuPublishRecords[i].status = .unknown
+                zhihuPublishRecords[i].clickCallCount = 1
+                zhihuPublishRecords[i].clickResult = "call-failed-or-unknown: \(error.localizedDescription)"
+                zhihuPublishRecords[i].resultDetail = ZhihuPublishPolicy.unknownNotice
+            }
+            _ = saveZhihuPublishRecords()
+            stateCard.setZhihuStatus(write: "已核实", publication: ZhihuPublishPolicy.unknownNotice)
+            appendStep("publish-attempt", "点击调用返回异常：\(error.localizedDescription)。\(ZhihuPublishPolicy.unknownNotice) 立即进入一次有界回读，不重放")
+            _ = await runZhihuReadback(recordID: recordID, token: token)
+        }
+    }
+
     // MARK: - prompt 组装：状态卡、确定性折叠与预算（H1）
 
     /// 状态卡的派生字段刷新：待办/未决问题/台账引用都由当前引擎状态直接
@@ -4401,6 +5621,7 @@ struct OpenStall {
     private func refreshStateCard() {
         if goal.isEmpty { return }
         if stateCard.goal != goal { stateCard.goal = goal }
+        if let matchedZhihuPublishRecord { syncZhihuStateCard(from: matchedZhihuPublishRecord) }
         switch waitingInput {
         case .question(_, let text): stateCard.openQuestions = [text]
         default: stateCard.openQuestions = []
@@ -4457,6 +5678,9 @@ struct OpenStall {
             let claimsBlock = stateCard.claimPromptBlock(currentTaskID: taskID)
             if !claimsBlock.isEmpty { prompt += claimsBlock + "\n" }
         }
+        // FIX4：程序派生的发布指令每轮单独注入，不依赖历史步骤，因而
+        // 历史折叠超过 12 步或页面 JSON 截断也不会丢失。
+        if let currentZhihuDirective { prompt += currentZhihuDirective.promptBlock() + "\n" }
         // 中断恢复的续跑提示（RESUME-CONTEXT-FIX）：恢复会话的每一轮都带上
         // ——原页面恢复结果＋不得反问目标／网址／进度的硬性口径，直到会话
         // 终结或新任务开始才清除。
@@ -4643,6 +5867,7 @@ struct OpenStall {
         var waiting: WaitingDTO?
         var answersJSON: String // [QuestionAnswer] 的 JSON
         var skillNames: [String]? // 已加载 playbook 名（正文恢复时按名从 SkillStore 重读；可选字段，旧快照无此键照常解码）
+        var skillVersions: [String: String]? = nil
         // v2 起（RESUME-CONTEXT-FIX）：工作现场——对话任务标识（恢复后沿用原
         // taskID，对话层的持久化去重才跨进程成立）与全部标签页地址＋当前页／
         // 执行页下标（页面本身不可序列化，只存地址，恢复时重新导航）。全部
@@ -4663,6 +5888,11 @@ struct OpenStall {
         // 两键照常解码（无卡时恢复路径按步流派生一张，见 restoreSnapshotIfNeeded）。
         var stateCard: TaskStateCard?
         var sessionID: UUID?
+        // FIX4：当前正文凭证与发布尝试账随任务快照双写。尝试账另有 App
+        // 级持久化，恢复时按 id 合并；旧快照无键照常解码。
+        var zhihuWriteProof: WriteProof? = nil
+        var zhihuPublishRecords: [ZhihuPublishRecord]? = nil
+        var zhihuPublishAuthorization: PublishAuthorization? = nil
         // F1 起：待决网页上传的等待现场（仅 statusKind=waitingManual 且上传
         // 等待中才有值）。可选字段，此前快照无此键照常解码。SP-01 一次性
         // 凭据不落盘：恢复时若原阶段是选文件且文件非本任务生成，退回确认
@@ -4786,11 +6016,15 @@ struct OpenStall {
                                        pendingActionJSON: pendingJSON, pendingElement: pendingElement, pendingURL: pendingURL,
                                        waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
                                        skillNames: loadedSkillNames,
+                                       skillVersions: loadedSkillVersions,
                                        taskID: conversationTaskID,
                                        tabURLs: scene.urls, activeTabIndex: scene.activeIndex, executionTabIndex: scene.executionIndex, tabPinned: scene.pinned,
                                        outcomes: outcomeLedger,
                                        stateCard: stateCard,
                                        sessionID: runSessionID,
+                                       zhihuWriteProof: currentZhihuWriteProof,
+                                       zhihuPublishRecords: zhihuPublishRecords,
+                                       zhihuPublishAuthorization: currentZhihuAuthorization,
                                        upload: pendingUpload.map { upload in
                                            SessionSnapshot.UploadDTO(attachmentID: upload.attachmentID, attachmentName: upload.attachmentName,
                                                                      isTaskGenerated: upload.isTaskGenerated, pageURL: upload.pageURL,
@@ -4902,12 +6136,24 @@ struct OpenStall {
             for step in snapshot.steps { derived.addCompleted("\(step.action)：\(step.reason)") }
             stateCard = derived
         }
+        currentZhihuWriteProof = snapshot.zhihuWriteProof
+        currentZhihuAuthorization = snapshot.zhihuPublishAuthorization ?? .initial(instruction: snapshot.goal)
+        if let savedPublish = snapshot.zhihuPublishRecords {
+            var changed = false
+            for record in savedPublish where !zhihuPublishRecords.contains(where: { $0.id == record.id }) {
+                zhihuPublishRecords.append(record); changed = true
+            }
+            if changed { _ = saveZhihuPublishRecords() }
+        }
         if let answers = try? JSONDecoder().decode([QuestionAnswer].self, from: Data(snapshot.answersJSON.utf8)) { answerContext = answers }
         if let names = snapshot.skillNames {
             for name in names {
                 if let skill = SkillStore.shared.skill(named: name), !loadedSkillNames.contains(skill.name) {
                     loadedSkillNames.append(skill.name)
-                    loadedSkillBodies += "\n【playbook：\(skill.name)】\n\(skill.body)"
+                    loadedSkillVersions[skill.name] = skill.version
+                    // 快照只声明当时版本；恢复始终按名称读取当前安装版本，
+                    // 不继续注入快照时代的旧 loadedSkillBodies。
+                    loadedSkillBodies += "\n【playbook：\(skill.name) v\(skill.version)】\n\(skill.body)"
                 }
             }
         }
@@ -5003,9 +6249,10 @@ struct OpenStall {
         generation = UUID(); worker?.cancel(); worker = nil; pending = nil
         goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         lastStaleKey = nil; staleStreak = 0; transientStreak = 0
-        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillBodies = ""
+        loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillVersions = [:]; loadedSkillBodies = ""
         conversationTaskID = nil; pendingSteers = []; sessionActive = false; status = .idle
         pendingTabScene = nil; restoredSession = false; didApplyTabRestore = false; resumeNote = nil
+        currentZhihuWriteProof = nil; currentZhihuPublishBinding = nil; currentZhihuDecision = nil; currentZhihuDirective = nil
         discardPendingUpload()
         // 成果台账的内存态同样清掉（打字记录／软门已提醒集合／未消费提醒），
         // 恢复后只剩快照里双写的那份台账——与真机强退重开同一口径

@@ -45,6 +45,16 @@ struct Coverage: Codable, Equatable {
     let truncated: Bool
 }
 
+/// 按钮禁用信号的原始观测。PageElement.disabled 保留兼容读数；这里把
+/// native、disabled fieldset 与 aria 来源拆开，供发布策略标注可信度。
+struct ButtonDisabledObservation: Codable, Equatable {
+    let index: Int
+    let nativeDisabled: Bool
+    let disabledFieldset: Bool
+    let ariaDisabled: Bool
+    let source: String
+}
+
 struct PageState: Codable {
     let url, title, text: String
     let elements: [PageElement]
@@ -57,15 +67,24 @@ struct PageState: Codable {
     var overlayNotes: [String] = []
     var coverage: Coverage?
     var epoch: Int?
+    var buttonDisabledObservations: [ButtonDisabledObservation] = []
+    /// 引擎基于 WriteProof 与唯一按钮绑定生成；不是 DOM 身份字段，绝不
+    /// 参与 WebController.guardScript 的逐字段元素比较。
+    var zhihuPublishDirective: ZhihuPublishDirective?
     var coverageComplete: Bool { coverage?.truncated != true }
     enum CodingKeys: String, CodingKey {
         case url, title, text, elements
         case overlayNotes = "overlays"
         case coverage
         case epoch
+        case buttonDisabledObservations
+        case zhihuPublishDirective
     }
-    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = [], coverage: Coverage? = nil, epoch: Int? = nil) {
+    init(url: String, title: String, text: String, elements: [PageElement], overlayNotes: [String] = [], coverage: Coverage? = nil, epoch: Int? = nil,
+         buttonDisabledObservations: [ButtonDisabledObservation] = [], zhihuPublishDirective: ZhihuPublishDirective? = nil) {
         self.url = url; self.title = title; self.text = text; self.elements = elements; self.overlayNotes = overlayNotes; self.coverage = coverage; self.epoch = epoch
+        self.buttonDisabledObservations = buttonDisabledObservations
+        self.zhihuPublishDirective = zhihuPublishDirective
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -76,6 +95,8 @@ struct PageState: Codable {
         overlayNotes = try c.decodeIfPresent([String].self, forKey: .overlayNotes) ?? []
         coverage = try c.decodeIfPresent(Coverage.self, forKey: .coverage)
         epoch = try c.decodeIfPresent(Int.self, forKey: .epoch)
+        buttonDisabledObservations = try c.decodeIfPresent([ButtonDisabledObservation].self, forKey: .buttonDisabledObservations) ?? []
+        zhihuPublishDirective = try c.decodeIfPresent(ZhihuPublishDirective.self, forKey: .zhihuPublishDirective)
     }
 }
 enum PageScript {
@@ -204,8 +225,9 @@ enum PageScript {
         const nm=names.get(e)||nameOf(e);
         const labelText=[...(e.labels||[])].map(l=>{if(named>=MAX_NAMED){truncated=true;return '';}named++;if(named===MAX_NAMED)truncated=true;return l.innerText||'';}).join(' ');
         const hint=[e.type,e.name,e.id,e.placeholder,e.getAttribute('aria-label'),e.getAttribute('alt'),e.autocomplete,labelText].join(' ');
-        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:nm.name,placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',nameSource:nm.source,inView:inViewOf(e),sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true',editable:!!e.isContentEditable};
+        return {index,tag:e.tagName.toLowerCase(),type:e.getAttribute('role')||e.type||(extraSet.has(e)?'clickable':e.tagName.toLowerCase()),text:nm.name,placeholder:e.placeholder||'',href:e.href||'',name:e.name||'',inputType:e.type||'',ariaLabel:e.getAttribute('aria-label')||'',nameSource:nm.source,inView:inViewOf(e),sensitive:/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint),disabled:(e.disabled===true)||e.getAttribute('aria-disabled')==='true'||(e.matches&&e.matches(':disabled')),editable:!!e.isContentEditable};
       });
+      const buttonDisabledObservations=merged.map((e,index)=>({e,index})).filter(x=>x.e.matches&&x.e.matches('button,[role="button"],input[type="submit"],input[type="button"]')).map(x=>{const e=x.e,nativeDisabled=e.disabled===true,disabledFieldset=!!e.closest('fieldset:disabled'),ariaDisabled=e.getAttribute('aria-disabled')==='true';const sources=[];if(nativeDisabled)sources.push('native-disabled');if(disabledFieldset)sources.push('disabled-fieldset');if(ariaDisabled)sources.push('aria-disabled');if(!sources.length)sources.push('none');return{index:x.index,nativeDisabled,disabledFieldset,ariaDisabled,source:sources.join('+')};});
       let text='',n;const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
       while((n=walker.nextNode())&&text.length<6000){if(n.parentElement&&!n.parentElement.closest('script,style,noscript')&&visible(n.parentElement))text+=n.textContent.trim()+' ';}
       // 浮动层盘点（EDITOR-ENTRY-BIND 诊断）：菜单/弹层类容器（role=
@@ -226,7 +248,7 @@ enum PageScript {
       const indexed=document.querySelectorAll('[data-mika-idx]'),mergedSet=new Set(merged);
       for(const e of indexed){if(!mergedSet.has(e))e.removeAttribute('data-mika-idx');}
       merged.forEach((e,index)=>{const value=String(index);if(e.getAttribute('data-mika-idx')!==value)e.setAttribute('data-mika-idx',value);});
-      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements,overlays,coverage:{visited,truncated}});
+      return JSON.stringify({url:location.href,title:document.title,text:text.slice(0,6000),elements,overlays,coverage:{visited,truncated},buttonDisabledObservations});
     })()
     """#
 }

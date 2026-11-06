@@ -43,20 +43,23 @@ final class AgentTraceStore: ObservableObject {
     /// 不经模型调用的引擎动作也必须可从同一份 JSONL 逐项还原。保留六组
     /// 外壳，避免导出端为 engine 行另开不兼容 schema。
     func appendEngineAction(action: String, targetFingerprint: String, method: String,
-                            result: String, pageURL: String) {
+                            result: String, pageURL: String,
+                            taskID: String = "unobservable", runID: String = "unobservable",
+                            evidence: [String: Any] = [:]) {
         let unknown: [String: Any] = ["observability": "unobservable", "value": NSNull()]
         append([
             "schemaVersion": 1,
             "source": "engine",
             "identityAndConfig": ["timestamp": timestamp(), "buildSHA": Self.buildSHA,
-                                    "buildNumber": Self.buildNumber, "source": "engine"],
+                                    "buildNumber": Self.buildNumber, "source": "engine",
+                                    "taskID": taskID, "runID": runID],
             "rawInput": ["action": action, "targetFingerprint": targetFingerprint,
                          "method": method, "pageURL": pageURL],
             "rawOutput": ["result": result],
             "actualExecution": ["action": action, "targetFingerprint": targetFingerprint,
                                 "method": method, "result": result, "pageURL": pageURL],
             "independentObservation": ["source": "engine", "pageURL": pageURL,
-                                       "targetFingerprint": targetFingerprint],
+                                       "targetFingerprint": targetFingerprint, "evidence": evidence],
             "stateAndResult": ["result": result, "failureType": result == "closed" || result == "success" ? unknown as Any : result as Any]
         ])
     }
@@ -102,8 +105,14 @@ final class AgentTraceStore: ObservableObject {
             "identityAndConfig": ["requestedModel": "synthetic-model", "requestedEffort": "low"],
             "rawInput": ["actualRequestBody": "{\"model\":\"synthetic-model\"}", "foldLevel": 1],
             "rawOutput": ["finishStatus": "completed", "usage": [:]],
-            "actualExecution": ["attemptStatus": "attempted", "verificationResult": "unknown"],
-            "independentObservation": ["candidateState": ["text": "候选"], "committedState": unknown, "counterNode": unknown],
+            "actualExecution": ["attemptStatus": "attempted", "verificationResult": "unknown",
+                                "taskID": "synthetic-task", "runID": "synthetic-run", "clickCount": 1],
+            "independentObservation": ["candidateState": ["text": "候选"], "committedState": unknown, "counterNode": unknown,
+                                       "writeProof": ["comparisonRule": ZhihuPublishPolicy.fullTextComparisonRule,
+                                                      "comparisonResult": "equal", "sourceText": "完整源稿", "committedText": "完整源稿"],
+                                       "publishBinding": ["questionID": "42", "composer": "answer-42", "disabledSource": "aria-disabled"],
+                                       "readback": ["answerLink": "https://www.zhihu.com/question/42/answer/9",
+                                                    "author": "me", "questionID": "42", "fullText": "完整源稿"]],
             "stateAndResult": ["failureType": unknown]
         ]
         append(record)
@@ -115,6 +124,7 @@ final class AgentTraceStore: ObservableObject {
             "\(groups.allSatisfy { record[$0] != nil } ? "✓" : "✗") 六个字段组齐全",
             "\(identity?["requestedModel"] as? String == "synthetic-model" && identity?["requestedEffort"] as? String == "low" ? "✓" : "✗") 实际请求模型与 effort 已记录",
             "\(observation?["candidateState"] != nil && observation?["committedState"] != nil ? "✓" : "✗") 候选状态与已提交状态分开",
+            "\(observation?["writeProof"] != nil && observation?["publishBinding"] != nil && observation?["readback"] != nil ? "✓" : "✗") FIX4 正文凭证、按钮归属、disabled 来源及完整回读字段齐全",
             "\(encoded.contains("unobservable") && !encoded.contains("\"counterNode\":0") ? "✓" : "✗") unobservable 未转成数值"
         ]
     }

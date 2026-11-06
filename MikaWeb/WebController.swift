@@ -1030,6 +1030,15 @@ enum TCProbeLogStore {
         return lastEditorTypeTrace
     }
     private var lastClickDispatchedAt: Date?
+    private var lastBlockerResolution: String?
+    func takeBlockerResolution() -> String? {
+        defer { lastBlockerResolution = nil }
+        return lastBlockerResolution
+    }
+    private var controlledZhihuFixtureTabID: UUID?
+    private var controlledZhihuDetailTabID: UUID?
+    private var controlledZhihuFixtureOutcome = "published"
+    private var controlledModalFixtureTabID: UUID?
     @Published private(set) var tabs: [BrowserTab]
     @Published private(set) var activeTabID: UUID
     /// 浏览器坞的几何／形态状态（CRASH-1031 追加项）：坞的 mode／小窗位置／
@@ -3014,6 +3023,541 @@ enum TCProbeLogStore {
         return lines
     }
 
+    /// 自检五十六（MIKA-FIX4）：真实 WKWebView＋生产 performType／WriteProof／
+    /// 唯一绑定／专用标准 click／知乎全文回读路径。模型动作以受控 wait/done
+    /// 桩喂给同一改写纯函数；不以提示词字符串存在作为通过条件。
+    func verifyZhihuPublishControl() async -> [String] {
+        let tab = activeTab
+        var lines: [String] = []
+        func check(_ ok: Bool, _ text: String) { lines.append("\(ok ? "✓" : "✗") \(text)") }
+        func action(_ name: String, index: Int, text: String = "") -> AgentAction? {
+            let data = try? JSONSerialization.data(withJSONObject: ["action": name, "index": index, "text": text, "reason": "FIX4 生产自检"])
+            return data.flatMap { try? JSONDecoder().decode(AgentAction.self, from: $0) }
+        }
+        let body = "第一段：保留标点、数字 123 与  Space。\n\n第二段：正文讨论『审核中』这个词，但它不是回答状态。Markdown **原样**，不做模糊匹配。"
+        let taskID = UUID()
+        do {
+            try tab.loadLocal("test-draft")
+            for _ in 0..<100 {
+                if (try? await evaluate("window.__ready===true", on: tab)) as? Bool == true { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            _ = try await evaluate("""
+            (()=>{const section=document.getElementById('editor-primary'),button=document.getElementById('update'),ed=section.querySelector('[contenteditable=true]');section.setAttribute('data-answer-editor','fixture-composer');section.setAttribute('data-question-id','4242');ed.setAttribute('data-editor-id','fixture-editor');button.textContent='发布回答';button.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','me');window.__pubCalls=0;button.addEventListener('click',()=>{window.__pubCalls++;document.querySelector('.AnswerItem')?.remove();const a=document.createElement('article');a.className='AnswerItem';a.setAttribute('data-answer-id','9001');a.setAttribute('data-question-id','4242');a.setAttribute('data-author-id','me');a.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/9001">详情</a><div class="RichContent-inner"></div>';a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));document.body.appendChild(a);});return true;})()
+            """, on: tab)
+            var page = try await state()
+            guard let editor = page.elements.first(where: { $0.editable }),
+                  let type = action("type", index: editor.index, text: body) else { throw MikaError("五十六 fixture 无编辑器") }
+            try await performType(type, expected: editor, approved: false, tab: tab)
+            // Draft 更新后重新赋稳定身份并刷新索引，模拟真实重渲染。
+            _ = try await evaluate("document.querySelector('[contenteditable=true]').setAttribute('data-editor-id','fixture-editor');true", on: tab)
+            page = try await state()
+            guard let proof = await captureZhihuWriteProof(action: type, taskID: taskID) else { throw MikaError("五十六未生成 WriteProof") }
+            let binding = await bindZhihuPublishTarget(to: proof)
+            let fixtureIdentity = await readZhihuPageIdentity()
+            let fixtureAccount = ZhihuAccountIdentity(
+                stableID: "zhacct-\(ZhihuPublishPolicy.hash(fixtureIdentity.accountIdentity))",
+                aliases: fixtureIdentity.accountAliases)
+            let ready = ZhihuPublishPolicy.shouldAttemptPublish(taskID: taskID,
+                authorization: .initial(instruction: "发布这个知乎回答"), proof: proof, binding: binding,
+                account: fixtureAccount, records: [])
+            check(proof.isValid && proof.expectedText == proof.committedText && proof.comparisonRule == ZhihuPublishPolicy.fullTextComparisonRule,
+                  "五十六-A：正文 committed 全文等值生成结构化 WriteProof（保留段落/空格/标点）")
+            check(ZhihuPublishPolicy.finalAction(for: ready, proposedAction: "wait") == "attempt_publish_once" && ZhihuPublishPolicy.finalAction(for: ready, proposedAction: "done") == "attempt_publish_once",
+                  "五十六-B（13:30 主回归）：受控 wait/done 均被生产决策钩子改写为 attempt_publish_once")
+            guard let binding else { throw MikaError("五十六发布按钮未唯一绑定") }
+            let click = try await attemptZhihuPublishOnce(proof: proof, binding: binding)
+            let calls = (try await evaluate("window.__pubCalls", on: tab)) as? Int ?? -1
+            let published = await readZhihuPublication(for: proof)
+            check(click == "standard-click-called" && calls == 1 && ZhihuAnswerVerifier.judge(published, proof: proof) == .verifiedPublished,
+                  "五十六-C：disabled=true（aria 来源）仍只调用一次标准 click；独立详情字段全文回读后才判已发布")
+
+            // 七十五：反馈基线与生命周期观察器保留为纯诊断。无论观察到旧
+            // 错误残留、同文替换、隐藏→可见、空基线新增或缺基线，只要
+            // 没有独立详情完整回读，分类都必须保持 unknown。
+            let staleAttempt = UUID()
+            let staleTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: staleAttempt, taskID: proof.taskID)
+            _ = try await evaluate("(()=>{document.querySelector('.AnswerItem')?.remove();const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div data-publish-status>回答提交失败：上次错误</div>');b.removeAttribute('aria-disabled');b.disabled=true;window.__pubCalls=0;return true;})()", on: tab)
+            let staleClick = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: staleAttempt)
+            let staleCalls = (try await evaluate("window.__pubCalls", on: tab)) as? Int ?? -1
+            let staleReadback = await readZhihuPublication(for: staleTarget)
+            let baselineSaved = (try await evaluate("(()=>{const x=JSON.parse(document.getElementById('editor-primary').getAttribute('data-mika-zhihu-feedback-baseline')||'null');return x?.attemptID===\(String(decoding: try JSONEncoder().encode(staleAttempt.uuidString), as: UTF8.self))&&x?.questionID==='4242'&&x?.nodes?.length===1&&!!x.nodes[0].id&&x.nodes[0].text==='回答提交失败：上次错误'&&x.nodes[0].visible===true;})()", on: tab)) as? Bool == true
+            check(staleClick == "standard-click-called" && staleCalls == 0 && baselineSaved && staleReadback.status == .unknown,
+                  "七十五-A：旧错误身份/文本/可见性原样残留；节点状态基线已保存，原生 disabled 零 handler，回读保持 unknown")
+
+            let replacementAttempt = UUID()
+            let replacementTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: replacementAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status]').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');b.disabled=false;b.setAttribute('aria-disabled','true');s.insertAdjacentHTML('beforeend','<div data-publish-status>发布失败：同文反馈</div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();const old=s.querySelector('[data-publish-status]'),fresh=old.cloneNode(true);old.replaceWith(fresh);},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: replacementAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            let replacementReadback = await readZhihuPublication(for: replacementTarget)
+            check(replacementReadback.status == .unknown &&
+                  replacementReadback.rejectionText == "发布失败：同文反馈",
+                  "七十七-A：点击后旧错误节点被同文新节点替换；反馈生命周期仅作诊断，保守收口为 unknown")
+
+            let revealAttempt = UUID()
+            let revealTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: revealAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status]').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div data-publish-status style="display:none">发布失败：隐藏反馈</div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();s.querySelector('[data-publish-status]').style.display='block';},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: revealAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            let revealReadback = await readZhihuPublication(for: revealTarget)
+            check(revealReadback.status == .unknown &&
+                  revealReadback.rejectionText == "发布失败：隐藏反馈",
+                  "七十七-B：点击前隐藏错误节点首次变可见；可见性生命周期仅作诊断，保守收口为 unknown")
+
+            let additionAttempt = UUID()
+            let additionTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: additionAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status]').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');b.addEventListener('click',e=>{e.stopImmediatePropagation();s.insertAdjacentHTML('beforeend','<div data-publish-status>发布失败：空基线新增</div>');},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: additionAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            let additionReadback = await readZhihuPublication(for: additionTarget)
+            check(additionReadback.status == .unknown &&
+                  additionReadback.rejectionText == "发布失败：空基线新增",
+                  "七十五-C：空基线点击后新增可见拒绝节点；拒绝提示仅作诊断，保守收口为 unknown")
+
+            // 原六例的广泛重渲染：错误节点随其它结构同批替换。观察器仍可
+            // 留诊断，但结构变化不得改变保守分类。
+            let broadAttempt = UUID()
+            let broadTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: broadAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status],#broad-dummy-editor,#broad-dummy-button').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div id="broad-dummy-editor"></div><button id="broad-dummy-button">占位</button><div data-publish-status>发布失败：重渲染旧反馈</div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();for(const id of ['broad-dummy-editor','broad-dummy-button']){const n=document.getElementById(id);n.replaceWith(n.cloneNode(true));}const old=s.querySelector('[data-publish-status]'),fresh=old.cloneNode(true);old.replaceWith(fresh);},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: broadAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            check((await readZhihuPublication(for: broadTarget)).status == .unknown,
+                  "七十五-D：反馈与编辑器/按钮结构同批广泛重渲染，保守收口为 unknown")
+
+            // FIX8 复审四反例按新规格全部锁为 unknown，不删除场景。
+            let textAttempt = UUID()
+            let textTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: textAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status],#broad-dummy-editor,#broad-dummy-button').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div data-publish-status>正在提交</div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();s.querySelector('[data-publish-status]').textContent='发布失败：文本更新';},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: textAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            check((await readZhihuPublication(for: textTarget)).status == .unknown,
+                  "七十八-A：同一反馈节点 textContent 从正在提交变为发布失败，保守收口为 unknown")
+
+            let parentAttempt = UUID()
+            let parentTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: parentAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status],#feedback-parent').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div id="feedback-parent" hidden><div data-publish-status>发布失败：父容器显示</div></div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();document.getElementById('feedback-parent').hidden=false;},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: parentAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            check((await readZhihuPublication(for: parentTarget)).status == .unknown,
+                  "七十八-B：父容器解除 hidden 使旧反馈首次显示，保守收口为 unknown")
+
+            let focusAttempt = UUID()
+            let focusTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: focusAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status],#feedback-parent').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');b.blur();s.insertAdjacentHTML('beforeend','<div data-publish-status style="display:none">发布失败：focus 旧反馈</div>');b.addEventListener('focus',()=>{s.querySelector('[data-publish-status]').style.display='block';},{once:true});b.addEventListener('click',e=>e.stopImmediatePropagation(),{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: focusAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            check((await readZhihuPublication(for: focusTarget)).status == .unknown,
+                  "七十八-C：focus 同步显示旧错误、click 无新增反馈，保守收口为 unknown")
+
+            let sequentialAttempt = UUID()
+            let sequentialTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: sequentialAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('#editor-primary [data-publish-status],#seq-dummy-editor,#seq-dummy-button').forEach(x=>x.remove());const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div id="seq-dummy-editor"></div><button id="seq-dummy-button">占位</button><div data-publish-status>发布失败：逐项重渲染</div>');b.addEventListener('click',e=>{e.stopImmediatePropagation();for(const id of ['seq-dummy-editor','seq-dummy-button']){const n=document.getElementById(id);n.replaceWith(n.cloneNode(true));}const old=s.querySelector('[data-publish-status]'),fresh=old.cloneNode(true);old.replaceWith(fresh);},{capture:true,once:true});return true;})()
+            """, on: tab)
+            _ = try await attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: sequentialAttempt)
+            try? await Task.sleep(for: .milliseconds(20))
+            check((await readZhihuPublication(for: sequentialTarget)).status == .unknown,
+                  "七十八-D：编辑器/按钮/旧错误逐项替换形成多条 mutation，保守收口为 unknown")
+            _ = try await evaluate("(()=>{document.querySelectorAll('#editor-primary [data-publish-status]').forEach(x=>x.remove());const b=document.getElementById('update');b.disabled=false;b.setAttribute('aria-disabled','true');return true;})()", on: tab)
+
+            // 真 native disabled/fieldset：调用发生，但浏览器自身不派 handler。
+            _ = try await evaluate("(()=>{document.querySelector('.AnswerItem')?.remove();window.__pubCalls=0;const b=document.getElementById('update');b.removeAttribute('aria-disabled');b.disabled=true;return true;})()", on: tab)
+            _ = try await state()
+            if let nativeBinding = await bindZhihuPublishTarget(to: proof) {
+                let nativeClick = try await attemptZhihuPublishOnce(proof: proof, binding: nativeBinding)
+                let nativeCalls = (try await evaluate("window.__pubCalls", on: tab)) as? Int ?? -1
+                let nativeReadback = await readZhihuPublication(for: proof)
+                _ = try await evaluate("(()=>{const b=document.getElementById('update'),f=document.createElement('fieldset');b.disabled=false;f.disabled=true;b.parentElement.insertBefore(f,b);f.appendChild(b);window.__pubCalls=0;return true;})()", on: tab)
+                _ = try await state()
+                let fieldsetBinding = await bindZhihuPublishTarget(to: proof)
+                var fieldsetClick: String?
+                if let fieldsetBinding { fieldsetClick = try await attemptZhihuPublishOnce(proof: proof, binding: fieldsetBinding) }
+                let fieldsetCalls = (try await evaluate("window.__pubCalls", on: tab)) as? Int ?? -1
+                check(nativeClick == "standard-click-called" && fieldsetClick == "standard-click-called" && nativeCalls == 0 && fieldsetCalls == 0 && fieldsetBinding?.disabledFieldset == true && nativeReadback.status == .unknown,
+                      "五十七：真原生 disabled（含 disabled fieldset）各发生一次 click() 调用但处理器不执行，不报成功、不循环")
+                _ = try await evaluate("(()=>{const f=document.querySelector('fieldset'),b=document.getElementById('update');f.parentElement.insertBefore(b,f);f.remove();return true;})()", on: tab)
+            } else { check(false, "五十七：真原生 disabled 仍应保持唯一绑定") }
+            _ = try await evaluate("(()=>{const b=document.getElementById('update');b.disabled=false;b.setAttribute('aria-disabled','true');return true;})()", on: tab)
+
+            // 多编辑器、多同名、隐藏副本、index 重排。
+            _ = try await evaluate("(()=>{window.__otherCalls=0;const other=document.createElement('section');other.id='other-composer';other.setAttribute('data-answer-editor','other-composer');other.setAttribute('data-question-id','4242');other.innerHTML='<div contenteditable=\"true\" data-editor-id=\"other-editor\">其它回答</div><button id=\"other-publish\">发布回答</button>';other.querySelector('button').onclick=()=>window.__otherCalls++;document.body.appendChild(other);const c=document.getElementById('editor-primary'),x=document.createElement('button');x.id='duplicate';x.textContent='发布回答';c.appendChild(x);return true;})()", on: tab)
+            _ = try await state()
+            check(await bindZhihuPublishTarget(to: proof) == nil, "五十八-A：多编辑器下只查当前 composer；当前容器多同名按钮产生歧义时不误点")
+            _ = try await evaluate("document.getElementById('duplicate').style.display='none';document.body.prepend(document.createElement('button'));window.__pubCalls=0;true", on: tab)
+            _ = try await state()
+            let rebound = await bindZhihuPublishTarget(to: proof)
+            if let rebound { _ = try await attemptZhihuPublishOnce(proof: proof, binding: rebound) }
+            let primaryCalls = (try await evaluate("window.__pubCalls", on: tab)) as? Int ?? -1
+            let otherCalls = (try await evaluate("window.__otherCalls", on: tab)) as? Int ?? -1
+            check(rebound != nil && primaryCalls == 1 && otherCalls == 0,
+                  "五十八-B：重排后实际点击目标 composer 按钮一次，其它同名按钮计数为 0")
+            _ = try await evaluate("(()=>{const extra=document.createElement('div');extra.id='same-composer-editor';extra.contentEditable='true';extra.textContent='另一个编辑器';document.getElementById('editor-primary').appendChild(extra);return true;})()", on: tab)
+            _ = try await state()
+            check(await bindZhihuPublishTarget(to: proof) == nil,
+                  "五十八-C：共同祖先有编辑器 A/B 且只有一个按钮时拒绝跨编辑器绑定")
+            _ = try await evaluate("document.getElementById('same-composer-editor').remove();true", on: tab)
+
+            let foreignTaskDecision = ZhihuPublishPolicy.shouldAttemptPublish(taskID: UUID(),
+                authorization: .initial(instruction: "发布回答"), proof: proof, binding: binding,
+                account: fixtureAccount, records: [])
+            let foreignBlocked: Bool
+            if case .blocked = foreignTaskDecision { foreignBlocked = true } else { foreignBlocked = false }
+            _ = try await evaluate("(()=>{const e=document.querySelector('#editor-primary [contenteditable=true]'),clone=e.cloneNode(true);e.replaceWith(clone);return true;})()", on: tab)
+            _ = try await state()
+            let replacementBlocked = await revalidateZhihuWriteProof(proof) == nil
+            check(foreignBlocked && replacementBlocked,
+                  "五十九-前置：旧任务 verified/WriteProof 不冒充当前凭证；编辑器节点替换即使属性和正文相同也失效")
+
+            // DOM 有全文但 Draft committed 缺失，不能生成有效凭证。
+            _ = try await evaluate("(()=>{window.__type4.reset('','','');const e=document.querySelector('#editor-primary [contenteditable=true]');e.setAttribute('data-editor-id','fixture-editor');e.innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));return true;})()", on: tab)
+            try? await Task.sleep(for: .milliseconds(200))
+            let domOnlyPage = try await state()
+            if let domOnlyEditor = domOnlyPage.elements.first(where: { $0.editable && $0.text != "其它回答" }),
+               let domOnlyAction = action("type", index: domOnlyEditor.index, text: body) {
+                check((await captureZhihuWriteProof(action: domOnlyAction, taskID: taskID))?.isValid != true,
+                      "五十九-A：DOM 有全文但 Draft committed 缺失/不等时不生成有效发布凭证")
+            } else { check(false, "五十九-A：DOM-only fixture 未定位") }
+
+            // 正文变化使旧证据失效；DOM/计数/旧 verified 都不能补造。
+            _ = try await evaluate("window.__type4.reset('正文已被改动','','');true", on: tab)
+            try? await Task.sleep(for: .milliseconds(200))
+            _ = try? await evaluate("document.querySelector('[contenteditable=true]').setAttribute('data-editor-id','fixture-editor');true", on: tab)
+            check(await revalidateZhihuWriteProof(proof) == nil, "五十九-B：旧正文凭证/点击前正文变化不能放行，DOM 与计数不能替代 committed 全文")
+
+            // Markdown 正负例走同一全文比较规则。
+            let md = "# 标题\n\n**粗体** 与 `code`。"
+            _ = try await evaluate("window.__type4.reset(\(String(decoding: try JSONEncoder().encode(md), as: UTF8.self)),'',\(String(decoding: try JSONEncoder().encode(md), as: UTF8.self)));true", on: tab)
+            try? await Task.sleep(for: .milliseconds(200)); _ = try await state()
+            guard let mdEditor = (try await state()).elements.first(where: { $0.editable }), let mdAction = action("type", index: mdEditor.index, text: md) else { throw MikaError("Markdown fixture 无编辑器") }
+            let mdProof = await captureZhihuWriteProof(action: mdAction, taskID: taskID)
+            let rendered = "标题\n\n粗体 与 code。"
+            _ = try await evaluate("window.__type4.reset(\(String(decoding: try JSONEncoder().encode(rendered), as: UTF8.self)),'',\(String(decoding: try JSONEncoder().encode(rendered), as: UTF8.self)));document.querySelector('[contenteditable=true]').setAttribute('data-editor-id','fixture-editor');true", on: tab)
+            try? await Task.sleep(for: .milliseconds(200))
+            let renderedPage = try await state()
+            let renderedAction = renderedPage.elements.first(where: { $0.editable }).flatMap { action("type", index: $0.index, text: md) }
+            var transformedProof: WriteProof?
+            if let renderedAction { transformedProof = await captureZhihuWriteProof(action: renderedAction, taskID: taskID) }
+            let savedRaw = try await evaluate("(()=>{window.__type4.savePayload();return sessionStorage.getItem('mika-type4-saved-raw');})()", on: tab) as? String ?? ""
+            let rawObject = savedRaw.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let rawBlocks = (rawObject?["blocks"] as? [[String: Any]])?.compactMap { $0["text"] as? String } ?? []
+            check(mdProof?.isValid == true && transformedProof?.isValid != true && !rawBlocks.isEmpty && rawBlocks.joined(separator: "\n") == rendered && ZhihuPublishPolicy.normalizeFullText(md) != ZhihuPublishPolicy.normalizeFullText(rendered),
+                  "六十：保存并回读实际 Draft blocks＋getPlainText；全文等值正例通过，转换负例不模糊放行")
+
+            // 专用回读负例：toast、错误作者、截断、拒绝提示、审核提示。
+            _ = try await evaluate("""
+            (()=>{document.querySelector('.AnswerItem')?.remove();document.body.insertAdjacentHTML('beforeend','<div role="alert">发布成功</div>');return true;})()
+            """, on: tab)
+            check((await readZhihuPublication(for: proof)).status == .unknown, "六十一-A：仅 toast/跳转/编辑器残稿不判发布")
+            _ = try await evaluate("""
+            (()=>{document.querySelector('[role=alert]')?.remove();document.body.insertAdjacentHTML('beforeend','<div role="alert">评论提交失败</div>');window.__INITIAL_STATE__={people:{currentUser:{id:'account-id',urlToken:'account-token'}}};document.body.setAttribute('data-current-user-id','account-id');const wrong=document.createElement('article');wrong.className='AnswerItem';wrong.setAttribute('data-answer-id','8999');wrong.setAttribute('data-question-id','4242');wrong.setAttribute('data-author-id','other');wrong.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/8999">其它候选</a><div class="RichContent-inner">截断候选</div>';document.body.appendChild(wrong);const a=document.createElement('article');a.className='AnswerItem';a.setAttribute('data-answer-id','9001');a.setAttribute('data-question-id','4242');a.setAttribute('data-author-id','account-token');a.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/9001">本回答</a><div class="RichContent-inner"></div>';a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body + "\n正文讨论：审核中只是一个词。"), as: UTF8.self));a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));a.querySelector('.RichContent-inner').insertAdjacentHTML('beforeend','<a href="https://www.zhihu.com/question/1/answer/2"></a>');document.body.appendChild(a);return true;})()
+            """, on: tab)
+            let normalizedIdentity = await readZhihuPublication(for: proof)
+            let aliasTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: normalizedIdentity.currentAccountIdentity,
+                accountAliases: ["account-id", "account-token"], attemptID: UUID(), taskID: proof.taskID)
+            _ = try await evaluate("window.__INITIAL_STATE__={people:{currentUser:{urlToken:'account-token'}}};document.body.setAttribute('data-current-user-id','account-token');true", on: tab)
+            let partialAlias = await readZhihuPublication(for: aliasTarget)
+            _ = try await evaluate("document.querySelector('.AnswerItem[data-answer-id=\"9001\"]').setAttribute('data-author-id','account-id');true", on: tab)
+            let crossAlias = await readZhihuPublication(for: aliasTarget)
+            check(normalizedIdentity.status == .verifiedPublished && normalizedIdentity.answerID == "9001" && normalizedIdentity.answerURL.hasSuffix("/question/4242/answer/9001") && !normalizedIdentity.currentAccountIdentity.isEmpty && normalizedIdentity.authorIdentity == normalizedIdentity.currentAccountIdentity && partialAlias.status == .verifiedPublished && crossAlias.status == .verifiedPublished,
+                  "六十一-B/七十四：当前页仅 token、作者为已验证 id 时，作者按持久化 targetAliases 等价类匹配；同题全文仍 verifiedPublished")
+            _ = try await evaluate("window.__INITIAL_STATE__={};document.body.setAttribute('data-current-user-id','me');document.querySelectorAll('.AnswerItem').forEach(x=>x.remove());document.querySelector('[role=alert]')?.remove();true", on: tab)
+            _ = try await evaluate("""
+            (()=>{document.querySelector('[role=alert]')?.remove();const a=document.createElement('article');a.className='AnswerItem';a.setAttribute('data-answer-id','9002');a.setAttribute('data-question-id','4242');a.setAttribute('data-author-id','other');a.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/9002">详情</a><div class="RichContent-inner"></div>';a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));document.body.appendChild(a);return true;})()
+            """, on: tab)
+            let wrongAuthor = ZhihuAnswerVerifier.judge(await readZhihuPublication(for: proof), proof: proof)
+            _ = try await evaluate("(()=>{const a=document.querySelector('.AnswerItem');a.setAttribute('data-author-id','me');a.setAttribute('data-question-id','9999');a.querySelector('a').href='https://www.zhihu.com/question/9999/answer/9002';return true;})()", on: tab)
+            let wrongQuestion = ZhihuAnswerVerifier.judge(await readZhihuPublication(for: proof), proof: proof)
+            _ = try await evaluate("(()=>{const a=document.querySelector('.AnswerItem');a.setAttribute('data-question-id','4242');a.querySelector('a').href='https://www.zhihu.com/question/4242/answer/9002';a.querySelector('.RichContent-inner').innerText='第一段：截断';return true;})()", on: tab)
+            let truncatedEvidence = await readZhihuPublication(for: proof)
+            let truncated = ZhihuAnswerVerifier.judge(truncatedEvidence, proof: proof)
+            check(wrongAuthor == .unknown && wrongQuestion == .unknown && truncated == .unknown && truncatedEvidence.answerURL.isEmpty,
+                  "六十一-C：错误作者、错误问题、正文截断无匹配候选时不返回首个链接、不误报已发布")
+            let rejectionAttempt = UUID()
+            let rejectionTarget = ZhihuReadbackTarget(questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, sourceText: proof.expectedText,
+                accountIdentity: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases,
+                attemptID: rejectionAttempt, taskID: proof.taskID)
+            _ = try await evaluate("""
+            (()=>{document.querySelector('.AnswerItem')?.remove();const f=document.createElement('form');f.className='AnswerForm';f.setAttribute('data-question-id','9999');f.innerHTML='<div class="Error">回答提交失败：其它表单</div>';document.body.appendChild(f);return true;})()
+            """, on: tab)
+            let foreignRejection = await readZhihuPublication(for: rejectionTarget)
+            let rejectionID = String(decoding: try JSONEncoder().encode(rejectionAttempt.uuidString), as: UTF8.self)
+            _ = try await evaluate("""
+            (()=>{const root=document.getElementById('editor-primary');root.__mikaZhihuFeedbackTracker?.observer?.disconnect();root.__mikaZhihuFeedbackTracker=null;root.removeAttribute('data-mika-zhihu-feedback-baseline');root.setAttribute('data-mika-zhihu-attempt-id',\(rejectionID));root.setAttribute('data-mika-zhihu-question-id','4242');root.insertAdjacentHTML('beforeend','<div data-publish-status>发布失败：内容违规</div>');return true;})()
+            """, on: tab)
+            let boundRejection = await readZhihuPublication(for: rejectionTarget)
+            check(foreignRejection.status == .unknown &&
+                  ZhihuAnswerVerifier.judge(boundRejection, target: rejectionTarget) == .unknown,
+                  "七十五-B：其它 AnswerForm 拒绝不串台；本次 attempt 缺点击前基线与生命周期跟踪时仍为 unknown")
+            _ = try await evaluate("""
+            (()=>{document.querySelectorAll('[data-publish-status],form.AnswerForm').forEach(x=>x.remove());const a=document.createElement('article');a.className='AnswerItem';a.setAttribute('data-answer-id','9003');a.setAttribute('data-question-id','4242');a.setAttribute('data-author-id','me');a.innerHTML='<a href="https://www.zhihu.com/question/4242/answer/9003">详情</a><div class="ReviewStatus" data-answer-status>审核中</div><div class="RichContent-inner"></div>';a.querySelector('.RichContent-inner').innerText=\(String(decoding: try JSONEncoder().encode(body), as: UTF8.self));document.body.appendChild(a);return true;})()
+            """, on: tab)
+            check(ZhihuAnswerVerifier.judge(await readZhihuPublication(for: proof), proof: proof) == .unknown, "六十二-B：审核提示不构成完整发布证据，保守收口为 unknown")
+
+            let pending = ZhihuPublishRecord(id: UUID(), taskID: taskID, runID: UUID(), accountIdentity: fixtureIdentity.accountIdentity,
+                accountStableID: fixtureAccount.stableID, accountAliases: fixtureAccount.aliases, questionID: proof.questionID,
+                expectedTextHash: proof.expectedTextHash, bodyVersion: proof.bodyVersion, sourceText: proof.expectedText,
+                status: .unknown, attemptStartedAt: Date(), clickCallCount: 1, clickResult: "called",
+                answerID: nil, answerURL: nil, authorIdentity: nil, readbackText: nil, resultDetail: "unknown")
+            let rewordedTaskID = UUID()
+            var rewordedProof = proof
+            rewordedProof.taskID = rewordedTaskID
+            rewordedProof.expectedText = "用户换一种说法后提交的同题正文"
+            rewordedProof.committedText = rewordedProof.expectedText
+            rewordedProof.expectedTextHash = ZhihuPublishPolicy.hash(rewordedProof.expectedText)
+            rewordedProof.committedTextHash = rewordedProof.expectedTextHash
+            let repeatedTaskBlocked: Bool = {
+                if case .readbackOnly(_) = ZhihuPublishPolicy.shouldAttemptPublish(taskID: rewordedTaskID,
+                    authorization: .initial(instruction: "换个说法再发布同一道题的回答"),
+                    proof: rewordedProof, binding: binding, account: fixtureAccount, records: [pending]) { return true }
+                return false
+            }()
+            check(repeatedTaskBlocked,
+                  "六十三：刷新/换会话/重新派单或换说法换正文后，同账号同题 unknown 仍只允许回读，不因 taskID/文本哈希变化绕过")
+            let migration = SkillStore.shared.verifyBuiltinMigrationPolicy()
+            check(!migration.contains(where: { $0.hasPrefix("✗") }),
+                  "六十四：随包 v4 与旧内置手册按哈希迁移、用户编辑文件保留；运行时恢复按名称加载当前安装版本")
+        } catch {
+            lines.append("✗ 自检五十六生产链异常：\(error.localizedDescription)")
+        }
+        let blocker = await verifyHitBlockerClose()
+        let geometry = await verifyGeometricBlockerCloseAndDirectURL()
+        let modalAccounting = await verifyZhihuModalPreservation()
+        check(!blocker.contains(where: { $0.hasPrefix("✗") }) && !geometry.contains(where: { $0.hasPrefix("✗") }) &&
+              !modalAccounting.contains(where: { $0.hasPrefix("✗") }),
+              "六十五：两条同名模态、纯 SVG、未保存正文保全及关闭/绕行分账均走生产路径")
+        return lines
+    }
+
+    private func verifyZhihuModalPreservation() async -> [String] {
+        let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        tab.webView.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        var lines: [String] = []
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        func target() async throws -> (AgentAction, PageElement) {
+            guard let raw = try await evaluate(PageScript.extract, on: tab) as? String,
+                  let page = try? JSONDecoder().decode(PageState.self, from: Data(raw.utf8)),
+                  let element = page.elements.first(where: { $0.text == "继续" }),
+                  let action = Self.selfTestClickAction(index: element.index) else { throw MikaError("六十五 fixture 无目标") }
+            return (action, element)
+        }
+        do {
+            let closeHTML = """
+            <html><body><textarea id='draft'>未保存正文</textarea><a id='target' href='#done' style='display:block;margin:220px'>继续</a>
+            <div class='veil' data-modal='lower' style='position:fixed;inset:0;z-index:1000;background:#0002'><section role='dialog' aria-modal='true'><button aria-label='关闭' onclick='this.closest(".veil").remove()'>关闭</button></section></div>
+            <div class='veil' data-modal='upper' style='position:fixed;inset:0;z-index:1001;background:#0002'><section role='dialog' aria-modal='true'><button aria-label='关闭' onclick='this.closest(".veil").remove()'>关闭</button></section></div>
+            <script>window.__closedLedger=[];new MutationObserver(()=>{window.__closedLedger.push('closed')}).observe(document.body,{childList:true,subtree:true});</script></body></html>
+            """
+            tab.webView.loadHTMLString(closeHTML, baseURL: nil)
+            try await Task.sleep(for: .milliseconds(300))
+            let (action, element) = try await target()
+            try await dispatchClick(action, expected: element, approved: false, tab: tab)
+            let closed = (try await evaluate("document.getElementById('draft').value==='未保存正文'&&!document.querySelector('.veil')&&window.__closedLedger.length>=2", on: tab)) as? Bool == true
+            check(closed, "六十五-A：两条同名关闭模态逐一解除，未保存正文保全，closed 分账至少两条")
+
+            let bypassHTML = """
+            <html><body><textarea id='draft'>未保存正文</textarea><a id='target' href='#done' style='display:block;margin:220px'>继续</a><div class='veil' style='position:fixed;inset:0;z-index:1001;background:#0002'><section role='dialog' aria-modal='true'>顽固模态</section></div><script>window.__bypassLedger=[];addEventListener('hashchange',()=>{document.querySelector('.veil')?.remove();window.__bypassLedger.push('bypassed')});</script></body></html>
+            """
+            tab.webView.loadHTMLString(bypassHTML, baseURL: nil)
+            try await Task.sleep(for: .milliseconds(300))
+            let (bypassAction, bypassTarget) = try await target()
+            try await dispatchClick(bypassAction, expected: bypassTarget, approved: false, tab: tab)
+            let bypassed = (try await evaluate("document.getElementById('draft').value==='未保存正文'&&window.__bypassLedger.length===1&&!document.querySelector('.veil')", on: tab)) as? Bool == true
+            check(bypassed, "六十五-B：关闭失败后 href 绕行保全未保存正文，bypassed 独立记账")
+        } catch { lines.append("✗ 六十五模态保全异常：\(error.localizedDescription)") }
+        return lines
+    }
+
+    /// 为受控模型主循环准备站点端。处理器把实际 Draft DOM 收到的正文保存为
+    /// 服务端响应源；详情页不会再从测试期望值凭空生成正文。
+    func loadZhihuEngineFixture(outcome: String = "published") async throws -> (editor: PageElement, publish: PageElement) {
+        let tab = executionTab
+        controlledZhihuFixtureTabID = tab.id
+        controlledZhihuFixtureOutcome = outcome
+        try tab.loadLocal("test-draft")
+        for _ in 0..<100 {
+            if (try? await evaluate("window.__ready===true", on: tab)) as? Bool == true { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        _ = try await evaluate("""
+        (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update'),e=s.querySelector('[contenteditable=true]');s.setAttribute('data-answer-editor','engine-fixture-composer');s.setAttribute('data-question-id','4242');e.setAttribute('data-editor-id','engine-fixture-editor');b.textContent='发布回答';b.setAttribute('aria-disabled','true');document.body.setAttribute('data-current-user-id','engine-me-id');window.__INITIAL_STATE__={people:{currentUser:{id:'engine-me-id',urlToken:'engine-me-token'}}};window.__pubCalls=0;window.__publishedBody='';b.addEventListener('click',()=>{window.__pubCalls++;window.__publishedBody=(e.innerText||'').replace(/\\r\\n?/g,'\\n');});return true;})()
+        """, on: tab)
+        if outcome == "native-disabled-fieldset-stale" {
+            _ = try await evaluate("""
+            (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update'),f=document.createElement('fieldset');s.insertAdjacentHTML('beforeend','<div data-publish-status>回答提交失败：上次错误</div>');b.removeAttribute('aria-disabled');b.disabled=true;f.disabled=true;b.parentElement.insertBefore(f,b);f.appendChild(b);return true;})()
+            """, on: tab)
+        } else if outcome == "rejected" {
+            _ = try await evaluate("""
+            (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update');b.addEventListener('click',()=>s.insertAdjacentHTML('beforeend','<div data-publish-status>发布失败：内容违规</div>'),{once:true});return true;})()
+            """, on: tab)
+        } else if outcome == "rejected-hidden-visible" {
+            _ = try await evaluate("""
+            (()=>{const s=document.getElementById('editor-primary'),b=document.getElementById('update');s.insertAdjacentHTML('beforeend','<div data-publish-status style="display:none">发布失败：隐藏反馈首次显示</div>');b.addEventListener('click',()=>{s.querySelector('[data-publish-status]').style.display='block';},{once:true});return true;})()
+            """, on: tab)
+        }
+        let page = try await state()
+        guard let editor = page.elements.first(where: { $0.editable }),
+              let publish = page.elements.first(where: { $0.text.contains("发布回答") }) else {
+            throw MikaError("引擎 fixture 无编辑器或发布按钮")
+        }
+        return (editor, publish)
+    }
+
+    struct ControlledZhihuFixtureMetrics: Equatable {
+        let handlerCalls: Int
+        let publishedBody: String
+    }
+
+    func controlledZhihuFixtureMetrics() async -> ControlledZhihuFixtureMetrics {
+        guard let id = controlledZhihuFixtureTabID,
+              let tab = tabs.first(where: { $0.id == id }) else {
+            return ControlledZhihuFixtureMetrics(handlerCalls: -1, publishedBody: "")
+        }
+        let raw = (try? await evaluate("JSON.stringify({calls:window.__pubCalls||0,body:window.__publishedBody||''})", on: tab)) as? String
+        let object = raw?.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        return ControlledZhihuFixtureMetrics(handlerCalls: object?["calls"] as? Int ?? -1,
+                                              publishedBody: object?["body"] as? String ?? "")
+    }
+
+    /// 恢复后执行页已切到独立详情页；这个计数器与编辑器 fixture
+    /// 的 __pubCalls 分开读，避免用旧页零次数冒充当前页防重证据。
+    func controlledZhihuDetailPublishCalls() async -> Int {
+        guard let id = controlledZhihuDetailTabID,
+              let tab = tabs.first(where: { $0.id == id }) else { return -1 }
+        return (try? await evaluate("window.__detailPublishCalls ?? -1", on: tab)) as? Int ?? -1
+    }
+
+    func exposeOnlyControlledZhihuAlias(_ alias: String) async throws {
+        let encoded = String(decoding: try JSONEncoder().encode(alias), as: UTF8.self)
+        _ = try await evaluate("document.body.setAttribute('data-current-user-id',\(encoded));window.__INITIAL_STATE__={people:{currentUser:{urlToken:\(encoded)}}};true", on: executionTab)
+    }
+
+    func mutateControlledZhihuBodyBeforeDispatch(_ body: String) async throws {
+        let encoded = String(decoding: try JSONEncoder().encode(body), as: UTF8.self)
+        _ = try await evaluate("window.__type4.reset(\(encoded),'',\(encoded));true", on: executionTab)
+        try await Task.sleep(for: .milliseconds(200))
+        _ = try await state()
+    }
+
+    func loadZhihuModalEngineFixture(mode: String) async throws -> PageElement {
+        let tab = executionTab
+        controlledModalFixtureTabID = tab.id
+        let overlay: String
+        if mode == "closed" {
+            overlay = """
+            <div class='veil' style='position:fixed;inset:0;z-index:1000;background:#0002'><section role='dialog' aria-modal='true'><button aria-label='关闭' onclick='this.closest(".veil").remove()'>关闭</button></section></div>
+            <div class='veil' style='position:fixed;inset:0;z-index:1001;background:#0002'><section role='dialog' aria-modal='true'><button aria-label='关闭' onclick='this.closest(".veil").remove()'>关闭</button></section></div>
+            """
+        } else {
+            overlay = """
+            <div class='veil' style='position:fixed;inset:0;z-index:1001;background:#0002'><section role='dialog' aria-modal='true'>顽固模态</section></div>
+            <script>addEventListener('hashchange',()=>document.querySelector('.veil')?.remove())</script>
+            """
+        }
+        let html = """
+        <!doctype html><html><body><textarea id='draft'>未保存正文</textarea>
+        <a id='target' href='#done' style='display:block;margin:220px'>继续</a>\(overlay)</body></html>
+        """
+        tab.webView.loadHTMLString(html, baseURL: URL(string: "https://www.zhihu.com/question/4242"))
+        try await Task.sleep(for: .milliseconds(300))
+        let page = try await state()
+        guard let target = page.elements.first(where: { $0.text == "继续" }) else {
+            throw MikaError("六十五生产 fixture 无目标")
+        }
+        return target
+    }
+
+    func controlledModalDraftPreserved() async -> Bool {
+        guard let id = controlledModalFixtureTabID,
+              let tab = tabs.first(where: { $0.id == id }) else { return false }
+        return (try? await evaluate("document.getElementById('draft')?.value==='未保存正文'&&!document.querySelector('.veil')", on: tab)) as? Bool == true
+    }
+
+    /// 兼容保留的局部入口；生产编排自检改由 launch() 消费 type 动作。
+    func prepareZhihuEngineFixture(body: String, taskID: UUID) async throws -> (AgentAction, WriteProof) {
+        let tab = executionTab
+        let fixture = try await loadZhihuEngineFixture()
+        let editor = fixture.editor
+        let data = try JSONSerialization.data(withJSONObject: ["action": "type", "index": editor.index, "text": body, "reason": "FIX5 controlled model type"])
+        let action = try JSONDecoder().decode(AgentAction.self, from: data)
+        try await performType(action, expected: editor, approved: false, tab: tab)
+        _ = try await evaluate("document.querySelector('[contenteditable=true]').setAttribute('data-editor-id','engine-fixture-editor');true", on: tab)
+        _ = try await state()
+        guard let proof = await captureZhihuWriteProof(action: action, taskID: taskID), proof.isValid else { throw MikaError("引擎 fixture 未生成 WriteProof") }
+        return (action, proof)
+    }
+
+    /// 独立详情页受控站点响应。新建真实 WKWebView 标签并用回答 permalink
+    /// 作 base URL，回读仍调用生产 readZhihuPublication。
+    func openControlledZhihuDetail(_ target: ZhihuReadbackTarget, bodyOverride: String? = nil) async throws {
+        let received = await controlledZhihuFixtureMetrics().publishedBody
+        let tab = try openTabForExecution(urlString: "")
+        controlledZhihuDetailTabID = tab.id
+        let body = String(decoding: try JSONEncoder().encode(bodyOverride ?? received), as: UTF8.self)
+        // 刻意只暴露别名集合中的一个值，覆盖详情页不再同时给出 id/urlToken 的真实形态。
+        let visibleAlias = target.accountAliases.last ?? ""
+        let account = String(decoding: try JSONEncoder().encode(visibleAlias), as: UTF8.self)
+        let review = controlledZhihuFixtureOutcome == "review"
+            ? "<div class='ReviewStatus' data-answer-status>审核中</div>" : ""
+        let html = """
+        <!doctype html><html><body data-current-user-id=\(account)><article class="AnswerItem" data-answer-id="9001" data-question-id="\(target.questionID)" data-author-id=\(account)><a class="answer-permalink" href="https://www.zhihu.com/question/\(target.questionID)/answer/9001">本回答</a>\(review)<div class="RichContent-inner"></div></article><button id="decoy-publish">发布回答</button><script>document.querySelector('.RichContent-inner').innerText=\(body);window.__detailReady=true;window.__detailPublishCalls=0;document.getElementById('decoy-publish').onclick=()=>window.__detailPublishCalls++;</script></body></html>
+        """
+        tab.webView.loadHTMLString(html, baseURL: URL(string: "https://www.zhihu.com/question/\(target.questionID)/answer/9001"))
+        for _ in 0..<100 {
+            if (try? await evaluate("window.__detailReady===true", on: tab)) as? Bool == true { return }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw MikaError("独立详情 fixture 加载超时")
+    }
+
+    func injectControlledZhihuPostClickException() async throws {
+        _ = try await evaluate("window.__mikaThrowAfterZhihuClick=true;true", on: executionTab)
+    }
+
     /// 自检四十七：独立页面经生产 dispatchClick；shadow 内部仅报告 host 指纹。
     func verifyHitBlockerClose() async -> [String] {
         let tab = BrowserTab(loadStartPage:false, sessionID:displayedSessionID)
@@ -3104,20 +3648,281 @@ enum TCProbeLogStore {
         return lines
     }
 
-    /// 自检四十五同源，只读 Draft committed 状态；不包装站点函数。
-    private func readDraftCommitted(action: AgentAction, tab: BrowserTab) async -> Bool? {
-        let json = String(decoding: (try? JSONSerialization.data(withJSONObject: ["index":action.index,"text":action.text])) ?? Data(), as: UTF8.self)
+    /// Draft committed 的结构化只读结果。比较只统一换行，不删空格、标点、
+    /// 数字或大小写；全文相等是唯一 match 口径。
+    private struct DraftCommittedRead: Decodable {
+        let observable: Bool
+        let committedText: String?
+        let editorIdentity: String
+        let composerIdentity: String
+        let questionID: String
+        let frameID: String
+        let comparisonResult: String
+    }
+
+    private func readDraftCommittedEvidence(index: Int, expectedText: String,
+                                            expectedEditorIdentity: String? = nil,
+                                            tab: BrowserTab) async -> DraftCommittedRead? {
+        let object: [String: Any] = ["index": index, "text": expectedText,
+                                     "editorIdentity": expectedEditorIdentity ?? ""]
+        let json = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
         let raw = try? await evaluate("""
-        (()=>{const a=\(json),host=document.querySelector('[data-mika-idx="'+a.index+'"]');
-        if(!host)return 'unobservable';
+        (()=>{const a=\(json),norm=s=>(s||'').replace(/\\r\\n?/g,'\\n');
+        const ident=e=>{if(!e)return '';for(const k of ['data-za-extra-module','data-answer-editor','data-editor-id','data-testid','id']){const v=e.getAttribute?.(k);if(v)return k+'='+v;}const p=[];for(let n=e;n&&n.nodeType===1&&p.length<8;n=n.parentElement){const sib=n.parentElement?[...n.parentElement.children].filter(x=>x.tagName===n.tagName):[];p.unshift(n.tagName.toLowerCase()+(sib.length>1?':nth-of-type('+(sib.indexOf(n)+1)+')':''));}return p.join('>');};
+        const editorIdent=e=>{if(!e)return '';if(!e.__mikaProofNodeID)Object.defineProperty(e,'__mikaProofNodeID',{value:(crypto.randomUUID?.()||Date.now()+'-'+Math.random()),configurable:false});return ident(e)+'|node='+e.__mikaProofNodeID;};
         const stateText=s=>{try{return s?.getCurrentContent?.().getPlainText('\\n')??null;}catch(e){return null;}};
-        const findDraft=()=>{const seen=new Set();let fiber=null;for(const k of Object.keys(host)){if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')){fiber=host[k];break;}}for(let f=fiber;f&&!seen.has(f);f=f.return){seen.add(f);const i=f.stateNode;if(i&&i.editor===host&&typeof i.update==='function')return i;}return null;};
-        const instance=findDraft(),text=instance?stateText(instance.props?.editorState):null;
-        if(typeof text!=='string')return 'unobservable';
-        const norm=s=>(s||'').replace(/[\\s\\u200b\\ufeff]+/g,'');
-        return norm(text).length>0&&norm(text).includes(norm(a.text))?'match':'miss';})()
+        const findDraft=host=>{const seen=new Set();let fiber=null;for(const k of Object.keys(host||{})){if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')){fiber=host[k];break;}}for(let f=fiber;f&&!seen.has(f);f=f.return){seen.add(f);const i=f.stateNode;if(i&&i.editor===host&&typeof i.update==='function')return i;}return null;};
+        const all=[...document.querySelectorAll('[contenteditable="true"]')].map(host=>{const i=findDraft(host),text=i?stateText(i.props?.editorState):null;return{host,text};}).filter(x=>typeof x.text==='string');
+        let chosen=null;const indexed=document.querySelector('[data-mika-idx="'+a.index+'"]');
+        if(indexed){const hit=all.find(x=>x.host===indexed);if(hit)chosen=hit;}
+        if(!chosen&&a.editorIdentity)chosen=all.find(x=>editorIdent(x.host)===a.editorIdentity)||null;
+        if(!chosen)return JSON.stringify({observable:false,committedText:null,editorIdentity:'',composerIdentity:'',questionID:'',frameID:'main',comparisonResult:'unobservable'});
+        const publishRe=/(发布回答|发布|发表|提交回答)/;
+        let composer=chosen.host.closest('[data-answer-editor],[data-composer-id],form,.AnswerForm,.AnswerEditor')||null;
+        if(!composer){for(let n=chosen.host.parentElement;n&&n!==document.body;n=n.parentElement){const buttons=[...n.querySelectorAll('button,[role="button"],input[type="submit"]')];if(buttons.some(x=>publishRe.test((x.innerText||x.value||x.getAttribute('aria-label')||'').trim()))){composer=n;break;}}}
+        if(!composer)composer=chosen.host.parentElement;
+        const ownedEditors=[...composer.querySelectorAll('[contenteditable="true"]')].filter(e=>!e.closest('[aria-hidden="true"],[hidden]'));
+        if(ownedEditors.length!==1||ownedEditors[0]!==chosen.host)return JSON.stringify({observable:false,committedText:null,editorIdentity:editorIdent(chosen.host),composerIdentity:ident(composer),questionID:'',frameID:'main',comparisonResult:'composer-not-one-to-one'});
+        const path=location.pathname.match(/\\/question\\/(\\d+)/);const attr=chosen.host.closest('[data-question-id]')?.getAttribute('data-question-id')||composer?.getAttribute?.('data-question-id')||'';
+        const q=attr||(path?path[1]:'');const result=norm(chosen.text)===norm(a.text)?'equal':'not_equal';
+        return JSON.stringify({observable:true,committedText:chosen.text,editorIdentity:editorIdent(chosen.host),composerIdentity:ident(composer),questionID:q,frameID:'main',comparisonResult:result});})()
         """, on: tab) as? String
-        switch raw { case "match": return true; case "miss": return false; default: return nil }
+        guard let raw, let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(DraftCommittedRead.self, from: data)
+    }
+
+    /// 兼容既有自检的三值入口；语义已升级为 committed 全文等值。
+    private func readDraftCommitted(action: AgentAction, tab: BrowserTab) async -> Bool? {
+        guard let read = await readDraftCommittedEvidence(index: action.index, expectedText: action.text, tab: tab), read.observable else { return nil }
+        return read.comparisonResult == "equal"
+    }
+
+    func captureZhihuWriteProof(action: AgentAction, taskID: UUID) async -> WriteProof? {
+        let tab = executionTab
+        guard let read = await readDraftCommittedEvidence(index: action.index, expectedText: action.text, tab: tab),
+              read.observable, let committed = read.committedText else { return nil }
+        let expectedHash = ZhihuPublishPolicy.hash(action.text)
+        let committedHash = ZhihuPublishPolicy.hash(committed)
+        let version = ZhihuPublishPolicy.hash([read.questionID, read.editorIdentity, read.composerIdentity,
+                                               String(tab.documentEpoch), committed].joined(separator: "|"))
+        return WriteProof(taskID: taskID, tabID: tab.id, documentEpoch: tab.documentEpoch,
+                          frameID: read.frameID, questionID: read.questionID,
+                          editorIdentity: read.editorIdentity, composerIdentity: read.composerIdentity,
+                          bodyVersion: version, expectedTextHash: expectedHash, committedTextHash: committedHash,
+                          comparisonRule: ZhihuPublishPolicy.fullTextComparisonRule,
+                          comparisonResult: read.comparisonResult, observedAt: Date(),
+                          expectedText: action.text, committedText: committed)
+    }
+
+    func revalidateZhihuWriteProof(_ proof: WriteProof) async -> WriteProof? {
+        let tab = executionTab
+        guard tab.id == proof.tabID, tab.documentEpoch == proof.documentEpoch,
+              let read = await readDraftCommittedEvidence(index: -1, expectedText: proof.expectedText,
+                                                           expectedEditorIdentity: proof.editorIdentity, tab: tab),
+              read.observable, read.comparisonResult == "equal", read.questionID == proof.questionID,
+              read.editorIdentity == proof.editorIdentity, read.composerIdentity == proof.composerIdentity,
+              let committed = read.committedText else { return nil }
+        let refreshed = WriteProof(taskID: proof.taskID, tabID: tab.id, documentEpoch: tab.documentEpoch,
+                                   frameID: read.frameID, questionID: read.questionID,
+                                   editorIdentity: read.editorIdentity, composerIdentity: read.composerIdentity,
+                                   bodyVersion: ZhihuPublishPolicy.hash([read.questionID, read.editorIdentity, read.composerIdentity,
+                                                                        String(tab.documentEpoch), committed].joined(separator: "|")),
+                                   expectedTextHash: ZhihuPublishPolicy.hash(proof.expectedText),
+                                   committedTextHash: ZhihuPublishPolicy.hash(committed),
+                                   comparisonRule: ZhihuPublishPolicy.fullTextComparisonRule,
+                                   comparisonResult: read.comparisonResult, observedAt: Date(),
+                                   expectedText: proof.expectedText, committedText: committed)
+        return refreshed.bodyVersion == proof.bodyVersion ? refreshed : nil
+    }
+
+    private struct PublishBindingRead: Decodable {
+        let found: Bool
+        let questionID: String
+        let editorIdentity: String
+        let composerIdentity: String
+        let buttonIdentity: String
+        let buttonIndex: Int
+        let buttonLabel: String
+        let candidateCount: Int
+        let revealed: Bool
+        let blocked: Bool
+        let nativeDisabled: Bool
+        let disabledFieldset: Bool
+        let ariaDisabled: Bool
+        let source: String
+    }
+
+    /// 只在已核实 Draft 所属 composer 内找发布按钮；隐藏副本不算候选，
+    /// 可见候选不是唯一时返回 nil，绝不退到全页第一个同名按钮或旧 index。
+    func bindZhihuPublishTarget(to proof: WriteProof) async -> ZhihuPublishBinding? {
+        let tab = executionTab
+        guard tab.id == proof.tabID, tab.documentEpoch == proof.documentEpoch else { return nil }
+        let json = String(decoding: (try? JSONEncoder().encode(proof)) ?? Data(), as: UTF8.self)
+        let raw = try? await evaluate("""
+        (()=>{const p=\(json);
+        const ident=e=>{if(!e)return '';for(const k of ['data-za-extra-module','data-answer-editor','data-editor-id','data-testid','id']){const v=e.getAttribute?.(k);if(v)return k+'='+v;}const a=[];for(let n=e;n&&n.nodeType===1&&a.length<8;n=n.parentElement){const s=n.parentElement?[...n.parentElement.children].filter(x=>x.tagName===n.tagName):[];a.unshift(n.tagName.toLowerCase()+(s.length>1?':nth-of-type('+(s.indexOf(n)+1)+')':''));}return a.join('>');};
+        const editorIdent=e=>{if(!e)return '';if(!e.__mikaProofNodeID)Object.defineProperty(e,'__mikaProofNodeID',{value:(crypto.randomUUID?.()||Date.now()+'-'+Math.random()),configurable:false});return ident(e)+'|node='+e.__mikaProofNodeID;};
+        const vis=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
+        const lab=e=>(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
+        const editors=[...document.querySelectorAll('[contenteditable="true"]')].filter(e=>editorIdent(e)===p.editorIdentity);
+        if(editors.length!==1)return JSON.stringify({found:false,questionID:'',editorIdentity:'',composerIdentity:'',buttonIdentity:'',buttonIndex:-1,buttonLabel:'',candidateCount:0,revealed:false,blocked:false,nativeDisabled:false,disabledFieldset:false,ariaDisabled:false,source:'editor-not-unique'});
+        const editor=editors[0];let composer=editor.closest('[data-answer-editor],[data-composer-id],form,.AnswerForm,.AnswerEditor')||null;
+        if(!composer){for(let n=editor.parentElement;n&&n!==document.body;n=n.parentElement){if(ident(n)===p.composerIdentity){composer=n;break;}}}
+        if(!composer||ident(composer)!==p.composerIdentity)return JSON.stringify({found:false,questionID:'',editorIdentity:editorIdent(editor),composerIdentity:ident(composer),buttonIdentity:'',buttonIndex:-1,buttonLabel:'',candidateCount:0,revealed:false,blocked:false,nativeDisabled:false,disabledFieldset:false,ariaDisabled:false,source:'composer-mismatch'});
+        const ownedEditors=[...composer.querySelectorAll('[contenteditable="true"]')].filter(e=>!e.closest('[aria-hidden="true"],[hidden]'));
+        if(ownedEditors.length!==1||ownedEditors[0]!==editor)return JSON.stringify({found:false,questionID:p.questionID,editorIdentity:ident(editor),composerIdentity:ident(composer),buttonIdentity:'',buttonIndex:-1,buttonLabel:'',candidateCount:0,revealed:false,blocked:false,nativeDisabled:false,disabledFieldset:false,ariaDisabled:false,source:'composer-editor-count'});
+        const re=/(^|\\s)(发布回答|发布|发表|提交回答)(\\s|$)/;const c=[...composer.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"]')].filter(e=>vis(e)&&re.test(lab(e)));
+        if(c.length!==1)return JSON.stringify({found:false,questionID:p.questionID,editorIdentity:ident(editor),composerIdentity:ident(composer),buttonIdentity:'',buttonIndex:-1,buttonLabel:'',candidateCount:c.length,revealed:false,blocked:false,nativeDisabled:false,disabledFieldset:false,ariaDisabled:false,source:'publish-candidate-count'});
+        const b=c[0];b.scrollIntoView({block:'center'});const r=b.getBoundingClientRect(),top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);const blocked=!!top&&top!==b&&!b.contains(top)&&!top.contains(b);
+        const path=location.pathname.match(/\\/question\\/(\\d+)/);const q=editor.closest('[data-question-id]')?.getAttribute('data-question-id')||composer.getAttribute('data-question-id')||(path?path[1]:'');
+        const nativeDisabled=b.disabled===true,disabledFieldset=!!b.closest('fieldset:disabled'),ariaDisabled=b.getAttribute('aria-disabled')==='true';const src=[];if(nativeDisabled)src.push('native-disabled');if(disabledFieldset)src.push('disabled-fieldset');if(ariaDisabled)src.push('aria-disabled');if(!src.length)src.push('none');
+        return JSON.stringify({found:q===p.questionID,questionID:q,editorIdentity:editorIdent(editor),composerIdentity:ident(composer),buttonIdentity:ident(b),buttonIndex:parseInt(b.getAttribute('data-mika-idx')||'-1',10),buttonLabel:lab(b),candidateCount:c.length,revealed:vis(b),blocked,nativeDisabled,disabledFieldset,ariaDisabled,source:src.join('+')});})()
+        """, on: tab) as? String
+        guard let raw, let data = raw.data(using: .utf8),
+              let r = try? JSONDecoder().decode(PublishBindingRead.self, from: data), r.found else { return nil }
+        return ZhihuPublishBinding(tabID: tab.id, documentEpoch: tab.documentEpoch,
+                                   questionID: r.questionID, editorIdentity: r.editorIdentity,
+                                   composerIdentity: r.composerIdentity, buttonIdentity: r.buttonIdentity,
+                                   buttonIndex: r.buttonIndex, buttonLabel: r.buttonLabel,
+                                   candidateCount: r.candidateCount, revealed: r.revealed, blocked: r.blocked,
+                                   nativeDisabled: r.nativeDisabled, disabledFieldset: r.disabledFieldset,
+                                   ariaDisabled: r.ariaDisabled, observationSource: r.source)
+    }
+
+    /// 发布专用窄路径：再次核对题目、正文版本、composer 与唯一按钮后，
+    /// 对该按钮调用一次标准 click()。不移除 disabled、不强行启用、不调用
+    /// 站点提交函数，也不进入通用点击的重扫、模态升级或自动重试。
+    func attemptZhihuPublishOnce(proof: WriteProof, binding: ZhihuPublishBinding,
+                                 attemptID: UUID? = nil) async throws -> String {
+        let tab = executionTab
+        guard tab.id == proof.tabID, tab.documentEpoch == proof.documentEpoch,
+              binding.matches(proof: proof) else { throw MikaError("知乎发布目标代次已变化，未点击") }
+        let payload = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "text": proof.expectedText, "questionID": proof.questionID,
+            "editorIdentity": proof.editorIdentity, "composerIdentity": proof.composerIdentity,
+            "buttonIdentity": binding.buttonIdentity, "buttonIndex": binding.buttonIndex,
+            "attemptID": attemptID?.uuidString ?? ""
+        ]), as: UTF8.self)
+        let raw = try await evaluate("""
+        (()=>{const p=\(payload),norm=s=>(s||'').replace(/\\r\\n?/g,'\\n');
+        const ident=e=>{if(!e)return '';for(const k of ['data-za-extra-module','data-answer-editor','data-editor-id','data-testid','id']){const v=e.getAttribute?.(k);if(v)return k+'='+v;}const a=[];for(let n=e;n&&n.nodeType===1&&a.length<8;n=n.parentElement){const s=n.parentElement?[...n.parentElement.children].filter(x=>x.tagName===n.tagName):[];a.unshift(n.tagName.toLowerCase()+(s.length>1?':nth-of-type('+(s.indexOf(n)+1)+')':''));}return a.join('>');};
+        const editorIdent=e=>{if(!e)return '';if(!e.__mikaProofNodeID)Object.defineProperty(e,'__mikaProofNodeID',{value:(crypto.randomUUID?.()||Date.now()+'-'+Math.random()),configurable:false});return ident(e)+'|node='+e.__mikaProofNodeID;};
+        const stateText=s=>{try{return s?.getCurrentContent?.().getPlainText('\\n')??null;}catch(e){return null;}};const find=host=>{let f=null;for(const k of Object.keys(host||{}))if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')){f=host[k];break;}const seen=new Set();for(;f&&!seen.has(f);f=f.return){seen.add(f);const i=f.stateNode;if(i&&i.editor===host&&typeof i.update==='function')return i;}return null;};
+        const editors=[...document.querySelectorAll('[contenteditable="true"]')].filter(e=>editorIdent(e)===p.editorIdentity);if(editors.length!==1)return 'editor-not-unique';const ed=editors[0],i=find(ed),text=i?stateText(i.props?.editorState):null;if(typeof text!=='string'||norm(text)!==norm(p.text))return 'body-version-mismatch';
+        let composer=ed.closest('[data-answer-editor],[data-composer-id],form,.AnswerForm,.AnswerEditor')||null;if(!composer){for(let n=ed.parentElement;n&&n!==document.body;n=n.parentElement)if(ident(n)===p.composerIdentity){composer=n;break;}}if(!composer||ident(composer)!==p.composerIdentity)return 'composer-mismatch';
+        const path=location.pathname.match(/\\/question\\/(\\d+)/),q=ed.closest('[data-question-id]')?.getAttribute('data-question-id')||composer.getAttribute('data-question-id')||(path?path[1]:'');if(q!==p.questionID)return 'question-mismatch';
+        const vis=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';},lab=e=>(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim(),re=/(^|\\s)(发布回答|发布|发表|提交回答)(\\s|$)/;
+        const ownedEditors=[...composer.querySelectorAll('[contenteditable="true"]')].filter(e=>!e.closest('[aria-hidden="true"],[hidden]'));if(ownedEditors.length!==1||ownedEditors[0]!==ed)return 'composer-editor-count';
+        const c=[...composer.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"]')].filter(e=>vis(e)&&re.test(lab(e)));if(c.length!==1)return 'button-not-unique';const b=c[0];if(ident(b)!==p.buttonIdentity||parseInt(b.getAttribute('data-mika-idx')||'-1',10)!==p.buttonIndex)return 'button-identity-mismatch';
+        b.scrollIntoView({block:'center'});const r=b.getBoundingClientRect(),top=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);if(top&&top!==b&&!b.contains(top)&&!top.contains(b))return 'button-blocked';
+        if(p.attemptID){
+          const statusSelector='[data-answer-status],[data-publish-status],.AnswerStatus,.Error';
+          const feedbackNodes=()=>[...composer.querySelectorAll(statusSelector)].filter(n=>!n.closest('[contenteditable="true"],.RichContent-inner,[itemprop="text"]'));
+          let feedbackSequence=0;
+          const feedbackID=n=>{if(!n.__mikaZhihuFeedbackNodeID)Object.defineProperty(n,'__mikaZhihuFeedbackNodeID',{value:p.attemptID+'-'+Date.now()+'-'+(++feedbackSequence),configurable:false});return n.__mikaZhihuFeedbackNodeID;};
+          const feedbackText=n=>(n.innerText||'').replace(/\\s+/g,' ').trim();
+          const snapshot=()=>new Map(feedbackNodes().map(n=>{const id=feedbackID(n);return [id,{id,text:feedbackText(n),visible:vis(n)}];}));
+          const initial=snapshot();
+          composer.__mikaZhihuFeedbackTracker?.observer?.disconnect();
+          const tracker={attemptID:p.attemptID,questionID:p.questionID,armed:false,last:initial,events:[],observer:null};
+          const observe=records=>{const directAdded=new Set(),directRemoved=new Set(),directChanged=new Set();for(const record of records){if(record.type==='childList'){const changed=[...record.addedNodes,...record.removedNodes].filter(n=>n.nodeType===1);const feedbackOnly=changed.length>0&&changed.every(n=>n.matches?.(statusSelector));if(feedbackOnly){for(const n of record.addedNodes)if(n.nodeType===1&&n.matches?.(statusSelector))directAdded.add(feedbackID(n));for(const n of record.removedNodes)if(n.nodeType===1&&n.matches?.(statusSelector))directRemoved.add(feedbackID(n));}}else if(record.type==='attributes'&&record.target.matches?.(statusSelector)){directChanged.add(feedbackID(record.target));}else if(record.type==='characterData'){const n=record.target.parentElement?.closest(statusSelector);if(n)directChanged.add(feedbackID(n));}}const current=snapshot();if(tracker.armed){for(const [id,value] of current){const previous=tracker.last.get(id);if(!previous){tracker.events.push({kind:'added',direct:directAdded.has(id),...value});continue;}if(previous.text!==value.text)tracker.events.push({kind:'text',direct:directChanged.has(id),...value,previousText:previous.text,previousVisible:previous.visible});if(previous.visible!==value.visible)tracker.events.push({kind:'visibility',direct:directChanged.has(id),...value,previousText:previous.text,previousVisible:previous.visible});}for(const [id,previous] of tracker.last)if(!current.has(id))tracker.events.push({kind:'removed',direct:directRemoved.has(id),...previous});}tracker.last=current;};
+          tracker.observer=new MutationObserver(observe);tracker.observer.observe(composer,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class','style','hidden','aria-hidden']});composer.__mikaZhihuFeedbackTracker=tracker;
+          composer.setAttribute('data-mika-zhihu-feedback-baseline',JSON.stringify({attemptID:p.attemptID,questionID:p.questionID,nodes:[...initial.values()]}));
+          composer.setAttribute('data-mika-zhihu-attempt-id',p.attemptID);composer.setAttribute('data-mika-zhihu-question-id',p.questionID);
+        }
+        b.focus();if(composer.__mikaZhihuFeedbackTracker)composer.__mikaZhihuFeedbackTracker.armed=true;b.click();if(window.__mikaThrowAfterZhihuClick)throw new Error('fixture-after-click-exception');return 'standard-click-called';})()
+        """, on: tab) as? String ?? "unobservable"
+        guard raw == "standard-click-called" else { throw MikaError("知乎发布首次尝试未执行：\(raw)") }
+        lastClickDispatchedAt = Date()
+        return raw
+    }
+
+    private struct PublicationRead: Decodable {
+        let status: String
+        let questionID: String
+        let answerID: String
+        let answerURL: String
+        let currentAccountIdentity: String
+        let authorIdentity: String
+        let bodyText: String
+        let fullTextEqual: Bool
+        let pageState: String
+        let rejectionText: String
+    }
+
+    struct ZhihuPageIdentity: Equatable {
+        let questionID: String
+        let accountAliases: [String]
+        var accountIdentity: String { ZhihuAccountIdentity.normalizedAliases(accountAliases).joined(separator: "|") }
+    }
+
+    private struct ZhihuPageIdentityRead: Decodable {
+        let questionID: String
+        let accountAliases: [String]
+    }
+
+    /// 与回读脚本使用同一账号别名规范：id/urlToken 都纳入排序键，避免同一
+    /// 账号在两种表示间失配；题目身份不依赖当前 WriteProof。
+    func readZhihuPageIdentity() async -> ZhihuPageIdentity {
+        let raw = try? await evaluate("""
+        (()=>{const s=window.__INITIAL_STATE__||{},u=s?.people?.currentUser||{};
+        const aliases=[document.documentElement.getAttribute('data-current-user-id'),document.body?.getAttribute('data-current-user-id'),document.querySelector('meta[name="current-user-id"]')?.content,u.id,u.urlToken].filter(Boolean).map(String);
+        const accountAliases=[...new Set(aliases)].sort();const q=(location.pathname.match(/\\/question\\/(\\d+)/)||[])[1]||document.querySelector('[data-question-id]')?.getAttribute('data-question-id')||'';
+        return JSON.stringify({questionID:q,accountAliases});})()
+        """, on: executionTab) as? String
+        guard let raw, let data = raw.data(using: .utf8),
+              let value = try? JSONDecoder().decode(ZhihuPageIdentityRead.self, from: data) else {
+            return ZhihuPageIdentity(questionID: "", accountAliases: [])
+        }
+        return ZhihuPageIdentity(questionID: value.questionID,
+                                 accountAliases: ZhihuAccountIdentity.normalizedAliases(value.accountAliases))
+    }
+
+    /// 知乎回答专用回读。只认稳定回答 ID/链接、题目、当前账号作者与编辑器外
+    /// 完整正文；toast、跳转和前缀都不会在这里晋级。折叠正文会先展开再读。
+    func readZhihuPublication(for proof: WriteProof) async -> ZhihuPublicationEvidence {
+        let identity = await readZhihuPageIdentity()
+        let aliases = ZhihuAccountIdentity.normalizedAliases(identity.accountAliases)
+        let target = ZhihuReadbackTarget(questionID: proof.questionID, expectedTextHash: proof.expectedTextHash,
+            sourceText: proof.expectedText,
+            accountIdentity: "zhacct-\(ZhihuPublishPolicy.hash(aliases.joined(separator: "|")))",
+            accountAliases: aliases,
+            attemptID: UUID(), taskID: proof.taskID)
+        return await readZhihuPublication(for: target)
+    }
+
+    func readZhihuPublication(for target: ZhihuReadbackTarget) async -> ZhihuPublicationEvidence {
+        let tab = executionTab
+        let payload = String(decoding: (try? JSONSerialization.data(withJSONObject: [
+            "text": target.sourceText, "questionID": target.questionID,
+            "accountIdentity": target.accountIdentity, "accountAliases": target.accountAliases,
+            "attemptID": target.attemptID.uuidString
+        ])) ?? Data(), as: UTF8.self)
+        let raw = try? await evaluate("""
+        (()=>{const p=\(payload),norm=s=>(s||'').replace(/\\r\\n?/g,'\\n');
+        const vis=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};const lab=e=>(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\\s+/g,' ').trim();
+        for(const b of document.querySelectorAll('button,[role="button"],a')){if(vis(b)&&/(展开阅读全文|阅读全文|展开全部)/.test(lab(b))&&!b.dataset.mikaReadbackExpanded){b.dataset.mikaReadbackExpanded='1';b.click();}}
+        const initial=window.__INITIAL_STATE__||{},user=initial?.people?.currentUser||{};const aliases=[document.documentElement.getAttribute('data-current-user-id'),document.body?.getAttribute('data-current-user-id'),document.querySelector('meta[name="current-user-id"]')?.content,user.id,user.urlToken].filter(Boolean).map(String);const targetAliases=new Set((p.accountAliases||[]).map(String)),accountBound=aliases.some(x=>targetAliases.has(x));
+        const pathQuestion=(location.pathname.match(/\\/question\\/(\\d+)/)||[])[1]||'';const boundQuestion=pathQuestion||[...document.querySelectorAll('[data-question-id]')].find(x=>x.getAttribute('data-question-id')===p.questionID)?.getAttribute('data-question-id')||'';
+        const rejectionMarkers=['发布失败','提交失败','被拒绝','内容违规','敏感词','回答失败'];let rejection='';const attemptRoots=[...document.querySelectorAll('[data-mika-zhihu-attempt-id]')].filter(x=>x.getAttribute('data-mika-zhihu-attempt-id')===p.attemptID&&x.getAttribute('data-mika-zhihu-question-id')===p.questionID);if(boundQuestion===p.questionID&&attemptRoots.length===1){const root=attemptRoots[0],statusNodes=[...root.querySelectorAll('[data-answer-status],[data-publish-status],.AnswerStatus,.Error')].filter(x=>!x.closest('[contenteditable="true"],.RichContent-inner,[itemprop="text"]'));let baseline=null;try{baseline=JSON.parse(root.getAttribute('data-mika-zhihu-feedback-baseline')||'null');}catch(e){}const tracker=root.__mikaZhihuFeedbackTracker;const baselineValid=baseline&&baseline.attemptID===p.attemptID&&baseline.questionID===p.questionID&&Array.isArray(baseline.nodes)&&tracker&&tracker.attemptID===p.attemptID&&tracker.questionID===p.questionID&&Array.isArray(tracker.events);if(baselineValid){const before=new Map(baseline.nodes.map(x=>[x.id,x])),events=tracker.events,current=statusNodes.map(n=>({node:n,id:n.__mikaZhihuFeedbackNodeID||'',text:(n.innerText||'').replace(/\\s+/g,' ').trim(),visible:vis(n)}));const added=id=>events.some(e=>e.kind==='added'&&e.direct===true&&e.id===id),removed=id=>events.some(e=>e.kind==='removed'&&e.direct===true&&e.id===id),shown=id=>events.some(e=>e.kind==='visibility'&&e.direct===true&&e.id===id&&e.previousVisible===false&&e.visible===true),retitled=id=>events.some(e=>e.kind==='text'&&e.direct===true&&e.id===id&&e.previousText!==e.text);for(const value of current){if(!value.id||!value.visible||!rejectionMarkers.some(m=>value.text.includes(m)))continue;const old=before.get(value.id);let attributable=false;if(old){attributable=(!old.visible&&shown(value.id))||(old.text!==value.text&&retitled(value.id));}else if(added(value.id)){const sameBefore=baseline.nodes.filter(x=>x.text===value.text),sameNow=current.filter(x=>x.text===value.text);attributable=sameNow.length>sameBefore.length||(sameBefore.length>0&&sameBefore.some(x=>removed(x.id)));}if(attributable){rejection=(value.node.innerText||'').trim();break;}}}}
+        const selectors='[data-answer-id],article[itemprop="answer"],.AnswerItem,[itemtype*="Answer"]';const nodes=[...new Set(document.querySelectorAll(selectors))];const rows=[];
+        for(const n of nodes){if(n.closest('[contenteditable="true"]')||n.querySelector('[contenteditable="true"]'))continue;const body=n.querySelector('.RichContent-inner,[itemprop="text"],[data-answer-body],.RichText')||null;const own=[...n.querySelectorAll('a[href*="/answer/"]')].filter(a=>!body?.contains(a)).map(a=>a.href);const hinted=n.getAttribute('data-answer-id')||'';const ownLink=own.find(h=>!hinted||new RegExp('/answer/'+hinted+'(?:[/?#]|$)').test(h))||'';const m=ownLink.match(/\\/question\\/(\\d+)\\/answer\\/(\\d+)/)||ownLink.match(/\\/answer\\/(\\d+)/);const q=n.getAttribute('data-question-id')||(m&&m.length>2?m[1]:'')||(location.pathname.match(/\\/question\\/(\\d+)/)||[])[1]||'';const id=hinted||(m?(m.length>2?m[2]:m[1]):'');const link=q&&id?'https://www.zhihu.com/question/'+q+'/answer/'+id:'';const author=n.getAttribute('data-author-id')||n.querySelector('[data-author-id]')?.getAttribute('data-author-id')||n.querySelector('a[href*="/people/"]')?.getAttribute('href')?.split('/people/')[1]?.split(/[/?#]/)[0]||'';const text=(body?.innerText||'').replace(/\\r\\n?/g,'\\n');rows.push({q,id,link,author,text,node:n,body});}
+        const exact=rows.filter(x=>x.q===p.questionID&&x.id&&x.link&&norm(x.text)===norm(p.text));const sameAuthor=exact.filter(x=>targetAliases.has(x.author));const chosen=sameAuthor.length===1?sameAuthor[0]:null;
+        if(chosen){const statusNodes=[...chosen.node.querySelectorAll('[data-answer-status],[data-publish-status],.AnswerStatus,.ReviewStatus')].filter(x=>!chosen.body?.contains(x));const review=statusNodes.some(x=>/审核中|等待审核|已提交审核/.test(x.innerText||'')),authorOK=accountBound&&targetAliases.has(chosen.author);const status=authorOK&&!review?'verifiedPublished':'unknown';return JSON.stringify({status,questionID:chosen.q,answerID:chosen.id,answerURL:chosen.link,currentAccountIdentity:authorOK?p.accountIdentity:'',authorIdentity:authorOK?p.accountIdentity:chosen.author,bodyText:chosen.text,fullTextEqual:true,pageState:review?'review':'published',rejectionText:rejection});}
+        return JSON.stringify({status:'unknown',questionID:rejection?p.questionID:'',answerID:'',answerURL:'',currentAccountIdentity:accountBound?p.accountIdentity:'',authorIdentity:'',bodyText:'',fullTextEqual:false,pageState:rejection?'rejected':'unverified',rejectionText:rejection});})()
+        """, on: tab) as? String
+        if let raw, let data = raw.data(using: .utf8), let r = try? JSONDecoder().decode(PublicationRead.self, from: data) {
+            let status = ZhihuPublishStatus(rawValue: r.status) ?? .unknown
+            return ZhihuPublicationEvidence(status: status, questionID: r.questionID,
+                                             answerID: r.answerID, answerURL: r.answerURL,
+                                             currentAccountIdentity: r.currentAccountIdentity,
+                                             authorIdentity: r.authorIdentity, bodyText: r.bodyText,
+                                             fullTextEqual: r.fullTextEqual, pageState: r.pageState,
+                                             rejectionText: r.rejectionText, observedAt: Date())
+        }
+        return ZhihuPublicationEvidence(status: .unknown, questionID: "", answerID: "", answerURL: "",
+                                         currentAccountIdentity: "", authorIdentity: "", bodyText: "",
+                                         fullTextEqual: false, pageState: "unobservable", rejectionText: "", observedAt: Date())
     }
 
     private func performTypeInEditor(action: AgentAction, expected: PageElement, approved: Bool, baseline: EditorSignals, tab: BrowserTab) async throws {
@@ -3209,10 +4014,9 @@ enum TCProbeLogStore {
             } else {
                 trace.append("\(path)=dom-ok,no-signals")
             }
-            if v.editorLike, !v.submits.isEmpty, v.submits.allSatisfy({ $0.disabled }) {
-                await captureFailureSnapshot(context: "type 后提交按钮仍禁用：\(action.reason)", tab: tab)
-                throw MikaError("文字已输入，但「\(v.submits[0].text)」按钮仍是灰的（禁用状态），没能发布")
-            }
+            // MIKA-FIX4：Draft committed 全文已经核实后，发布按钮的 disabled、
+            // 字数 0 或编辑提示只是独立页面观测，不能反推正文没有写入。
+            // 是否尝试发布由 ZhihuPublishPolicy 与专用一次点击路径决定。
             return
         }
         await captureFailureSnapshot(context: "type 编辑器状态校验失败：\(action.reason)｜\(trace.joined(separator: "；"))", tab: tab)
@@ -3721,6 +4525,7 @@ enum TCProbeLogStore {
         lastClickEffect = nil
         lastClickEffectMissingBefore = false
         lastClickDispatchedAt = nil
+        lastBlockerResolution = nil
         let before = await clickSignature(in: tab)
         lastClickEffectMissingBefore = before == nil
         try await dispatchClick(action, expected: expected, approved: approved, tab: tab)
@@ -3747,6 +4552,7 @@ enum TCProbeLogStore {
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         var blockerCensus = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
         if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+            let initiallyBlocked = true
             recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label)
             for _ in 0..<2 {
                 let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: true)
@@ -3760,7 +4566,10 @@ enum TCProbeLogStore {
                             pageURL: tab.webView.url?.absoluteString ?? "")
                     }
                 }
-                if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) { break }
+                if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+                    if initiallyBlocked { lastBlockerResolution = "closed" }
+                    break
+                }
             }
             if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
                 if let directURL = directClickURL(action: action, expected: expected, currentURL: tab.webView.url) {
@@ -3771,7 +4580,7 @@ enum TCProbeLogStore {
                     AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-direct-url", targetFingerprint: before.joined(separator: " | "),
                         method: "direct-navigation", result: persisted ? "persisted" : "success",
                         pageURL: tab.webView.url?.absoluteString ?? directURL.absoluteString)
-                    if !persisted { return }
+                    if !persisted { lastBlockerResolution = "bypassed"; return }
                     blockerCensus = after
                 }
                 if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {

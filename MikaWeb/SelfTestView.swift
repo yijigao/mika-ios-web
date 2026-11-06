@@ -381,6 +381,20 @@ struct SelfTestView: View {
             }.disabled(!engine.active)
             Text("自检五十五预期：系统提示同时含新任务不反问、旧账同站同题至多一步、任务内证据一致与用户确认终局的硬规则。")
                 .font(.caption).foregroundStyle(.secondary)
+            Button("知乎发布自检全套") {
+                Task { @MainActor in
+                    let engineLines = engine.verifyZhihuPublishOrchestration()
+                    let productionEngineLines = await engine.verifyZhihuProductionOrchestration()
+                    let authorizationLines = engine.verifyZhihuPublishAuthorization()
+                    let webLines = await WebController().verifyZhihuPublishControl()
+                    let lines = engineLines + productionEngineLines + authorizationLines + webLines
+                    for line in lines { conversation.localFeedback(line) }
+                    conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "知乎发布自检全套：FAIL" : "知乎发布自检全套：策略局部＋WKWebView＋生产主循环各分项 PASS")
+                }
+                dismiss()
+            }.disabled(!engine.active)
+            Text("自检五十六至七十二分别保留真实编号，报告策略局部、WKWebView 与生产主循环证据；汇总文案不替代真机证据。")
+                .font(.caption).foregroundStyle(.secondary)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true
