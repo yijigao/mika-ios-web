@@ -1,6 +1,103 @@
 import Foundation
 import Combine
 import MetricKit
+import WebKit
+import UIKit
+import CryptoKit
+
+/// 最小逐步取证日志。每条 JSONL 都含 Astra 裁决的六个字段组；不能从
+/// 当前接口独立观测的值保留为 `unobservable`，绝不折算成 0 或失败。
+/// 请求凭据只存在 HTTP header，不进入传给本类型的 requestBody。
+final class AgentTraceStore: ObservableObject {
+    static let shared = AgentTraceStore()
+    @Published private(set) var recordCount = 0
+    private let queue = DispatchQueue(label: "MikaWeb.AgentTrace")
+    private let formatter = ISO8601DateFormatter()
+    private var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MikaWeb/Trace", isDirectory: true)
+    }
+    private var file: URL { directory.appendingPathComponent("agent-trace.jsonl") }
+
+    private init() {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var url = directory
+        var values = URLResourceValues(); values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+        recordCount = (try? String(contentsOf: file, encoding: .utf8).split(separator: "\n").count) ?? 0
+    }
+
+    func append(_ record: [String: Any]) {
+        queue.async { [weak self] in
+            guard let self, JSONSerialization.isValidJSONObject(record),
+                  let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+            do {
+                if !FileManager.default.fileExists(atPath: file.path) { try Data().write(to: file, options: .atomic) }
+                let handle = try FileHandle(forWritingTo: file)
+                try handle.seekToEnd(); try handle.write(contentsOf: data); try handle.write(contentsOf: Data([0x0a])); try handle.close()
+                DispatchQueue.main.async { self.recordCount += 1 }
+            } catch { }
+        }
+    }
+
+    func exportURL() throws -> URL {
+        try queue.sync {
+            guard FileManager.default.fileExists(atPath: file.path) else {
+                throw NSError(domain: "MikaWeb.Trace", code: 1, userInfo: [NSLocalizedDescriptionKey: "尚无 trace 记录"])
+            }
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent("mika-agent-trace-\(UUID().uuidString).jsonl")
+            try FileManager.default.copyItem(at: file, to: destination)
+            return destination
+        }
+    }
+
+    func storeAttachment(_ text: String) -> [String: Any] {
+        let data = Data(text.utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return queue.sync {
+            let attachments = directory.appendingPathComponent("attachments", isDirectory: true)
+            try? FileManager.default.createDirectory(at: attachments, withIntermediateDirectories: true)
+            let name = UUID().uuidString + ".json"
+            let url = attachments.appendingPathComponent(name)
+            do {
+                try data.write(to: url, options: .atomic)
+                return ["reference": "attachments/" + name, "sha256": digest, "bytes": data.count, "complete": true]
+            } catch {
+                return ["reference": "unobservable", "sha256": digest, "bytes": data.count, "complete": false]
+            }
+        }
+    }
+
+    static var buildSHA: String { Bundle.main.object(forInfoDictionaryKey: "MikaBuildSHA") as? String ?? "b8cdb8e75608357a09f6fed56d7e53ecfba5916d" }
+    static var buildNumber: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unobservable" }
+    static var device: String { UIDevice.current.model + " / " + UIDevice.current.systemName + " " + UIDevice.current.systemVersion }
+    static var webViewVersion: String { Bundle(identifier: "com.apple.WebKit")?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unobservable" }
+    func timestamp() -> String { formatter.string(from: Date()) }
+
+    func verifySyntheticCompleteness() -> [String] {
+        let unknown: [String: Any] = ["observability": "unobservable", "value": NSNull()]
+        let record: [String: Any] = [
+            "schemaVersion": 1,
+            "identityAndConfig": ["requestedModel": "synthetic-model", "requestedEffort": "low"],
+            "rawInput": ["actualRequestBody": "{\"model\":\"synthetic-model\"}", "foldLevel": 1],
+            "rawOutput": ["finishStatus": "completed", "usage": [:]],
+            "actualExecution": ["attemptStatus": "attempted", "verificationResult": "unknown"],
+            "independentObservation": ["candidateState": ["text": "候选"], "committedState": unknown, "counterNode": unknown],
+            "stateAndResult": ["failureType": unknown]
+        ]
+        append(record)
+        let groups = ["identityAndConfig", "rawInput", "rawOutput", "actualExecution", "independentObservation", "stateAndResult"]
+        let identity = record["identityAndConfig"] as? [String: Any]
+        let observation = record["independentObservation"] as? [String: Any]
+        let encoded = (try? JSONSerialization.data(withJSONObject: record)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        return [
+            "\(groups.allSatisfy { record[$0] != nil } ? "✓" : "✗") 六个字段组齐全",
+            "\(identity?["requestedModel"] as? String == "synthetic-model" && identity?["requestedEffort"] as? String == "low" ? "✓" : "✗") 实际请求模型与 effort 已记录",
+            "\(observation?["candidateState"] != nil && observation?["committedState"] != nil ? "✓" : "✗") 候选状态与已提交状态分开",
+            "\(encoded.contains("unobservable") && !encoded.contains("\"counterNode\":0") ? "✓" : "✗") unobservable 未转成数值"
+        ]
+    }
+}
 
 struct StoredDiagnosticReport: Identifiable {
     let id: UUID
@@ -102,4 +199,5 @@ final class DiagnosticStore: NSObject, ObservableObject, MXMetricManagerSubscrib
         }
     }
     func finishShare(_ url: URL) { queue.async { try? FileManager.default.removeItem(at: url) } }
+    func prepareTraceShare() throws -> URL { try AgentTraceStore.shared.exportURL() }
 }

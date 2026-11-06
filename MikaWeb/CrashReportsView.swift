@@ -3,10 +3,20 @@ import UIKit
 
 struct CrashReportsView: View {
     @ObservedObject var store: DiagnosticStore
+    @ObservedObject private var traces = AgentTraceStore.shared
     @State private var sharingURL: URL?
     @State private var shareError: String?
     var body: some View {
         List {
+            Section("Agent trace") {
+                Text("逐步 JSONL，仅保存在本机；实际请求体不含 Authorization 凭据。当前 \(traces.recordCount) 条。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("导出 trace JSONL") {
+                    do { sharingURL = try store.prepareTraceShare() }
+                    catch { shareError = error.localizedDescription }
+                }
+                .disabled(traces.recordCount == 0)
+            }
             Section {
                 Text("崩溃诊断由系统在后续运行期间送达，通常需要崩溃后重新打开 App，可能有延迟，也可能未收到。仅保存在本机，最多保留最近 5 份；分享后将交给你选择的接收方。")
                     .font(.callout)

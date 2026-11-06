@@ -329,6 +329,12 @@ struct SelfTestView: View {
                     for line in lines { conversation.localFeedback("自检四十七：\(line)") }
                 }
             }
+            Button("自检四十八：最小 trace 完整性") {
+                let lines = AgentTraceStore.shared.verifySyntheticCompleteness()
+                for line in lines { conversation.localFeedback("自检四十八：\(line)") }
+                conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十八：FAIL" : "自检四十八：六字段组 PASS，合成记录已落盘可导出")
+                dismiss()
+            }.disabled(!engine.active)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true

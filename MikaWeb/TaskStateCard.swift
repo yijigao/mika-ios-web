@@ -23,7 +23,7 @@ struct TaskStateCard: Codable, Equatable {
     var openQuestions: [String] = []
     /// 成果台账引用（人读短行；台账详情与定力口径仍由台账注入段承担）
     var outcomeRefs: [String] = []
-    /// 成功写入页面的短记录；可选键使旧状态卡快照照常解码。
+    /// 页面写入尝试的短记录；尝试与核实结果分列，可选键使旧快照照常解码。
     var writes: [String]? = nil
     var updatedAt: Date = Date()
 
@@ -50,11 +50,17 @@ struct TaskStateCard: Codable, Equatable {
         updatedAt = Date()
     }
 
-    mutating func addWrite(target: String, body: String) {
+    mutating func addWrite(target: String, body: String, verification: String = "unknown") {
         let label = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let preview = String(body.prefix(24)).map { $0.isNewline ? " " : String($0) }.joined()
-        let line = "\(label.isEmpty ? "（目标未名）" : label)←\(preview)（\(body.count)字）"
         var entries = writes ?? []
+        entries = entries.map { line in
+            if line.hasPrefix("当前内容；") { return line.replacingOccurrences(of: "当前内容；", with: "旧版本；") }
+            if line.hasPrefix("旧版本；") { return line }
+            return "旧版本；旧格式；核实=unknown；" + line
+        }
+        let normalized = ["verified", "failed", "unknown"].contains(verification) ? verification : "unknown"
+        let line = "当前内容；type=replace（整段替换）；目标=\(label.isEmpty ? "（目标未名）" : label)；尝试=attempt；核实=\(normalized)；预览=\(preview)（\(body.count)字）"
         entries.append(line)
         if entries.count > Self.writesCap { entries.removeFirst(entries.count - Self.writesCap) }
         writes = entries
@@ -73,7 +79,7 @@ struct TaskStateCard: Codable, Equatable {
         if !pinnedFacts.isEmpty { lines.append("关键事实（不可丢弃）：" + pinnedFacts.joined(separator: "；")) }
         if !openQuestions.isEmpty { lines.append("未决问题：" + openQuestions.joined(separator: "；")) }
         if !outcomeRefs.isEmpty { lines.append("成果台账引用：" + outcomeRefs.joined(separator: "；")) }
-        if let writes, !writes.isEmpty { lines.append("【已写入页面的内容】\n" + writes.map { "· " + $0 }.joined(separator: "\n")) }
+        if let writes, !writes.isEmpty { lines.append("【页面写入版本账】（type 语义固定为 replace／整段替换；attempt 不等于已写入，核实仅取 verified/failed/unknown）\n" + writes.map { "· " + $0 }.joined(separator: "\n")) }
         return lines.joined(separator: "\n")
     }
 }

@@ -880,6 +880,16 @@ struct OpenStall {
     /// 3＝留 1 步且行更短。forcedFoldLevel 由预算升级/上下文超限重试抬升，
     /// 会话内只升不降（保守侧）。
     private var forcedFoldLevel = 0
+    // MIKA-TRACE-BASELINE：仅保存本轮取证材料，不参与 prompt／预算决策。
+    private var traceModel: ModelClient.TraceEvidence?
+    private var tracePageBefore: PageState?
+    private var tracePrompt = ""
+    private var traceHistoryBefore = ""
+    private var traceHistoryAfter = ""
+    private var traceFoldLevel = 0
+    private var traceStateCardBefore = ""
+    private var traceInterjection = ""
+    private var traceInputStrategies: [String] = []
     static let foldStepThreshold = 12
     /// 组装 prompt 的字符预算（H1）：保守默认值——组装后超此值先逐级加大
     /// 折叠再发送；它管的是「我们发出去的体量有界」，不是某个模型的窗口
@@ -1786,16 +1796,20 @@ struct OpenStall {
                         let loopHint = pendingLoopHint; pendingLoopHint = nil
                         let outcomeHint = pendingOutcomeHint; pendingOutcomeHint = nil
                         let steerHint = try consumePendingSteers()
+                        traceInterjection = steerHint ?? ""
                         // prompt 组装（H1）：任务→状态卡→恢复说明→成果台账→
                         // 历史（确定性折叠）→问答→playbook→提示→当前页面；
                         // 体量由 promptCharBudget 约束，超预算逐级加大折叠
                         // （见 assemblePrompt）。各注入段的口径注释见组装函数。
                         let prompt = assemblePrompt(pageJSON: json, answersJSON: answers, loopHint: loopHint, outcomeHint: outcomeHint, steerHint: steerHint)
+                        tracePageBefore = page
+                        traceModel = nil
+                        traceInputStrategies = []
                         let action: AgentAction
                         if settings.modelSource == .chatGPT {
-                            action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
+                            action = try await ModelClient().nextViaChatGPT(auth: settings.chatGPTAuth, model: settings.chatGPTModel, prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(), trace: { [weak self] in self?.traceModel = $0 })
                         } else {
-                            action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment())
+                            action = try await ModelClient().next(baseURL: settings.baseURL, model: settings.model, key: Keychain.read(), prompt: prompt, skillCatalog: SkillStore.shared.catalogFragment(), trace: { [weak self] in self?.traceModel = $0 })
                         }
                         // 预算计数点（Part C）：模型返回一个动作＝一次决策，
                         // 全引擎只在此一处计数（runConfirmed 执行的是已计数的
@@ -1921,10 +1935,13 @@ struct OpenStall {
                             // 按稳定描述重找重绑，不再把「目标已失效／已变化」直接判为任务失败。
                             switch try await runTargeted(action, modelPage: page, token: token) {
                             case .executed:
-                                record(action)
                                 if action.action == "type" {
                                     let trace = web.takeEditorTypeTrace()
-                                    if !trace.isEmpty { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+                                    traceInputStrategies = trace
+                                }
+                                record(action)
+                                if action.action == "type", !traceInputStrategies.isEmpty {
+                                    appendStep("note", "type 策略阶梯：\(traceInputStrategies.joined(separator: "；"))")
                                 }
                                 if action.action == "click" { appendStep("effect", clickEffectDescription()) }
                                 // 卡点逐项验收记账（LADDER-FIX F2）：真实
@@ -3774,6 +3791,68 @@ struct OpenStall {
         appendStep(action.action, action.reason + suffix)
         // 状态卡的已完成里程碑在记账点同步（程序事实，不经模型转述，H1）
         stateCard.addCompleted("\(action.action)：\(action.reason)")
+        appendTrace(action: action, suffix: suffix)
+    }
+
+    private func appendTrace(action: AgentAction, suffix: String) {
+        guard let model = traceModel else { return }
+        let page = tracePageBefore
+        let actionObject = ((try? JSONSerialization.jsonObject(with: JSONEncoder().encode(action))) as? [String: Any]) ?? [:]
+        let unknown: [String: Any] = ["observability": "unobservable", "value": NSNull()]
+        let attempted = suffix.contains("未执行") ? "not-executed" : "attempted"
+        let verified = traceInputStrategies.contains(where: { $0.contains("count-ok") || $0.contains("committed-override") }) ? "verified" : "unknown"
+        let requestAttachment = AgentTraceStore.shared.storeAttachment(model.requestBody)
+        let record: [String: Any] = [
+            "schemaVersion": 1,
+            "identityAndConfig": [
+                "taskID": conversationTaskID?.uuidString ?? "unobservable", "runID": generation.uuidString,
+                "stepID": stepSeq, "attemptID": UUID().uuidString, "timestamp": AgentTraceStore.shared.timestamp(),
+                "buildSHA": AgentTraceStore.buildSHA, "buildNumber": AgentTraceStore.buildNumber,
+                "device": AgentTraceStore.device, "webViewVersion": AgentTraceStore.webViewVersion,
+                "channel": model.channel, "requestedModel": model.requestedModel, "requestedEffort": model.requestedEffort,
+                "returnedModel": model.responseModel ?? "unobservable", "timeoutSeconds": model.timeoutSeconds,
+                "outputLimit": "not-sent", "stepLimit": limit
+            ],
+            "rawInput": [
+                "task": goal, "interjections": traceInterjection, "draftVersion": unknown,
+                "actualRequestBody": model.requestBody, "requestBodyAttachment": requestAttachment, "prompt": tracePrompt,
+                "historyBeforeFold": traceHistoryBefore, "historyAfterFold": traceHistoryAfter,
+                "segmentCharacterCounts": ["task": goal.count, "stateCard": traceStateCardBefore.count,
+                    "historyBefore": traceHistoryBefore.count, "historyAfter": traceHistoryAfter.count,
+                    "page": page?.text.count ?? 0, "playbook": loadedSkillBodies.count, "fullPrompt": tracePrompt.count],
+                "foldLevel": traceFoldLevel
+            ],
+            "rawOutput": [
+                "rawResponseOrSSE": model.rawResponse, "completeResponseItems": model.rawResponse,
+                "finishStatus": model.finishStatus, "truncation": "unobservable", "error": NSNull(),
+                "usage": model.usage ?? unknown, "parsedAction": actionObject, "completeText": action.text
+            ],
+            "actualExecution": [
+                "proposedAction": actionObject, "finalAction": actionObject, "rewriteReason": "none",
+                "attemptStatus": attempted, "verificationResult": verified,
+                "tabID": web.executionTab.id.uuidString, "frame": unknown, "documentEpoch": page?.epoch.map { $0 as Any } ?? NSNull(),
+                "targetIdentity": action.index >= 0 ? "page-element-index:\(action.index)" : "not-applicable",
+                "focus": unknown, "selection": unknown,
+                "inputStrategiesAndRetries": traceInputStrategies
+            ],
+            "independentObservation": [
+                "domTextBefore": page?.text ?? "unobservable", "domTextAfter": unknown,
+                "counterNode": unknown, "candidateState": unknown, "committedState": unknown,
+                "buttonState": page?.elements.filter { $0.tag == "button" }.map { ["index": $0.index, "text": $0.text, "disabled": $0.disabled] } ?? [],
+                "saveSignal": unknown, "reopenedTextAfterSave": unknown,
+                "source": "PageState + execution trace", "observedAt": AgentTraceStore.shared.timestamp(),
+                "observability": ["afterDOM": "unobservable", "committedState": "unobservable"]
+            ],
+            "stateAndResult": [
+                "stateCardBefore": traceStateCardBefore, "stateCardAfter": stateCard.promptBlock(),
+                "stateEvidenceSource": "program-maintained TaskStateCard", "nextRoundActualInput": "pending",
+                "finalBody": unknown, "draftOrPublishReceipt": unknown, "failureType": unknown,
+                "manualIntervention": suffix.contains("手动输入"),
+                "totalElapsedSeconds": runStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+            ]
+        ]
+        AgentTraceStore.shared.append(record)
+        traceModel = nil
     }
 
     // MARK: - 成果台账（OUTCOME-LEDGER-2026-11-02.md）
@@ -3830,7 +3909,7 @@ struct OpenStall {
         guard !action.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let target = [element.text, element.ariaLabel, element.placeholder, element.name]
             .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) ?? "（目标未名）"
-        stateCard.addWrite(target: target, body: action.text)
+        stateCard.addWrite(target: target, body: action.text, verification: "verified")
         let isEditor = element.editable || element.tag == "textarea"
         recentTyped.append((text: action.text, isEditor: isEditor))
         if recentTyped.count > 5 { recentTyped.removeFirst(recentTyped.count - 5) }
@@ -4101,10 +4180,10 @@ struct OpenStall {
         card.addWrite(target: "正文编辑器", body: "甲乙丙丁")
         card.addWrite(target: "", body: String(repeating: "文", count: 30))
         let first = card.writes ?? []
-        lines.append("\(first.count == 2 && first[0] == "正文编辑器←甲乙丙丁（4字）" && first[1] == "（目标未名）←\(String(repeating: "文", count: 24))（30字）" ? "✓" : "✗") 写入格式：目标、正文前24字、原文字数及无名目标回退")
+        lines.append("\(first.count == 2 && first[0].hasPrefix("旧版本；type=replace") && first[0].contains("目标=正文编辑器") && first[1].hasPrefix("当前内容；type=replace") && first[1].contains("核实=unknown") ? "✓" : "✗") 写入格式：replace 语义、旧版本/当前内容、attempt 与 unknown 分列")
         for number in 0..<8 { card.addWrite(target: "目标\(number)", body: "内容\(number)") }
         let retained = card.writes ?? []
-        lines.append("\(retained.count == 8 && retained.first?.hasPrefix("目标0←") == true && retained.last?.hasPrefix("目标7←") == true ? "✓" : "✗") FIFO 封顶：第9、10次写入后只留最近8条")
+        lines.append("\(retained.count == 8 && retained.first?.contains("目标=目标0") == true && retained.last?.contains("目标=目标7") == true && retained.last?.hasPrefix("当前内容；") == true ? "✓" : "✗") FIFO 封顶：第9、10次写入后只留最近8条且仅末条为当前内容")
 
         let snapshot = SessionSnapshot(savedAt: Date(), goal: card.goal, limit: 25, stepSeq: 0, steps: [],
                                        statusKind: "paused", statusText: "", pendingActionJSON: nil, pendingElement: nil,
@@ -4185,7 +4264,14 @@ struct OpenStall {
         var level = max(forcedFoldLevel, steps.count > Self.foldStepThreshold ? 1 : 0)
         while true {
             let prompt = buildPrompt(pageJSON: pageJSON, answersJSON: answersJSON, foldLevel: level, loopHint: loopHint, outcomeHint: outcomeHint, steerHint: steerHint)
-            if prompt.count <= Self.promptCharBudget || level >= 3 { return prompt }
+            if prompt.count <= Self.promptCharBudget || level >= 3 {
+                tracePrompt = prompt
+                traceHistoryBefore = Self.historyText(steps: steps, level: 0)
+                traceHistoryAfter = Self.historyText(steps: steps, level: level)
+                traceFoldLevel = level
+                traceStateCardBefore = stateCard.promptBlock()
+                return prompt
+            }
             level += 1
         }
     }
