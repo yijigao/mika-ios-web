@@ -4357,22 +4357,70 @@ struct OpenStall {
              !Set(lhs.accountAliases).isDisjoint(with: Set(rhs.accountAliases)))
     }
 
-    private static func explicitZhihuQuestionID(in instruction: String) -> String? {
+    private struct ZhihuQuestionReference {
+        enum Role { case target, excluded }
+        let id: String
+        let location: Int
+        let role: Role
+    }
+
+    /// 把任务里的题号解析成带语义的引用，而不是只取第一个数字。否定旧题的
+    /// 子句产出 excluded，后续换写的新题子句产出 target；多目标时以最后一
+    /// 个正向目标为准，符合用户在同一句中修正目标的自然顺序。
+    private static func zhihuQuestionReferences(in instruction: String) -> [ZhihuQuestionReference] {
         let patterns = [#"zhihu\.com/question/(\d+)"#, #"(?:问题|题目)\s*(?:ID\s*)?[：:#]?\s*(\d{3,})"#]
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
-                  let match = regex.firstMatch(in: instruction,
-                    range: NSRange(instruction.startIndex..<instruction.endIndex, in: instruction)),
-                  let range = Range(match.range(at: 1), in: instruction) else { continue }
-            return String(instruction[range])
+        let nsInstruction = instruction as NSString
+        let clauseSeparators = CharacterSet(charactersIn: "，,。；;！？!?\n")
+        func isClauseSeparator(at location: Int) -> Bool {
+            guard let scalar = UnicodeScalar(UInt32(nsInstruction.character(at: location))) else { return false }
+            return clauseSeparators.contains(scalar)
         }
-        return nil
+        var references: [ZhihuQuestionReference] = []
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let fullRange = NSRange(location: 0, length: nsInstruction.length)
+            for match in regex.matches(in: instruction, range: fullRange) {
+                let idRange = match.range(at: 1)
+                guard idRange.location != NSNotFound else { continue }
+                var clauseStart = match.range.location
+                while clauseStart > 0 {
+                    if isClauseSeparator(at: clauseStart - 1) { break }
+                    clauseStart -= 1
+                }
+                var clauseEnd = NSMaxRange(match.range)
+                while clauseEnd < nsInstruction.length {
+                    if isClauseSeparator(at: clauseEnd) { break }
+                    clauseEnd += 1
+                }
+                let clause = nsInstruction.substring(with: NSRange(location: clauseStart,
+                                                                    length: clauseEnd - clauseStart))
+                let referenceStart = match.range.location - clauseStart
+                let referenceEnd = NSMaxRange(match.range) - clauseStart
+                let clauseText = clause as NSString
+                let prefix = clauseText.substring(to: referenceStart)
+                let suffix = clauseText.substring(from: referenceEnd)
+                let excludesBefore = prefix.range(of:
+                    #"(?:不要|别|不再|停止|终止|放弃)(?:再)?(?:继续|处理|回答|写|改写)?(?:这个|该|旧)?(?:知乎)?\s*$"#,
+                    options: [.regularExpression, .caseInsensitive]) != nil
+                let excludesAfter = suffix.range(of:
+                    #"^\s*(?:不要|别|不再|停止|终止|放弃)(?:再)?(?:继续|处理|回答|写|改写)?"#,
+                    options: [.regularExpression, .caseInsensitive]) != nil
+                references.append(ZhihuQuestionReference(
+                    id: nsInstruction.substring(with: idRange), location: match.range.location,
+                    role: excludesBefore || excludesAfter ? .excluded : .target))
+            }
+        }
+        return references.sorted { $0.location < $1.location }
     }
 
     /// 会话关联只兜底承接“这篇／刚才／继续”等旧目标。带不同问题 ID，或明确
     /// 要另写、换题、围绕新主题创作的任务，必须从空稿开始，不能被旧稿绑住。
     private static func sessionDraftApplies(_ draft: PreservedDraft, to instruction: String) -> Bool {
-        if let questionID = explicitZhihuQuestionID(in: instruction) {
+        let references = zhihuQuestionReferences(in: instruction)
+        if references.contains(where: { $0.id == draft.target.questionID && $0.role == .excluded }) {
+            return false
+        }
+        if let questionID = references.last(where: { $0.role == .target })?.id {
             return questionID == draft.target.questionID
         }
         let newTargetPatterns = [
@@ -4385,14 +4433,38 @@ struct OpenStall {
         }
     }
 
+    private struct PreservedDraftReference {
+        var draftID: UUID?
+        var sourceTaskID: UUID?
+    }
+
+    /// 用户可在新任务文字中携带状态卡/步流展示的明确稿件关联。只接受带字段
+    /// 名的 UUID，不把任意 UUID 猜成稿件或任务，避免跨任务误取。
+    private static func preservedDraftReference(in instruction: String) -> PreservedDraftReference {
+        func identifier(labels: String) -> UUID? {
+            let pattern = "(?:\(labels))\\s*[：:#]?\\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let match = regex.firstMatch(in: instruction,
+                    range: NSRange(instruction.startIndex..<instruction.endIndex, in: instruction)),
+                  let range = Range(match.range(at: 1), in: instruction) else { return nil }
+            return UUID(uuidString: String(instruction[range]))
+        }
+        return PreservedDraftReference(
+            draftID: identifier(labels: #"draftID|稿件ID|草稿ID"#),
+            sourceTaskID: identifier(labels: #"sourceTaskID|来源任务ID"#))
+    }
+
     /// 恢复优先级固定为明确 draftID → 来源任务 → 适用的会话关联；不再用
     /// 关键词或全局最新稿猜测。明确关联不受新题文本启发式影响。
     private func attachPreservedDraft(to instruction: String, draftID: UUID? = nil,
                                       sourceTaskID: UUID? = nil) {
+        let instructionReference = Self.preservedDraftReference(in: instruction)
         let draft: PreservedDraft?
         do {
-            if let draftID {
+            if let draftID = draftID ?? instructionReference.draftID {
                 draft = try preservedDraftStore.draft(id: draftID)
+            } else if let referencedSourceTaskID = instructionReference.sourceTaskID {
+                draft = try preservedDraftStore.draft(sourceTaskID: referencedSourceTaskID)
             } else if let sourceTaskID,
                       let taskDraft = try preservedDraftStore.draft(sourceTaskID: sourceTaskID) {
                 draft = taskDraft
@@ -4873,8 +4945,8 @@ struct OpenStall {
             lines.append(line(corruptSaveRejected && corruptAfter == corruptBytes,
                               "稿库保全：存在但解码失败的文件使 save 报错，原字节保持不变"))
 
-            // 同一会话的明确新题不能继承旧稿；随后按来源任务恢复时又必须越过
-            // 会话最新稿，精确取回甲稿。三段都走 startInSession 生产入口。
+            // 同一会话中否定旧题并指定新题时不能继承旧稿；随后由全新任务携带
+            // 明确 draftID，越过会话最新乙稿取回甲稿。三段都走 startInSession。
             let interleaveStore = PreservedDraftStore(
                 fileURL: isolatedDraftDirectory.appendingPathComponent("interleaved.json"))
             let interleaveSession = UUID(), topicATask = UUID(), topicBTask = UUID()
@@ -4902,28 +4974,31 @@ struct OpenStall {
             let topicBEngine = AgentEngine(web: topicBWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: interleaveStore,
                 controlledZhihuPublishFixture: true, restoreSession: false)
+            let topicBInstruction = "不要继续问题 6101，改写问题 6102，只保存草稿"
             configure(topicBEngine, web: topicBWeb, sessionID: interleaveSession, taskID: topicBTask,
-                goal: "为知乎问题 6102 写乙题回答，只保存草稿", actions: [
+                goal: topicBInstruction, actions: [
                     try action("type", index: topicBFixture.editor.index, text: topicBBody),
                     try action("done", summary: "乙稿已保存")
                 ])
             topicBEngine.startInSession(interleaveSession, local: nil,
-                task: "为知乎问题 6102 写乙题回答，只保存草稿", startingID: topicBTask)
+                task: topicBInstruction, startingID: topicBTask)
             let topicBDone = await waitFor({ isDone(topicBEngine) }, seconds: 20)
             let savedB = try interleaveStore.draft(sourceTaskID: topicBTask)
 
+            let restoreATask = UUID()
             let restoreAWeb = WebController(); restoreAWeb.beginExecution(sessionID: interleaveSession)
             let restoreAFixture = try await loadFixture(restoreAWeb, questionID: "6101", label: "topic-a-restore")
             let restoreAEngine = AgentEngine(web: restoreAWeb, settings: SettingsStore(),
                 zhihuPublishLedgerKeyOverride: draftOnlyKey, preservedDraftStore: interleaveStore,
                 controlledZhihuPublishFixture: true, restoreSession: false)
-            configure(restoreAEngine, web: restoreAWeb, sessionID: interleaveSession, taskID: topicATask,
-                goal: "恢复来源任务甲稿并继续编辑", actions: [
+            let restoreAInstruction = "恢复 draftID: \(savedA?.id.uuidString ?? "missing") 的甲稿并继续编辑"
+            configure(restoreAEngine, web: restoreAWeb, sessionID: interleaveSession, taskID: restoreATask,
+                goal: restoreAInstruction, actions: [
                     try action("type", index: restoreAFixture.editor.index, text: "__MIKA_PRESERVED_DRAFT__"),
                     try action("done", summary: "甲稿恢复完成")
                 ])
             restoreAEngine.startInSession(interleaveSession, local: nil,
-                task: "恢复来源任务甲稿并继续编辑", startingID: topicATask)
+                task: restoreAInstruction, startingID: restoreATask)
             let restoreADone = await waitFor({ isDone(restoreAEngine) }, seconds: 20)
             let restoredA = try interleaveStore.draft(sourceTaskID: topicATask)
             let interleavedDrafts = try interleaveStore.all()
@@ -4934,11 +5009,16 @@ struct OpenStall {
                 $0.action == "draft-restore" && $0.reason.contains(savedA?.id.uuidString ?? "missing")
             }
             lines.append(line(topicADone && topicBDone && restoreADone && topicBDetached && topicARestored &&
+                              restoreATask != topicATask && restoreAEngine.conversationTaskID == restoreATask &&
                               savedA?.id != savedB?.id && interleavedDrafts.count == 2 &&
+                              savedA?.target.questionID == "6101" && savedA?.sourceTaskID == topicATask &&
+                              savedB?.target.questionID == "6102" && savedB?.sourceTaskID == topicBTask &&
                               savedA?.fullText == topicABody && savedB?.fullText == topicBBody &&
+                              restoredA?.id == savedA?.id && restoredA?.sourceTaskID == topicATask &&
                               restoredA?.fullText == topicABody &&
+                              restoreAEngine.currentZhihuWriteProof?.taskID == restoreATask &&
                               restoreAEngine.currentZhihuWriteProof?.expectedText == topicABody,
-                              "关联取稿：同会话甲→明确新题乙分别独立保存；再按来源任务恢复甲，生产入口取回全文与原甲稿一致"))
+                              "关联取稿：6101→否定旧题并指定 6102 时乙稿独立保存；全新任务按明确 draftID 越过最新乙稿恢复甲，全文一致且两稿保留"))
 
             // 真实生产主循环先完成“只写草稿”任务；任务收口后不靠任务快照，
             // 新建 Store/Engine 模拟进程退出，再从独立稿件文件取回正文。
