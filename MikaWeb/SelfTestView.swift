@@ -395,6 +395,18 @@ struct SelfTestView: View {
             }.disabled(!engine.active)
             Text("自检五十六至七十二分别保留真实编号，报告策略局部、WKWebView 与生产主循环证据；汇总文案不替代真机证据。")
                 .font(.caption).foregroundStyle(.secondary)
+            Button("自检七十三：知乎阻挡三态与目的状态") {
+                Task { @MainActor in
+                    let lines = await WebController().verifyZhihuBlockerFirstRound()
+                    for line in lines { conversation.localFeedback("自检七十三：\(line)") }
+                    conversation.localFeedback(lines.contains { $0.hasPrefix("✗") }
+                        ? "自检七十三：FAIL，见诊断与 trace 导出"
+                        : "自检七十三：8 类 WK fixture PASS；此结论不代表知乎真页通过")
+                }
+                dismiss()
+            }.disabled(!engine.active)
+            Text("MIKA-ZHIHU-BLOCKER-01 第一轮 App 内 fixture：2,001 节点无弹窗反例、无效果、透明遮挡及 pointer-events:none 对照、重渲染、跨 frame 同名、文本/SVG 关闭回归、错误/正确目的页、次数与迟到补点上限。调用生产点击与 frame 探针；真页仍须验收方独立验证。")
+                .font(.caption).foregroundStyle(.secondary)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true

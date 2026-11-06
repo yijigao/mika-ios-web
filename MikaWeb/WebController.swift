@@ -9,6 +9,7 @@ extension Notification.Name {
     /// 页面发起通行密钥（WebAuthn）请求且被平台拒绝时，由 BrowserTab 发出、
     /// AgentConversationStore 订阅并在对话区给人话降级提示（DOCK-NAV-PASSKEY-FIX）。
     static let mikaWebAuthnBlocked = Notification.Name("MikaWeb.WebAuthnBlocked")
+    static let mikaDiagnosticsChanged = Notification.Name("MikaWeb.DiagnosticsChanged")
 }
 
 struct ClickGuardCacheKey: Equatable {
@@ -348,9 +349,31 @@ enum SiteMode: String {
       // Retain the requested click target so later census and failure snapshots agree.
       var hitTarget = null;
       var targetFor = function(d){
-        if (d.targetIndex !== undefined && window===window.top) hitTarget=document.querySelector('[data-mika-idx="'+d.targetIndex+'"]');
-        else if (d.targetLabel) hitTarget=Array.from(document.querySelectorAll('button,[role="button"],a')).find(function(x){return vis(x)&&norm(lab(x))===norm(d.targetLabel);})||null;
+        hitTarget=null;
+        if (d.targetIndex !== undefined){
+          if(window===window.top)hitTarget=document.querySelector('[data-mika-idx="'+d.targetIndex+'"]');
+        } else if (d.targetLabel) {
+          var matches=Array.from(document.querySelectorAll('button,[role="button"],a')).filter(function(x){return vis(x)&&norm(lab(x))===norm(d.targetLabel);});
+          hitTarget=matches.length===1?matches[0]:null;
+        }
         return hitTarget;
+      };
+      var shortNode = function(n){
+        if(!n||!n.tagName)return null;var r=n.getBoundingClientRect(),s=getComputedStyle(n),input=/^(INPUT|TEXTAREA|SELECT)$/.test(n.tagName);
+        return {tag:n.tagName.toLowerCase(),id:(n.id||'').slice(0,40),class:clsOf(n).slice(0,80),role:(n.getAttribute('role')||'').slice(0,30),shortText:input?'[redacted-input]':lab(n).slice(0,48),rect:[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)],position:s.position,zIndex:s.zIndex,opacity:s.opacity,pointerEvents:s.pointerEvents};
+      };
+      var targetEvidence = function(){
+        if(!hitTarget)return {state:'missing',connected:false,unique:false};
+        var r=hitTarget.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2,stack=[];
+        try{stack=Array.from(document.elementsFromPoint(x,y)).slice(0,8).map(shortNode);}catch(e){}
+        var shadowChain=[],shadowHost=null;try{shadowHost=document.elementFromPoint(x,y);}catch(e){}
+        for(var depth=0;shadowHost&&shadowHost.shadowRoot&&depth<8;depth++){
+          var inner=null;try{inner=shadowHost.shadowRoot.elementFromPoint?shadowHost.shadowRoot.elementFromPoint(x,y):null;}catch(e){}
+          if(!inner||inner===shadowHost)break;shadowChain.push({host:shortNode(shadowHost),inner:shortNode(inner)});shadowHost=inner;
+        }
+        var ancestors=[],n=hitTarget;for(var i=0;n&&n.nodeType===1&&i<8;i++,n=n.parentElement)ancestors.push(shortNode(n));
+        var style=getComputedStyle(hitTarget);
+        return {state:hitTarget.isConnected?'connected':'disconnected',connected:!!hitTarget.isConnected,unique:true,descriptor:shortNode(hitTarget),disabled:!!hitTarget.disabled,readonly:!!hitTarget.readOnly,inert:!!hitTarget.inert||hitTarget.closest('[inert]')!==null,point:[Math.round(x),Math.round(y)],elementFromPoint:stack[0]||null,elementsFromPoint:stack,ancestors:ancestors,shadowChain:shadowChain,viewport:{width:innerWidth,height:innerHeight,scrollX:scrollX,scrollY:scrollY,scale:window.visualViewport?window.visualViewport.scale:1},visibility:style.visibility,display:style.display,truncated:{stack:stack.length===8,ancestors:ancestors.length===8,shadowChain:shadowChain.length===8}};
       };
       var blockerFor = function(target){
         if(!target || !target.isConnected || !vis(target)) return null;
@@ -376,7 +399,8 @@ enum SiteMode: String {
           clickable.push({tag:c.tagName.toLowerCase(),class:clsOf(c).slice(0,40),rect:[Math.round(cr.left),Math.round(cr.top),Math.round(cr.width),Math.round(cr.height)],hasSvg:!!c.querySelector('svg'),ariaLabel:(c.getAttribute('aria-label')||'').slice(0,40),role:(c.getAttribute('role')||'').slice(0,30),text:lab(c).slice(0,20)});
         }
         var modalDOM={chain:chain,clickables:clickable};
-        var fingerprint={kind:'hit-blocker',path:nodePath(h),tag:h.tagName.toLowerCase(),class:clsOf(h).slice(0,80),text:lab(h).slice(0,80),rect:[r.left,r.top,r.width,r.height],position:st.position,zIndex:st.zIndex,framePath:framePath(),modalDOM:modalDOM};
+        var tr=hitTarget.getBoundingClientRect(),point=[Math.round(tr.left+tr.width/2),Math.round(tr.top+tr.height/2)];
+        var fingerprint={kind:'hit-blocker',path:nodePath(h),tag:h.tagName.toLowerCase(),class:clsOf(h).slice(0,80),text:lab(h).slice(0,80),rect:[r.left,r.top,r.width,r.height],position:st.position,zIndex:st.zIndex,framePath:framePath(),clickPoint:point,modalDOM:modalDOM};
         return {sig:'hit-blocker:'+JSON.stringify(fingerprint),text:JSON.stringify(fingerprint),buttons:[],fingerprint:fingerprint};
       };
       var closeHitBlocker = function(d){
@@ -429,7 +453,7 @@ enum SiteMode: String {
           btns.push({ label: lab(c).slice(0,40), tag: c.tagName.toLowerCase(), cls: clsOf(c).slice(0,60) });
         }
         var r = d.getBoundingClientRect();
-        return { sig: dialogSig(d), tag: d.tagName.toLowerCase(), role: d.getAttribute('role') || '', cls: clsOf(d).slice(0,80), text: lab(d).slice(0,80), rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], buttons: btns };
+        return { sig: dialogSig(d), tag: d.tagName.toLowerCase(), role: d.getAttribute('role') || '', cls: clsOf(d).slice(0,80), text: lab(d).slice(0,80), rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], buttons: btns, containsTarget:!!(hitTarget&&d.contains(hitTarget)) };
       };
       var framePath = function(){
         var path = [], w = window;
@@ -626,7 +650,7 @@ enum SiteMode: String {
           targetFor(d);
           var dialogs = dialogElements().map(describeDialog);
           var blocker=blockerFor(hitTarget);if(blocker)dialogs.push(blockerDescription(blocker));
-          post({ kind:'probe-report', token:d.token, path:framePath(), href:hrefSafe(), isTop: window===window.top, children: window.frames.length, dialogs:dialogs });
+          post({ kind:'probe-report', token:d.token, path:framePath(), href:hrefSafe(), isTop: window===window.top, children: window.frames.length, dialogs:dialogs,target:targetEvidence(),viewport:{width:innerWidth,height:innerHeight,scrollX:scrollX,scrollY:scrollY,scale:window.visualViewport?window.visualViewport.scale:1},shadowBoundary:'open-shadow-traversed-when-elementFromPoint-is-available;closed-shadow-stops-at-host' });
         } else if (d.kind === 'click-blocker'){
           closeHitBlocker(d);
         } else if (d.kind === 'click'){
@@ -783,7 +807,10 @@ enum SiteMode: String {
         let envelope: [String: Any] = ["schemaVersion": 1, "id": id.uuidString, "receivedAt": formatter.string(from: now), "types": ["通行密钥尝试"], "payload": payload]
         guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]) else { return }
         let name = formatter.string(from: now).replacingOccurrences(of: ":", with: "-") + "-" + id.uuidString + ".json"
-        try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
+        do {
+            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+            NotificationCenter.default.post(name: .mikaDiagnosticsChanged, object: nil)
+        } catch { }
     }
 
     private func update() {
@@ -1010,6 +1037,49 @@ enum TCProbeLogStore {
 // 时由 AgentEngine 捕获的标签页（executionTabID），用户中途手动切页不影响正在跑的任务。
 @MainActor final class WebController: NSObject, ObservableObject, WKUIDelegate {
     private var clickGuardCache: ClickGuardCacheKey?
+    enum ObservationUnknownReason: String, Codable, CaseIterable {
+        case nodeBudget = "node-budget"
+        case evaluationFailure = "evaluation-failure"
+        case documentEpochChanged = "document-epoch-changed"
+        case missingReport = "missing-report"
+        case targetDisconnected = "target-disconnected"
+        case timeout = "timeout"
+        case invalidPayload = "invalid-payload"
+    }
+
+    enum ObservationState: Equatable {
+        case present
+        case absent
+        case unknown(ObservationUnknownReason)
+
+        var label: String {
+            switch self {
+            case .present: return "present"
+            case .absent: return "absent"
+            case .unknown(let reason): return "unknown(\(reason.rawValue))"
+            }
+        }
+    }
+
+    struct ModalAttemptRecord: Equatable {
+        enum Status: String { case executed, failed, notApplicable, notExecuted, observationTimeout }
+        let method: String
+        let status: Status
+        let note: String
+    }
+
+    private var lastModalAttempts: [ModalAttemptRecord] = []
+    func takeModalAttemptRecords() -> [ModalAttemptRecord] {
+        defer { lastModalAttempts = [] }
+        return lastModalAttempts
+    }
+
+    private var diagnosticTaskID = "unobservable"
+    private var diagnosticRunID = "unobservable"
+    func setDiagnosticContext(taskID: UUID?, runID: UUID?) {
+        diagnosticTaskID = taskID?.uuidString ?? "unobservable"
+        diagnosticRunID = runID?.uuidString ?? "unobservable"
+    }
     struct ClickEffect: Equatable {
         let urlChanged: Bool
         let contentChanged: Bool
@@ -3595,6 +3665,98 @@ enum TCProbeLogStore {
         _ = try await evaluate("window.__mikaThrowAfterZhihuClick=true;true", on: executionTab)
     }
 
+    /// MIKA-ZHIHU-BLOCKER-01：八类核心 fixture 走生产 dispatchClick／frame 探针，
+    /// 结果由 WKWebView 内结构化回读给出；不代表真页结论。
+    func verifyZhihuBlockerFirstRound() async -> [String] {
+        let tab = BrowserTab(loadStartPage: false, sessionID: displayedSessionID)
+        tab.webView.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        var lines: [String] = []
+        func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
+        func load(_ body: String, marker: String) async throws -> (AgentAction, PageElement) {
+            let html = "<!doctype html><html><meta name='viewport' content='width=device-width'><body>\(body)<script>window.__fixture=\"\(marker)\";</script></body></html>"
+            tab.webView.loadHTMLString(html, baseURL: URL(string: "https://www.zhihu.com/question/4242"))
+            var ready = false
+            for _ in 0..<100 {
+                if (try? await evaluate("window.__fixture==='\(marker)'&&window.__mikaFrameProbe===true", on: tab)) as? Bool == true { ready = true; break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard ready, let raw = try await evaluate(PageScript.extract, on: tab) as? String,
+                  let page = try? JSONDecoder().decode(PageState.self, from: Data(raw.utf8)),
+                  let target = page.elements.first(where: { ($0.text.isEmpty ? $0.ariaLabel : $0.text) == "写回答" }),
+                  let action = Self.selfTestClickAction(index: target.index) else { throw MikaError("BLOCKER fixture \(marker) 未就绪") }
+            return (action, target)
+        }
+        let editorJS = "const c=document.createElement('section');c.setAttribute('data-answer-editor','fixture-composer');c.setAttribute('data-question-id','4242');c.innerHTML='<div data-editor-id=fixture-editor contenteditable=true></div>';document.body.appendChild(c);"
+        do {
+            let nodes = String(repeating: "<i></i>", count: 2001)
+            var pair = try await load("<button id='answer' onclick=\"window.clicks++;\(editorJS)\">写回答</button>\(nodes)<script>window.clicks=0</script>", marker: "node-budget")
+            let budgetObservation = await dialogPersists(action: pair.0, expected: pair.1, tab: tab)
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            let nodeBudgetOK = (try await evaluate("window.clicks===1&&!!document.querySelector('[data-editor-id=fixture-editor]')", on: tab)) as? Bool == true
+            check(budgetObservation.state == .unknown(.nodeBudget) && nodeBudgetOK && takeModalAttemptRecords().isEmpty,
+                  "1：2,001 节点无弹窗——原始观测 unknown(node-budget)，编辑器出现、原按钮仅一次、无虚假关闭阶段")
+
+            pair = try await load("<button id='answer' onclick='window.clicks++'>写回答</button><script>window.clicks=0</script>", marker: "no-effect")
+            var noEffect = ""
+            do { try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab) } catch { noEffect = error.localizedDescription }
+            let once = (try await evaluate("window.clicks===1", on: tab)) as? Bool == true
+            check(once && noEffect.contains("编辑器未就绪") && !noEffect.contains(Self.modalUnresponsivePrefix), "2：无弹窗且按钮无效果——只点一次并诚实报结果未就绪")
+
+            let transparent = "<button id='answer' onclick=\"window.clicks++;\(editorJS)\" style='margin:180px'>写回答</button><div class='veil' style='position:fixed;inset:0;z-index:99;background:transparent'><span aria-label='关闭' onclick='this.parentElement.remove()' style='cursor:pointer'>×</span></div><script>window.clicks=0</script>"
+            pair = try await load(transparent, marker: "transparent-blocker")
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            check((try await evaluate("window.clicks===1&&!document.querySelector('.veil')", on: tab)) as? Bool == true,
+                  "3A：无 dialog/无文字透明遮挡——按实际命中识别、解除后仅点目标一次")
+            let pointerNone = "<button id='answer' onclick=\"window.clicks++;\(editorJS)\" style='margin:180px'>写回答</button><div class='veil' style='pointer-events:none;position:fixed;inset:0;z-index:99'></div><script>window.clicks=0</script>"
+            pair = try await load(pointerNone, marker: "pointer-none")
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            check((try await evaluate("window.clicks===1&&!!document.querySelector('.veil')", on: tab)) as? Bool == true,
+                  "3B：pointer-events:none 对照——不误报遮挡、不处置遮罩")
+
+            let moving = "<button id='answer' onclick='window.clicks++' style='margin:180px'>写回答</button><div class='veil one' style='position:fixed;inset:0;z-index:99'><span aria-label='关闭' onclick=\"const n=this.parentElement.cloneNode(true);n.className='veil two';n.style.left='12px';this.parentElement.replaceWith(n)\">×</span></div><script>window.clicks=0</script>"
+            pair = try await load(moving, marker: "rerender")
+            var rerenderError = ""
+            do { try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab) } catch { rerenderError = error.localizedDescription }
+            check((try await evaluate("window.clicks===0&&!!document.querySelector('.veil')", on: tab)) as? Bool == true && !rerenderError.isEmpty,
+                  "4：阻挡层重渲染/移动——旧节点消失不冒充解除")
+
+            let otherFrame = "<button id='answer' onclick=\"window.clicks++;\(editorJS)\">写回答</button><iframe srcdoc=\"<div role='dialog'><button>写回答</button></div>\"></iframe><script>window.clicks=0</script>"
+            pair = try await load(otherFrame, marker: "other-frame")
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            let cross = await probeFrames(on: tab)
+            check((try await evaluate("window.clicks===1", on: tab)) as? Bool == true && cross.hits.contains(where: { !$0.isTop }),
+                  "5：其他 frame 同名按钮不触发处置；frame 覆盖状态仍结构化可见")
+
+            let textClose = "<button id='answer' onclick=\"window.clicks++;\(editorJS)\" style='margin:180px'>写回答</button><div class='veil' style='position:fixed;inset:0;z-index:99'><button aria-label='关闭' onclick='this.parentElement.remove()'>关闭</button></div><script>window.clicks=0</script>"
+            pair = try await load(textClose, marker: "text-close")
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            check((try await evaluate("window.clicks===1&&!document.querySelector('.veil')", on: tab)) as? Bool == true,
+                  "6：原有文本关闭回归通过（SVG 回归继续由自检五十二覆盖）")
+
+            func directFixture(questionID: String) -> String {
+                "<a id='answer' href='#answer' style='display:block;margin:180px'>写回答</a><div class='veil' style='position:fixed;inset:0;z-index:99'></div><script>addEventListener('hashchange',()=>{document.querySelector('.veil')?.remove();const c=document.createElement('section');c.setAttribute('data-answer-editor','fixture');c.setAttribute('data-question-id','\(questionID)');c.innerHTML='<div contenteditable=true></div>';document.body.appendChild(c);});</script>"
+            }
+            pair = try await load(directFixture(questionID: "9999"), marker: "wrong-destination")
+            var wrong = ""
+            do { try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab) } catch { wrong = error.localizedDescription }
+            check(wrong.contains("未判绕行成功") || wrong.contains("编辑器状态"), "7A：错误问题/目的状态未就绪——直达不得报成功")
+            pair = try await load(directFixture(questionID: "4242"), marker: "right-destination")
+            try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab)
+            check((try await evaluate("!!document.querySelector('[data-question-id=\"4242\"] [contenteditable=true]')", on: tab)) as? Bool == true,
+                  "7B：仅正确问题的可用编辑器才收口为绕行成功")
+
+            pair = try await load("<button id='answer' onclick='window.clicks++;setTimeout(()=>window.late=(window.late||0)+1,900)'>写回答</button><script>window.clicks=0;window.late=0</script>", marker: "bounded")
+            var boundedError = ""
+            do { try await dispatchClick(pair.0, expected: pair.1, approved: false, tab: tab) } catch { boundedError = error.localizedDescription }
+            try await Task.sleep(for: .milliseconds(1000))
+            check((try await evaluate("window.clicks===1&&window.late===1", on: tab)) as? Bool == true && boundedError.contains("未重复点击"),
+                  "8：回读/次数有界——到顶后无迟到补点，实际点击次数为一")
+        } catch {
+            lines.append("✗ BLOCKER-01 fixture 异常：\(error.localizedDescription)")
+        }
+        return lines
+    }
+
     /// 自检四十七：独立页面经生产 dispatchClick；shadow 内部仅报告 host 指纹。
     func verifyHitBlockerClose() async -> [String] {
         let tab = BrowserTab(loadStartPage:false, sessionID:displayedSessionID)
@@ -3625,7 +3787,7 @@ enum TCProbeLogStore {
                 do { try await dispatchClick(action,expected:target,approved:false,tab:tab) }
                 catch let error as MikaError { errorText = error.localizedDescription }
                 let clicked = (try await evaluate("window.originalClicks===1",on:tab)) as? Bool == true
-                check(mode == "stubborn" ? !clicked && errorText.contains(Self.modalUnresponsivePrefix) && errorText.contains("hit-blocker:") && errorText.contains("promo-veil") && errorText.contains("关闭 affordance") && errorText.contains("遮罩角点") && errorText.contains("Escape") : clicked && errorText.isEmpty, "\(mode): 原点击／失败指纹与已试手段回读")
+                check(mode == "stubborn" ? !clicked && errorText.contains(Self.modalUnresponsivePrefix) && errorText.contains("hit-blocker:") && errorText.contains("promo-veil") && errorText.contains("hit-blocker-mask-outside") && errorText.contains("hit-blocker-escape") : clicked && errorText.isEmpty, "\(mode): 原点击／失败指纹与实际执行账回读")
                 if !errorText.isEmpty { lines.append("· \(errorText)") }
             }
             tab.webView.loadHTMLString("<html><body><iframe srcdoc=\"<div role='dialog'><button onclick='this.parentElement.remove()'>关闭窗</button></div>\"></iframe></body></html>",baseURL:nil)
@@ -4171,16 +4333,15 @@ enum TCProbeLogStore {
     //
     // 真机现场（Joey 2026-11-03 01:46，构建 1655）：微信公众号编辑器的
     // 「AI 配图」条款弹窗，agent 多次点「同意」弹窗始终不消失——这类网页
-    // 按钮只认完整的 pointer/mouse 事件序列（或只认真实点按），旧 click
-    // 只调 e.click() 派发一个简化 click 事件，网页不认账。升级路径：
+    // 部分按钮对简化 click 没有预期结果，旧 click 只调 e.click()。升级路径：
     // 目标位于弹窗内、或普通点击后观察到同一弹窗仍在 → 改用完整事件
     // 序列（先滚动入视口，再按元素中心坐标带间隔依次派发 pointerover→
     // pointerdown→mousedown→focus→pointerup→mouseup→click）；升级后弹窗
     // 仍在、连败 2 次 → 抛 modalUnresponsivePrefix 错误，引擎据此判定
     // 为能力类卡点、走绕行梯（弹窗导航绕行），不停车等用户代劳
     // （AUTONOMY-FIX；信号判定见 AgentEngine.modalInterventionText）。
-    // 诚实边界：合成事件 isTrusted=false 无法伪造——过不去时如实进
-    // 绕行梯/失败结案，绝不静默循环、绝不假装已同意。
+    // 诚实边界：合成事件的 isTrusted=false 只作事实记录，不据此推断站点
+    // 根因；过不去时按实际执行与回读结果分账，绝不静默循环或假报成功。
 
     /// 弹窗点按无响应的错误前缀（引擎分类门信号判定的唯一依据，两处共用同一常量）。
     static let modalUnresponsivePrefix = "弹窗点按无响应"
@@ -4217,38 +4378,62 @@ enum TCProbeLogStore {
         return (result as? String) ?? "ready-plain"
     }
 
-    /// 弹窗存续探针：点击之后「同一弹窗仍在」是否成立——目标节点仍连接、
-    /// 可见且身处弹窗内，或任一可见弹窗容器里还有同文案的可见按钮。
+    /// 弹窗存续探针是显式三态。扫描截断、求值失败、页面代次变化与
+    /// 目标失联均保留原因；unknown 既不等于仍有弹窗，也不等于已经成功。
     private struct DialogPersistence {
-        let persists: Bool
-        let coverageComplete: Bool
-        var confirmedGone: Bool { coverageComplete && !persists }
+        let state: ObservationState
+        let scanned: Int
+        let limit: Int
+        let targetConnected: Bool
     }
-    private func dialogPersists(action: AgentAction, expected: PageElement, tab: BrowserTab) async -> DialogPersistence {
+    private func dialogPersists(action: AgentAction, expected: PageElement, tab: BrowserTab,
+                                allowTargetDisappearance: Bool = false) async -> DialogPersistence {
         let epoch = tab.documentEpoch
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
-        guard let data = try? JSONSerialization.data(withJSONObject: ["index": action.index, "label": label]),
-              let json = String(data: data, encoding: .utf8) else { return DialogPersistence(persists: false, coverageComplete: false) }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["index": action.index, "label": label,
+                                                                       "allowTargetDisappearance": allowTargetDisappearance]),
+              let json = String(data: data, encoding: .utf8) else {
+            return DialogPersistence(state: .unknown(.invalidPayload), scanned: 0, limit: 2000, targetConnected: false)
+        }
         let script = """
         (()=>{const a=\(json);
         \(Self.dialogProbeJS)
         const e=document.querySelector('[data-mika-idx="'+a.index+'"]');
-        if(e&&e.isConnected&&visDlg(e)&&dialogOf(e))return 'still';
+        const connected=!!(e&&e.isConnected);
+        if(connected&&visDlg(e)&&dialogOf(e))return JSON.stringify({status:'present',reason:null,scanned:0,limit:2000,targetConnected:true});
         const want=normDlg(a.label);
-        if(!want)return 'unknown';
+        if(!want)return JSON.stringify({status:'unknown',reason:'invalid-payload',scanned:0,limit:2000,targetConnected:connected});
         const examine=d=>{if(!visDlg(d)||dialogOf(d)!==d)return false;const cands=d.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]');for(const c of cands){if(visDlg(c)&&normDlg(labDlg(c))===want)return true;}return false;};
         if(want){
           const known=document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],.modal,[class*="dialog"],[class*="modal"],[class*="popup"]');
-          let seen=0;for(const d of known){if(++seen>64)return 'unknown';if(examine(d))return 'still';}
+          let seen=0;for(const d of known){if(++seen>64)return JSON.stringify({status:'unknown',reason:'node-budget',scanned:seen,limit:64,targetConnected:connected});if(examine(d))return JSON.stringify({status:'present',reason:null,scanned:seen,limit:64,targetConnected:connected});}
           const walk=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT);
-          let d;seen=0;while((d=walk.nextNode())){if(++seen>2000)return 'unknown';if(d.matches('button,[role="button"],a,input[type="button"],input[type="submit"]')&&visDlg(d)&&normDlg(labDlg(d))===want&&dialogOf(d))return 'still';}
+          let d;seen=0;while((d=walk.nextNode())){if(++seen>2000)return JSON.stringify({status:'unknown',reason:'node-budget',scanned:seen,limit:2000,targetConnected:connected});if(d.matches('button,[role="button"],a,input[type="button"],input[type="submit"]')&&visDlg(d)&&normDlg(labDlg(d))===want&&dialogOf(d))return JSON.stringify({status:'present',reason:null,scanned:seen,limit:2000,targetConnected:connected});}
+          if(!connected&&!a.allowTargetDisappearance)return JSON.stringify({status:'unknown',reason:'target-disconnected',scanned:seen,limit:2000,targetConnected:false});
+          return JSON.stringify({status:'absent',reason:null,scanned:seen,limit:2000,targetConnected:connected});
         }
-        return 'gone';})()
+        return JSON.stringify({status:'absent',reason:null,scanned:0,limit:2000,targetConnected:connected});})()
         """
-        let result = try? await evaluate(script, on: tab)
-        guard tab.documentEpoch == epoch else { return DialogPersistence(persists: false, coverageComplete: false) }
-        let status = result as? String
-        return DialogPersistence(persists: status == "still", coverageComplete: status == "still" || status == "gone")
+        let result: Any?
+        do { result = try await evaluate(script, on: tab) }
+        catch { return DialogPersistence(state: .unknown(.evaluationFailure), scanned: 0, limit: 2000, targetConnected: false) }
+        guard tab.documentEpoch == epoch else {
+            return DialogPersistence(state: .unknown(.documentEpochChanged), scanned: 0, limit: 2000, targetConnected: false)
+        }
+        guard let raw = result as? String, let payload = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let status = payload["status"] as? String else {
+            return DialogPersistence(state: .unknown(.invalidPayload), scanned: 0, limit: 2000, targetConnected: false)
+        }
+        let state: ObservationState
+        if status == "present" { state = .present }
+        else if status == "absent" { state = .absent }
+        else {
+            let rawReason = payload["reason"] as? String ?? ObservationUnknownReason.invalidPayload.rawValue
+            state = .unknown(ObservationUnknownReason(rawValue: rawReason) ?? .invalidPayload)
+        }
+        return DialogPersistence(state: state, scanned: payload["scanned"] as? Int ?? 0,
+                                 limit: payload["limit"] as? Int ?? 2000,
+                                 targetConnected: payload["targetConnected"] as? Bool ?? false)
     }
 
     /// 完整点按序列的单步派发：每步独立求值（步间由 Swift 侧睡出小间隔），
@@ -4302,13 +4487,28 @@ enum TCProbeLogStore {
         let local = try localClickGuard(action: action, expected: expected, approved: approved)
         let validity = try await evaluate("(()=>{\(local)return 'ready';})()", on: tab) as? String
         guard validity == "ready" else { throw MikaError("目标元素已失效") }
-        for _ in 1...2 {
+        for round in 1...2 {
             try await performPointerSequence(action: action, approved: approved, tab: tab)
+            lastModalAttempts.append(ModalAttemptRecord(method: "pointer-sequence-\(round)", status: .executed,
+                                                        note: "完整 pointer/mouse 序列已派发"))
             try await Task.sleep(for: .milliseconds(600))
-            if await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone { return }
+            let observation = await dialogPersists(action: action, expected: expected, tab: tab,
+                                                   allowTargetDisappearance: true)
+            switch observation.state {
+            case .absent:
+                return
+            case .present:
+                lastModalAttempts.append(ModalAttemptRecord(method: "post-click-observation-\(round)", status: .failed,
+                                                            note: "弹窗仍为 present"))
+            case .unknown(let reason):
+                lastModalAttempts.append(ModalAttemptRecord(method: "post-click-observation-\(round)",
+                                                            status: reason == .timeout || reason == .missingReport ? .observationTimeout : .failed,
+                                                            note: observation.state.label))
+                throw MikaError("弹窗状态观测不足：\(observation.state.label)，未继续盲点")
+            }
         }
         await captureFailureSnapshot(context: "弹窗点按无响应：\(action.reason)", tab: tab)
-        throw MikaError("\(Self.modalUnresponsivePrefix)：弹窗内的按钮经完整点按序列（真实坐标的 pointer/mouse 事件）两次尝试后仍未关闭——合成点按不是真实点按（isTrusted=false），这类网页只认真实点按")
+        throw MikaError("\(Self.modalUnresponsivePrefix)：弹窗内按钮的两次完整点按序列均已执行，回读仍为 present")
     }
 
     // MARK: - 弹窗 frame 探针与框内感知关闭（WECHAT-COVER-FIX，Part A）
@@ -4335,6 +4535,7 @@ enum TCProbeLogStore {
         let sig: String
         let text: String
         let buttons: [(label: String, tag: String)]
+        let containsTarget: Bool
     }
 
     struct FrameCensus {
@@ -4342,6 +4543,13 @@ enum TCProbeLogStore {
         let hits: [FrameDialogHit]
         let framePaths: Set<String>
         let coverageComplete: Bool
+        let unknownReasons: [ObservationUnknownReason]
+        let targetState: String
+        let reports: [[String: Any]]
+        var observation: ObservationState {
+            if let reason = unknownReasons.first { return .unknown(reason) }
+            return hits.isEmpty ? .absent : .present
+        }
         /// 人话摘要（进诊断与失败原文）：frame 总数＋每个命中弹窗的位置与按钮。
         var summary: String {
             guard !hits.isEmpty else { return "共 \(frameCount) 个 frame，未发现弹窗" }
@@ -4362,6 +4570,7 @@ enum TCProbeLogStore {
     /// （900ms 窗口）。探针未覆盖的页面（注入缺失）返回空普查，调用方
     /// 据此回落旧路径。
     func probeFrames(on tab: BrowserTab, targetIndex: Int? = nil, targetLabel: String = "") async -> FrameCensus {
+        let epoch = tab.documentEpoch
         let token = UUID().uuidString
         let box = FrameMessageBox()
         FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
@@ -4372,8 +4581,11 @@ enum TCProbeLogStore {
         if let targetIndex { payload["targetIndex"] = targetIndex; payload["targetLabel"] = targetLabel }
         let payloadJSON = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
         let flood = "(()=>{const d=\(payloadJSON);window.postMessage(d,'*');return 'flooded';})()"
-        _ = try? await evaluate(flood, on: tab)
+        var reasons: [ObservationUnknownReason] = []
+        do { _ = try await evaluate(flood, on: tab) }
+        catch { reasons.append(.evaluationFailure) }
         try? await Task.sleep(for: .milliseconds(900))
+        if tab.documentEpoch != epoch { reasons.append(.documentEpochChanged) }
         var hits: [FrameDialogHit] = []
         for message in box.messages {
             let isTop = (message["isTop"] as? Bool) ?? false
@@ -4385,12 +4597,23 @@ enum TCProbeLogStore {
                 }
                 hits.append(FrameDialogHit(framePath: path, frameHref: href, isTop: isTop,
                                            sig: (dialog["sig"] as? String) ?? "",
-                                           text: (dialog["text"] as? String) ?? "", buttons: buttons))
+                                           text: (dialog["text"] as? String) ?? "", buttons: buttons,
+                                           containsTarget: (dialog["containsTarget"] as? Bool) ?? false))
             }
         }
-        return FrameCensus(frameCount: box.messages.count, hits: hits,
-                           framePaths: Set(box.messages.compactMap { $0["path"] as? String }),
-                           coverageComplete: box.messages.contains { ($0["isTop"] as? Bool) == true })
+        let paths = Set(box.messages.compactMap { $0["path"] as? String })
+        let hasTop = box.messages.contains { ($0["isTop"] as? Bool) == true }
+        let expected = 1 + box.messages.reduce(0) { $0 + (($1["children"] as? Int) ?? 0) }
+        if !hasTop || paths.count < expected { reasons.append(.missingReport) }
+        let targetState = box.messages.first(where: { ($0["isTop"] as? Bool) == true })
+            .flatMap { $0["target"] as? [String: Any] }?["state"] as? String ?? "missing"
+        if targetIndex != nil && hasTop && (targetState == "disconnected" || targetState == "missing") {
+            reasons.append(.targetDisconnected)
+        }
+        let uniqueReasons = Array(Set(reasons.map(\.rawValue))).compactMap(ObservationUnknownReason.init(rawValue:))
+        return FrameCensus(frameCount: box.messages.count, hits: hits, framePaths: paths,
+                           coverageComplete: reasons.isEmpty, unknownReasons: uniqueReasons,
+                           targetState: targetState, reports: box.messages)
     }
 
     struct FrameClickReport {
@@ -4406,14 +4629,16 @@ enum TCProbeLogStore {
     /// 目标按钮的 frame 会回報；其余 frame 静默）。阶段尝试在 frame 内
     /// 完成，最长约 8 秒，等待上限 10 秒；无回報（探针未覆盖／没有
     /// frame 持有该按钮）返回 nil。
-    func dispatchFrameClick(on tab: BrowserTab, label: String, approved: Bool, blockerOnly: Bool = false) async -> FrameClickReport? {
+    func dispatchFrameClick(on tab: BrowserTab, label: String, approved: Bool, blockerOnly: Bool = false,
+                            targetIndex: Int? = nil) async -> FrameClickReport? {
         let token = UUID().uuidString
         let box = FrameMessageBox()
         FrameProbeHub.shared.register(webView: tab.webView, token: token) { body in
             if (body["kind"] as? String) == "click-report", box.messages.isEmpty { box.messages.append(body) }
         }
         defer { FrameProbeHub.shared.unregister(token: token) }
-        let payload: [String: Any] = ["__mikaFrame": 1, "kind": blockerOnly ? "click-blocker" : "click", "token": token, "label": label, "approved": approved, "keywords": SafetyPolicy.keywords]
+        var payload: [String: Any] = ["__mikaFrame": 1, "kind": blockerOnly ? "click-blocker" : "click", "token": token, "label": label, "approved": approved, "keywords": SafetyPolicy.keywords]
+        if let targetIndex { payload["targetIndex"] = targetIndex }
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
         let flood = "(()=>{const d=\(String(decoding: payloadData, as: UTF8.self));window.postMessage(d,'*');return 'flooded';})()"
         _ = try? await evaluate(flood, on: tab)
@@ -4431,28 +4656,77 @@ enum TCProbeLogStore {
         return nil
     }
 
-    /// 探针实测留档：与失败快照同目录、同信封格式（诊断页可见）。
-    private func recordFrameProbeDiagnostic(census: FrameCensus, tab: BrowserTab, label: String) {
+    private static func questionID(in url: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: "/question/(\\d+)"),
+              let match = regex.firstMatch(in: url, range: NSRange(url.startIndex..., in: url)),
+              let range = Range(match.range(at: 1), in: url) else { return "unobservable" }
+        return String(url[range])
+    }
+
+    private static func diagnosticURL(_ raw: String) -> String {
+        guard var components = URLComponents(string: raw) else { return String(raw.prefix(240)) }
+        components.user = nil; components.password = nil; components.query = nil; components.fragment = nil
+        return String((components.string ?? "unobservable").prefix(240))
+    }
+
+    /// 探针实测留档：与失败快照同目录、同信封格式（诊断页可见、可一次分享）。
+    /// 只收有界结构化片段；不采集整页 HTML、输入框值或凭据。
+    @discardableResult
+    private func recordFrameProbeDiagnostic(census: FrameCensus, tab: BrowserTab, label: String,
+                                            phase: String = "before-action",
+                                            disposition: String = "observed",
+                                            attempts: [ModalAttemptRecord] = [],
+                                            resultEvidence: [String: Any] = [:]) -> String {
+        let evidenceID = UUID().uuidString
+        let pageURL = Self.diagnosticURL(tab.webView.url?.absoluteString ?? "")
+        let boundedReports: [[String: Any]] = census.reports.prefix(32).map { report in
+            ["path": report["path"] ?? "?", "href": Self.diagnosticURL(report["href"] as? String ?? ""),
+             "isTop": report["isTop"] ?? false, "children": report["children"] ?? 0,
+             "dialogs": report["dialogs"] ?? [], "target": report["target"] ?? [:],
+             "viewport": report["viewport"] ?? [:], "shadowBoundary": report["shadowBoundary"] ?? "unobservable"]
+        }
         let payload: [String: Any] = [
-            "kind": "frame-probe",
-            "url": tab.webView.url?.absoluteString ?? "",
-            "targetLabel": label,
-            "frameCount": census.frameCount,
-            "summary": census.summary,
-            "hits": census.hits.map { hit in
-                ["framePath": hit.framePath, "frameHref": hit.frameHref, "isTop": hit.isTop,
+            "kind": "zhihu-blocker-evidence", "evidenceID": evidenceID, "phase": phase,
+            "identity": ["buildNumber": AgentTraceStore.buildNumber, "buildSHA": AgentTraceStore.buildSHA,
+                         "taskID": diagnosticTaskID, "runID": diagnosticRunID, "attemptID": UUID().uuidString,
+                         "tabID": tab.id.uuidString, "documentEpoch": tab.documentEpoch,
+                         "url": pageURL, "questionID": Self.questionID(in: pageURL)],
+            "rawDecision": ["branch": "click-frame-probe", "state": census.observation.label,
+                            "unknownReasons": census.unknownReasons.map(\.rawValue),
+                            "frameReports": census.frameCount, "coverageComplete": census.coverageComplete],
+            "targetState": ["label": String(label.prefix(80)), "state": census.targetState],
+            "clickSceneAndBoundaries": ["reports": boundedReports, "reportLimit": 32,
+                                         "truncated": census.reports.count > boundedReports.count,
+                                         "coordinateSpace": "per-frame CSS viewport"],
+            "dispositionAndResult": ["disposition": disposition,
+                                      "attempts": attempts.map { ["method": $0.method, "status": $0.status.rawValue,
+                                                                   "note": String($0.note.prefix(240))] },
+                                      "resultEvidence": resultEvidence],
+            "frameCount": census.frameCount, "summary": census.summary,
+            "hits": census.hits.prefix(32).map { hit in
+                ["framePath": hit.framePath, "frameHref": Self.diagnosticURL(hit.frameHref), "isTop": hit.isTop,
                  "sig": hit.sig, "text": hit.text,
+                 "containsTarget": hit.containsTarget,
                  "buttons": hit.buttons.map { ["label": $0.label, "tag": $0.tag] }] as [String: Any]
             },
+            "privacy": ["wholeHTML": false, "inputValues": false, "credentials": false]
         ]
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let id = UUID(), now = Date(), formatter = ISO8601DateFormatter()
         let envelope: [String: Any] = ["schemaVersion": 1, "id": id.uuidString, "receivedAt": formatter.string(from: now), "types": ["弹窗Frame探针"], "payload": payload]
-        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]) else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]) else { return evidenceID }
         let name = formatter.string(from: now).replacingOccurrences(of: ":", with: "-") + "-" + id.uuidString + ".json"
-        try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
+        do {
+            try data.write(to: directory.appendingPathComponent(name), options: .atomic)
+            NotificationCenter.default.post(name: .mikaDiagnosticsChanged, object: nil)
+        } catch { }
+        AgentTraceStore.shared.appendEngineAction(action: "zhihu-blocker-evidence", targetFingerprint: label,
+            method: phase, result: disposition, pageURL: pageURL, taskID: diagnosticTaskID, runID: diagnosticRunID,
+            evidence: ["evidenceID": evidenceID, "probeState": census.observation.label,
+                       "unknownReasons": census.unknownReasons.map(\.rawValue), "diagnosticFile": name])
+        return evidenceID
     }
 
     private static func frameLabelMatch(_ a: String, _ b: String) -> Bool {
@@ -4468,17 +4742,44 @@ enum TCProbeLogStore {
         var lastCensus: FrameCensus?
         var sawDialog = false
         for round in 1...2 {
-            let census = await probeFrames(on: tab)
+            let census = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
             lastCensus = census
-            if round == 1 { recordFrameProbeDiagnostic(census: census, tab: tab, label: label) }
-            let hit = census.hits.first(where: { hit in hit.buttons.contains { Self.frameLabelMatch($0.label, label) } })
-                ?? census.hits.first(where: { !$0.isTop })
-                ?? census.hits.first
-            guard let hit else { break }
+            if round == 1 { recordFrameProbeDiagnostic(census: census, tab: tab, label: label, phase: "before-modal-close") }
+            let hit = census.hits.first(where: { $0.containsTarget })
+                ?? census.hits.first(where: { hit in
+                    hit.isTop && hit.buttons.contains { Self.frameLabelMatch($0.label, label) }
+                })
+            guard let hit else {
+                if case .unknown(let reason) = census.observation {
+                    lastModalAttempts.append(ModalAttemptRecord(method: "frame-probe", status: .observationTimeout,
+                                                                note: "unknown(\(reason.rawValue)); 未执行关闭"))
+                    throw MikaError("弹窗状态观测不足：unknown(\(reason.rawValue))，未执行无关关闭")
+                }
+                lastModalAttempts.append(ModalAttemptRecord(method: "frame-close", status: .notApplicable,
+                                                            note: "本次 frame 普查未发现与目标关联的弹窗"))
+                break
+            }
             sawDialog = true
-            if let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: hit.sig.hasPrefix("hit-blocker:")), report.gone {
-                let after = await probeFrames(on: tab)
-                if !after.hits.contains(where: { $0.sig == hit.sig }) { return }
+            guard let report = await dispatchFrameClick(on: tab, label: label, approved: approved,
+                                                        blockerOnly: hit.sig.hasPrefix("hit-blocker:"),
+                                                        targetIndex: expected.index) else {
+                lastModalAttempts.append(ModalAttemptRecord(method: "frame-close", status: .observationTimeout,
+                                                            note: "点击回报超时；未重复点按"))
+                throw MikaError("弹窗关闭回报超时：unknown(timeout)，未重复点按")
+            }
+            for method in report.stages {
+                lastModalAttempts.append(ModalAttemptRecord(method: method,
+                                                            status: report.gone && method == report.stages.last ? .executed : .failed,
+                                                            note: report.gone ? "执行后报告 gone，等待独立复查" : "执行后弹窗仍在"))
+            }
+            if report.gone {
+                let after = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
+                recordFrameProbeDiagnostic(census: after, tab: tab, label: label, phase: "after-modal-close",
+                                           disposition: after.observation.label, attempts: lastModalAttempts)
+                if after.coverageComplete && !after.hits.contains(where: { $0.sig == hit.sig }) { return }
+                if case .unknown(let reason) = after.observation {
+                    throw MikaError("弹窗关闭后复查不足：unknown(\(reason.rawValue))，未判成功")
+                }
             }
             if round < 2 { try? await Task.sleep(for: .milliseconds(400)) }
         }
@@ -4487,7 +4788,8 @@ enum TCProbeLogStore {
             return
         }
         await captureFailureSnapshot(context: "弹窗点按无响应（frame 感知）：\(action.reason)", tab: tab)
-        throw MikaError("\(Self.modalUnresponsivePrefix)：frame 探针实测——\(lastCensus?.summary ?? "无探针数据")。已在弹窗所在 frame 内依次尝试完整点按序列、触摸序列、Escape、关闭按钮与遮罩点击，两轮后弹窗仍在——合成事件 isTrusted=false 的边界未变，这类网页只认真实点按")
+        let actual = lastModalAttempts.map { "\($0.method)=\($0.status.rawValue)" }.joined(separator: "、")
+        throw MikaError("\(Self.modalUnresponsivePrefix)：frame 探针实测——\(lastCensus?.summary ?? "无探针数据")。实际执行账：\(actual.isEmpty ? "未执行" : actual)")
     }
 
     // MARK: - 入口揭示复判（WECHAT-EDITOR-NAV A2）
@@ -4551,6 +4853,94 @@ enum TCProbeLogStore {
                             hit: (obj["hit"] as? Bool) ?? false)
     }
 
+    private struct AnswerEditorObservation {
+        let applicable: Bool
+        let state: ObservationState
+        let questionID: String
+        let evidence: [String: Any]
+    }
+
+    private func observeAnswerEditor(afterClickOn expected: PageElement, expectedQuestionID explicitQuestionID: String? = nil,
+                                     tab: BrowserTab) async -> AnswerEditorObservation {
+        let label = (expected.text.isEmpty ? expected.ariaLabel : expected.text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pageURL = tab.webView.url?.absoluteString ?? ""
+        let expectedQuestionID = explicitQuestionID ?? Self.questionID(in: pageURL)
+        let applicable = pageURL.contains("zhihu.com/") && label.contains("写回答") && expectedQuestionID != "unobservable"
+        guard applicable else { return AnswerEditorObservation(applicable: false, state: .absent, questionID: "", evidence: [:]) }
+        let epoch = tab.documentEpoch
+        let questionJSON = String(decoding: (try? JSONEncoder().encode(expectedQuestionID)) ?? Data("\"\"".utf8), as: UTF8.self)
+        let script = """
+        (()=>{const expected=\(questionJSON),vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        const path=(location.pathname.match(/\\/question\\/(\\d+)/)||[])[1]||'';
+        const editors=[...document.querySelectorAll('[contenteditable="true"],textarea')].filter(vis);
+        const candidates=editors.map(e=>{const owner=e.closest('[data-question-id],[data-answer-editor],.AnswerForm,.AnswerEditor,form');const q=owner?.getAttribute('data-question-id')||e.getAttribute('data-question-id')||path;return{e,owner,q};}).filter(x=>x.q===expected);
+        const usable=candidates.filter(x=>!x.e.disabled&&!x.e.readOnly&&!x.e.closest('[inert],[aria-hidden="true"]'));
+        const chosen=usable.length===1?usable[0]:null;
+        return JSON.stringify({status:chosen?'present':'absent',questionID:path,expectedQuestionID:expected,editorCount:editors.length,ownedCount:candidates.length,usableCount:usable.length,editorReady:!!chosen,editable:!!chosen&&(chosen.e.isContentEditable||chosen.e.tagName==='TEXTAREA'),focused:!!chosen&&(document.activeElement===chosen.e||chosen.e.contains(document.activeElement)),identity:chosen?((chosen.e.getAttribute('data-editor-id')||chosen.e.id||chosen.e.tagName).slice(0,80)):'',composer:chosen?((chosen.owner?.getAttribute('data-answer-editor')||chosen.owner?.id||chosen.owner?.className||'').toString().slice(0,80)):''});})()
+        """
+        let value: Any?
+        do { value = try await evaluate(script, on: tab) }
+        catch { return AnswerEditorObservation(applicable: true, state: .unknown(.evaluationFailure), questionID: expectedQuestionID, evidence: ["error": error.localizedDescription]) }
+        guard tab.documentEpoch == epoch else {
+            return AnswerEditorObservation(applicable: true, state: .unknown(.documentEpochChanged), questionID: expectedQuestionID, evidence: [:])
+        }
+        guard let raw = value as? String,
+              let evidence = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let status = evidence["status"] as? String else {
+            return AnswerEditorObservation(applicable: true, state: .unknown(.invalidPayload), questionID: expectedQuestionID, evidence: [:])
+        }
+        return AnswerEditorObservation(applicable: true, state: status == "present" ? .present : .absent,
+                                       questionID: expectedQuestionID, evidence: evidence)
+    }
+
+    /// 普通点击只派发一次。先查本题编辑器；仅在观测不足时最多补两次有界回读，
+    /// 不会因 unknown 再点「写回答」。
+    private func verifyAnswerEditorAfterSingleClick(expected: PageElement, expectedQuestionID: String? = nil,
+                                                    tab: BrowserTab) async -> AnswerEditorObservation {
+        var observation = await observeAnswerEditor(afterClickOn: expected, expectedQuestionID: expectedQuestionID, tab: tab)
+        guard observation.applicable else { return observation }
+        for _ in 0..<2 {
+            if case .present = observation.state { break }
+            try? await Task.sleep(for: .milliseconds(250))
+            observation = await observeAnswerEditor(afterClickOn: expected, expectedQuestionID: expectedQuestionID, tab: tab)
+        }
+        return observation
+    }
+
+    private func requireAnswerEditorAfterSingleClick(expected: PageElement, label: String, tab: BrowserTab) async throws -> Bool {
+        let result = await verifyAnswerEditorAfterSingleClick(expected: expected, tab: tab)
+        guard result.applicable else { return false }
+        let after = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
+        recordFrameProbeDiagnostic(census: after, tab: tab, label: label, phase: "after-single-click",
+                                   disposition: result.state.label, attempts: lastModalAttempts,
+                                   resultEvidence: result.evidence)
+        switch result.state {
+        case .present:
+            return true
+        case .absent:
+            throw MikaError("「\(label)」已派发一次，但本题（\(result.questionID)）回答编辑器未就绪；未重复点击")
+        case .unknown(let reason):
+            throw MikaError("「\(label)」已派发一次，结果观测不足：unknown(\(reason.rawValue))；两次有界回读后仍未确认，未重复点击")
+        }
+    }
+
+    func zhihuAnswerEditorDestinationState(questionID: String) async -> ObservationState {
+        let tab = executionTab, epoch = executionTab.documentEpoch
+        let encoded = String(decoding: (try? JSONEncoder().encode(questionID)) ?? Data("\"\"".utf8), as: UTF8.self)
+        let script = """
+        (()=>{const expected=\(encoded),path=(location.pathname.match(/\\/question\\/(\\d+)/)||[])[1]||'',vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+        if(path!==expected)return 'absent';const usable=[...document.querySelectorAll('[contenteditable="true"],textarea')].filter(e=>{const owner=e.closest('[data-question-id],[data-answer-editor],.AnswerForm,.AnswerEditor,form'),q=owner?.getAttribute('data-question-id')||e.getAttribute('data-question-id')||path;return q===expected&&vis(e)&&!e.disabled&&!e.readOnly&&!e.closest('[inert],[aria-hidden="true"]');});return usable.length===1?'present':'absent';})()
+        """
+        let value: Any?
+        do { value = try await evaluate(script, on: tab) }
+        catch { return .unknown(.evaluationFailure) }
+        guard tab.documentEpoch == epoch else { return .unknown(.documentEpochChanged) }
+        if value as? String == "present" { return .present }
+        if value as? String == "absent" { return .absent }
+        return .unknown(.invalidPayload)
+    }
+
     /// click 总流程：先探针分流——目标在弹窗内直接走升级序列；普通目标
     /// 先按已校验元素点（旧口径），点后若观察到同一弹窗仍在再升级；
     /// 禁用/缺失时「等待＋重扫」轮询约 3.6 秒（编辑器状态更新后按钮常
@@ -4582,48 +4972,86 @@ enum TCProbeLogStore {
 
     private func dispatchClick(_ action: AgentAction, expected: PageElement?, approved: Bool, tab: BrowserTab) async throws {
         guard let expected else { throw MikaError("缺少已检查的目标元素") }
+        lastModalAttempts = []
         let probe = try await probeClickContext(action: action, expected: expected, approved: approved, tab: tab)
         if probe.hasPrefix("ready-") {
             _ = try await evaluate("document.querySelector('[data-mika-idx=\"\(expected.index)\"]')?.scrollIntoView({block:'center'});true", on: tab)
         }
         let label = expected.text.isEmpty ? expected.ariaLabel : expected.text
         var blockerCensus = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
+        let answerEntry = (tab.webView.url?.absoluteString ?? "").contains("zhihu.com/question/") && label.contains("写回答")
+        if answerEntry {
+            let legacyDialog = await dialogPersists(action: action, expected: expected, tab: tab)
+            recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label,
+                                       phase: "before-single-click", disposition: blockerCensus.observation.label,
+                                       resultEvidence: ["dialogObservation": legacyDialog.state.label,
+                                                        "scanned": legacyDialog.scanned, "limit": legacyDialog.limit,
+                                                        "targetConnected": legacyDialog.targetConnected])
+        }
         if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
             let initiallyBlocked = true
-            recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label)
+            recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label, phase: "before-blocker-close")
             for _ in 0..<2 {
-                let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: true)
+                let report = await dispatchFrameClick(on: tab, label: label, approved: approved,
+                                                      blockerOnly: true, targetIndex: expected.index)
                 if report?.stage == "refused-sensitive" { throw MikaError("敏感操作未经确认") }
-                blockerCensus = await probeFrames(on: tab)
-                if let report {
-                    for method in report.stages {
-                        let closed = !blockerCensus.hits.contains(where: { $0.sig == report.fingerprint })
-                        AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-close", targetFingerprint: report.fingerprint,
-                            method: method, result: closed && method == report.stages.last ? "closed" : "persisted",
-                            pageURL: tab.webView.url?.absoluteString ?? "")
-                    }
+                guard let report else {
+                    lastModalAttempts.append(ModalAttemptRecord(method: "hit-blocker-close", status: .observationTimeout,
+                                                                note: "关闭回报缺失；未盲目重试"))
+                    throw MikaError("目标遮挡处置回报不足：unknown(timeout)，未盲目重试")
                 }
-                if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
+                blockerCensus = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
+                for method in report.stages {
+                    let closed = !blockerCensus.hits.contains(where: { $0.sig == report.fingerprint })
+                    lastModalAttempts.append(ModalAttemptRecord(method: method,
+                        status: closed && report.stages.last == method ? .executed : .failed,
+                        note: closed ? "旧遮挡消失；继续检查当前目标" : "遮挡仍在"))
+                    AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-close", targetFingerprint: report.fingerprint,
+                        method: method, result: closed && method == report.stages.last ? "closed" : "persisted",
+                        pageURL: Self.diagnosticURL(tab.webView.url?.absoluteString ?? ""),
+                        taskID: diagnosticTaskID, runID: diagnosticRunID)
+                }
+                recordFrameProbeDiagnostic(census: blockerCensus, tab: tab, label: label, phase: "after-blocker-close",
+                                           disposition: blockerCensus.observation.label, attempts: lastModalAttempts)
+                if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) &&
+                    blockerCensus.targetState == "connected" {
                     if initiallyBlocked { lastBlockerResolution = "closed" }
                     break
+                }
+                if blockerCensus.targetState != "connected" {
+                    throw MikaError("遮挡变化后当前目标失联：unknown(target-disconnected)，未判关闭成功")
                 }
             }
             if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
                 if let directURL = directClickURL(action: action, expected: expected, currentURL: tab.webView.url) {
+                    let expectedQuestionID = Self.questionID(in: tab.webView.url?.absoluteString ?? "")
                     let before = blockerCensus.hits.filter { $0.sig.hasPrefix("hit-blocker:") }.map(\.sig)
                     try await navigateDirectly(to: directURL, on: tab)
-                    let after = await probeFrames(on: tab)
+                    let after = await probeFrames(on: tab, targetIndex: expected.index, targetLabel: label)
                     let persisted = after.hits.contains { before.contains($0.sig) }
+                    let destination = await verifyAnswerEditorAfterSingleClick(expected: expected,
+                                                                               expectedQuestionID: expectedQuestionID,
+                                                                               tab: tab)
+                    let purposeReady = !destination.applicable || destination.state == .present
                     AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-direct-url", targetFingerprint: before.joined(separator: " | "),
-                        method: "direct-navigation", result: persisted ? "persisted" : "success",
-                        pageURL: tab.webView.url?.absoluteString ?? directURL.absoluteString)
-                    if !persisted { lastBlockerResolution = "bypassed"; return }
+                        method: "direct-navigation", result: !persisted && purposeReady ? "success" : "failed-purpose-state",
+                        pageURL: Self.diagnosticURL(tab.webView.url?.absoluteString ?? directURL.absoluteString),
+                        taskID: diagnosticTaskID, runID: diagnosticRunID,
+                        evidence: ["destinationState": destination.state.label, "expectedQuestionID": destination.questionID])
+                    recordFrameProbeDiagnostic(census: after, tab: tab, label: label, phase: "after-direct-navigation",
+                                               disposition: destination.state.label, attempts: lastModalAttempts,
+                                               resultEvidence: destination.evidence)
+                    if !persisted && purposeReady { lastBlockerResolution = "bypassed"; return }
+                    if !persisted && destination.applicable {
+                        throw MikaError("直达后旧遮挡虽消失，但本题回答编辑器状态为 \(destination.state.label)，未判绕行成功")
+                    }
                     blockerCensus = after
                 }
                 if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
                     let evidence = blockerCensus.summary
                     await captureFailureSnapshot(context: "命中阻挡层关闭失败：\(evidence)", tab: tab)
-                    throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)。已试关闭手段：模态子树关闭 affordance → 右上几何候选 → 对话框外遮罩角点 → Escape → 可解析目标 URL 直达；每次均重新普查，指纹仍在")
+                    let actual = lastModalAttempts.map { "\($0.method)=\($0.status.rawValue)" }.joined(separator: "、")
+                    throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)。实际执行账：\(actual.isEmpty ? "未执行" : actual)")
                 }
             }
         }
@@ -4636,10 +5064,7 @@ enum TCProbeLogStore {
             let first = try await runClickScript(action: action, expected: expected, approved: approved, rescan: false, tab: tab)
             status = first
             if first == "clicked" {
-                try await Task.sleep(for: .milliseconds(500))
-                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
-                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
-                }
+                if try await requireAnswerEditorAfterSingleClick(expected: expected, label: label, tab: tab) { return }
                 return
             }
         }
@@ -4647,10 +5072,7 @@ enum TCProbeLogStore {
             try await Task.sleep(for: .milliseconds(300))
             status = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
             if status == "clicked" {
-                try await Task.sleep(for: .milliseconds(500))
-                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
-                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
-                }
+                if try await requireAnswerEditorAfterSingleClick(expected: expected, label: label, tab: tab) { return }
                 return
             }
         }
@@ -4666,10 +5088,7 @@ enum TCProbeLogStore {
         if reveal.found {
             let retry = try await runClickScript(action: action, expected: expected, approved: approved, rescan: true, tab: tab)
             if retry == "clicked" {
-                try await Task.sleep(for: .milliseconds(500))
-                if !(await dialogPersists(action: action, expected: expected, tab: tab).confirmedGone) {
-                    try await performModalClose(action: action, expected: expected, approved: approved, tab: tab)
-                }
+                if try await requireAnswerEditorAfterSingleClick(expected: expected, label: label, tab: tab) { return }
                 return
             }
             if retry == "disabled" {

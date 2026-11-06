@@ -168,6 +168,7 @@ final class DiagnosticStore: NSObject, ObservableObject, MXMetricManagerSubscrib
     private let queue = DispatchQueue(label: "MikaWeb.Diagnostics")
     private let formatter = ISO8601DateFormatter()
     private var started = false
+    private var changeObserver: NSObjectProtocol?
     private var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MikaWeb/Diagnostics", isDirectory: true)
@@ -177,6 +178,9 @@ final class DiagnosticStore: NSObject, ObservableObject, MXMetricManagerSubscrib
         guard !started else { return }
         started = true
         MXMetricManager.shared.add(self)
+        changeObserver = NotificationCenter.default.addObserver(forName: .mikaDiagnosticsChanged, object: nil, queue: nil) { [weak self] _ in
+            self?.queue.async { [weak self] in self?.publishList() }
+        }
         queue.async { [weak self] in
             guard let self else { return }
             self.prepareDirectory()
@@ -184,7 +188,10 @@ final class DiagnosticStore: NSObject, ObservableObject, MXMetricManagerSubscrib
             self.publishList()
         }
     }
-    deinit { if started { MXMetricManager.shared.remove(self) } }
+    deinit {
+        if started { MXMetricManager.shared.remove(self) }
+        if let changeObserver { NotificationCenter.default.removeObserver(changeObserver) }
+    }
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         for payload in payloads {
             let raw = payload.jsonRepresentation()

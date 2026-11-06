@@ -930,6 +930,18 @@ struct OpenStall {
     private var traceInputStrategies: [String] = []
     private var traceFinalAction: [String: Any]?
     private var traceRewriteReason = "none"
+    private var pendingDialogAttemptRecords: [WebController.ModalAttemptRecord] = []
+
+    private func consumeDialogAttemptRecords() -> (summary: String, actuallyExecuted: Bool) {
+        let fresh = web.takeModalAttemptRecords()
+        if !fresh.isEmpty { pendingDialogAttemptRecords = fresh }
+        let records = pendingDialogAttemptRecords
+        let summary = records.isEmpty ? "未执行（执行层无动作记录）" : records.map {
+            "\($0.method)=\($0.status.rawValue)\($0.note.isEmpty ? "" : "（\($0.note)）")"
+        }.joined(separator: "；")
+        let executed = records.contains { $0.status == .executed || $0.status == .failed }
+        return (summary, executed)
+    }
     static let foldStepThreshold = 12
     /// 组装 prompt 的字符预算（H1）：保守默认值——组装后超此值先逐级加大
     /// 折叠再发送；它管的是「我们发出去的体量有界」，不是某个模型的窗口
@@ -1875,6 +1887,8 @@ struct OpenStall {
         runStartedAt = Date()
         finalAuditFired = false
         activeRunContext = conversationTaskID.map { (sessionID: runSessionID, taskID: $0, generation: token) }
+        web.setDiagnosticContext(taskID: conversationTaskID, runID: token)
+        pendingDialogAttemptRecords = []
         worker?.cancel(); status = .running; sessionActive = true; applyIdleTimerPolicy()
         transientStreak = 0
         web.agentWorkSuspended = false // launch 只从前台路径进入，驻停标记在此兜底复位
@@ -2422,7 +2436,8 @@ struct OpenStall {
             // 放回等待确认，用户在干净页面上重新确认（确认本身属安全
             // 类、仍由用户点，引擎不代行）；绕行失败 → 失败结案。
             if Self.modalInterventionText(for: error) != nil {
-                appendStep("click", "弹窗点按无响应（能力卡点）：不停车等用户代劳，改走绕行梯（弹窗导航绕行）")
+                let accounting = consumeDialogAttemptRecords()
+                appendStep("click", "弹窗点按无响应（能力卡点）：实际执行账：\(accounting.summary)。改走绕行梯（弹窗导航绕行）")
                 if await driveDialogBypass(token: token) {
                     pending = saved
                     appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，已确认动作放回等待确认——请在干净页面上重新确认（确认属安全类，仍由用户点）")
@@ -2778,14 +2793,16 @@ struct OpenStall {
                 // （不再从这里跳过第 2 级直达第 3 级）；无在开卡点时沿
                 // 用既有直达弹窗导航绕行口径，绕行失败 → 失败结案。
                 if Self.modalInterventionText(for: error) != nil {
+                    let accounting = consumeDialogAttemptRecords()
                     if var stall = openStall {
-                        stall.noteFrameCloseSignal()
+                        if accounting.actuallyExecuted { stall.noteFrameCloseSignal() }
+                        else { stall.markNA(.frameClose, reason: "执行层记录为未执行/未适用/观测超时") }
                         openStall = stall
-                        appendStep("click", "弹窗点按无响应（能力卡点）：frame 感知关闭连败已计入在开卡点的证据（第 1 级 frame 感知关闭项验收），引擎将按绕行梯继续推进（直达 URL／弹窗导航绕行），不停车等用户代劳")
+                        appendStep("click", "弹窗点按无响应（能力卡点）：实际执行账：\(accounting.summary)。\(accounting.actuallyExecuted ? "已执行项计入 frame 感知关闭实证" : "未把未执行项冒充关闭实证")；引擎将按绕行梯继续推进")
                         persistSnapshot()
                         return .strategySwitch
                     }
-                    appendStep("click", "弹窗点按无响应（能力卡点）：不停车等用户代劳，改走绕行梯（弹窗导航绕行）")
+                    appendStep("click", "弹窗点按无响应（能力卡点）：实际执行账：\(accounting.summary)。改走绕行梯（弹窗导航绕行）")
                     if await driveDialogBypass(token: token) {
                         appendStep("bypass", "弹窗导航绕行成功：弹窗已消失，请按最新页面重新判断")
                         return .strategySwitch
@@ -3258,14 +3275,13 @@ struct OpenStall {
     /// 已消失、页面可继续；false＝可用梯级已尽（梯账已记全，调用方
     /// 走失败结案）。
     private func driveDialogBypass(token: UUID) async -> Bool {
-        // 卡点在开时（LADDER-FIX）：frame 感知关闭连败先记入卡点账
-        // （第 1 级 frameClose 项的实证），绕行成功即关卡点
-        if var stall = openStall {
-            stall.noteFrameCloseSignal()
-            openStall = stall
+        let accounting = consumeDialogAttemptRecords()
+        // 只把实际执行的阶段记为实证；未适用、未执行与观测超时保留原状态。
+        if var stall = openStall, accounting.actuallyExecuted {
+            stall.noteFrameCloseSignal(); openStall = stall
         }
         if !bypassLadder.attempted.contains(.existingMeans) {
-            bypassLadder.markAttempted(.existingMeans, note: "执行层 frame 感知关闭（框内五阶段）已在抛错前试过并连败")
+            bypassLadder.markAttempted(.existingMeans, note: "执行层实际执行账：\(accounting.summary)")
         }
         if bypassLadder.attempted.contains(.dialogNavBypass) { return false }
         let outcome = await attemptDialogNavBypass(token: token)
@@ -3296,6 +3312,17 @@ struct OpenStall {
         let sigsBefore = Set(before.hits.map { $0.sig })
         guard let page = try? await web.state() else { return (false, "页面状态读取失败") }
         let originalURL = page.url
+        let expectedQuestionID: String? = {
+            guard let url = URL(string: originalURL) else { return nil }
+            let parts = url.pathComponents
+            guard let i = parts.firstIndex(of: "question"), parts.indices.contains(i + 1),
+                  Int(parts[i + 1]) != nil else { return nil }
+            return parts[i + 1]
+        }()
+        func purposeState() async -> WebController.ObservationState? {
+            guard let expectedQuestionID else { return nil }
+            return await web.zhihuAnswerEditorDestinationState(questionID: expectedQuestionID)
+        }
         let isEditor = originalURL.contains("appmsg_edit") || page.elements.contains { $0.editable }
         if !isEditor {
             guard recoveryBudget.reserveLoad() else { return (false, "非编辑页需要重载但整任务重载预算已用完，此级失败") }
@@ -3311,6 +3338,9 @@ struct OpenStall {
             let after = await web.dialogCensus()
             guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
             let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+            if gone, let destination = await purposeState(), destination != .present {
+                return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功")
+            }
             return gone
                 ? (true, "成功（非编辑页重载绕行）：重载前弹窗 \(sigsBefore.count) 个，重载后原弹窗签名全部消失")
                 : (false, "非编辑页重载后弹窗仍在（普查：\(after.summary)）")
@@ -3341,6 +3371,9 @@ struct OpenStall {
         let after = await web.dialogCensus()
         guard after.coverageComplete && before.framePaths.isSubset(of: after.framePaths) else { return (false, "弹窗存续未确认（frame 探针覆盖不足）") }
         let gone = !after.hits.contains { sigsBefore.contains($0.sig) }
+        if gone, let destination = await purposeState(), destination != .present {
+            return (false, "原弹窗签名已消失，但本题回答编辑器状态为 \(destination.label)，不判绕行成功")
+        }
         return gone
             ? (true, "成功（编辑页往返绕行）：先保存并 settle 回读落定→离开→直达返回后，原弹窗签名全部消失；正文完整以模型下一轮回读为准")
             : (false, "编辑页往返后弹窗仍在（普查：\(after.summary)）")
