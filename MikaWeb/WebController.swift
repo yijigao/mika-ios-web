@@ -2900,6 +2900,21 @@ enum TCProbeLogStore {
     })()
     """#
 
+    /// 反例甲：真实 Draft 拒绝提交，但 DOM 与旁侧计数伪装为成功。
+    /// 仅安装在独立 fixture；生产校验只读，不安装这些监听器。
+    static let draftMissGrowthFixture = #"""
+    (()=>{
+      const text=__TEXT__,host=document.querySelector('[contenteditable=true]');
+      const paint=()=>{if(host.textContent!==text)host.textContent=text;};
+      paint();
+      for(const name of ['paste','beforeinput','input'])document.addEventListener(name,()=>{
+        document.getElementById('round46-count').textContent='字数：'+text.replace(/[\s\u200b\ufeff]+/g,'').length;
+        setTimeout(paint,0);
+      },true);
+      return true;
+    })()
+    """#
+
     func verifyFrozenDraftCommitted() async -> [String] {
         let tab = BrowserTab(loadStartPage:false, sessionID:displayedSessionID)
         tab.webView.frame = CGRect(x:0,y:0,width:1024,height:768)
@@ -2908,7 +2923,7 @@ enum TCProbeLogStore {
         func js(_ value: String) -> String { String(decoding:try! JSONEncoder().encode(value),as:UTF8.self) }
         let text = String(repeating:"计数冻结但状态完整。",count:12)
         do {
-            for mode in ["committed", "ignore", "unobservable"] {
+            for mode in ["committed", "ignore", "unobservable", "miss-growth"] {
                 let epoch = tab.documentEpoch
                 try tab.loadLocal("test-draft")
                 var ready = false
@@ -2918,8 +2933,11 @@ enum TCProbeLogStore {
                     try await Task.sleep(for:.milliseconds(100))
                 }
                 guard ready else { throw MikaError("自检四十六 fixture 加载超时") }
-                _ = try await evaluate("window.__type4.reset('',\(js(mode == "ignore" ? "ignore" : "")),\(js(text)));true",on:tab)
+                _ = try await evaluate("window.__type4.reset('',\(js(mode == "ignore" || mode == "miss-growth" ? "ignore" : "")),\(js(text)));true",on:tab)
                 _ = try await evaluate(Self.frozenDraftFixture,on:tab)
+                if mode == "miss-growth" {
+                    _ = try await evaluate(Self.draftMissGrowthFixture.replacingOccurrences(of:"__TEXT__",with:js(text)),on:tab)
+                }
                 if mode == "unobservable" {
                     _ = try await evaluate("(()=>{const h=document.querySelector('[contenteditable=true]');for(const k of Object.keys(h))if(k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$'))Object.defineProperty(h,k,{enumerable:false});return true;})()",on:tab)
                 }
@@ -2932,19 +2950,29 @@ enum TCProbeLogStore {
                 check(baseline.count == 0, "\(mode): baseline count=0")
                 lastEditorTypeTrace = []
                 var passed = false
-                do { try await performTypeInEditor(action:action,expected:expected,approved:false,baseline:baseline,tab:tab); passed = true }
+                do { try await performType(action,expected:expected,approved:false,tab:tab); passed = true }
                 catch let error as MikaError { lines.append("· \(mode): \(error.localizedDescription)") }
                 check(passed == (mode == "committed"), "\(mode): performType \(passed ? "PASS" : "FAIL")")
-                let marker = mode == "committed" ? "committed-override" : mode == "ignore" ? "committed-miss" : "committed-unobservable"
+                let marker = mode == "committed" ? "committed-override" : mode == "unobservable" ? "committed-unobservable" : "committed-miss-veto"
                 check(lastEditorTypeTrace.contains { $0.contains(marker) }, "\(mode): \(marker)")
                 let diagnostic = try await evaluate("JSON.stringify(window.__mikaEditorSignalsDiagnostic)",on:tab) as? String ?? ""
                 check(diagnostic.contains("whole-page-fallback"), "\(mode): whole-page-fallback（form 外计数）")
+                if mode == "miss-growth" {
+                    let post = try await probeEditorSignals(action:action,tab:tab)
+                    let dom = try await verifyType(action:action,tab:tab)
+                    let committed = await readDraftCommitted(action:action,tab:tab)
+                    let original = TypeVerifyPolicy.verdict(baselineCount:baseline.count,postCount:post.count,
+                        textOK:dom.textOK,expectedCount:Self.normalizedLength(text),longForm:false)
+                    check(post.count == Self.normalizedLength(text) && dom.textOK && committed == false && original == .pass,
+                          "反例甲：计数充分增长＋DOM 全文＋committed 缺失；原 policy=pass")
+                    check(!passed && lastEditorTypeTrace.filter { $0.hasPrefix("committed-miss-veto") }.count == 5,
+                          "反例甲：performType FAIL 且五策略 committed-miss-veto")
+                }
                 if mode == "ignore" {
                     check((try await evaluate("window.__updateCalls===0&&window.__type4.text()===''",on:tab)) as? Bool == true, "ignored: update=0, committed empty")
                 }
                 lines.append("· \(mode): \(lastEditorTypeTrace.joined(separator:"；"))")
             }
-            lines.append("✗ 反例甲（DOM 全文／计数变动／committed 缺失）判据冲突，待裁决；不计通过")
         } catch { lines.append("✗ 自检四十六异常：\(error.localizedDescription)") }
         return lines
     }
@@ -3054,7 +3082,11 @@ enum TCProbeLogStore {
                 case true?:
                     committedOverride = true
                     trace.append("committed-override(count=\(counterJSON)),strategy=\(path)")
-                case false?: trace.append("committed-miss,strategy=\(path)")
+                case false?:
+                    trace.append("committed-miss-veto,strategy=\(path)")
+                    trace.append("\(path)=dom-missing")
+                    failure = .domMissing
+                    continue
                 case nil: trace.append("committed-unobservable,strategy=\(path)")
                 }
             }
