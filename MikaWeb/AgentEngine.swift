@@ -5542,14 +5542,14 @@ struct OpenStall {
             return
         }
         let recordID = UUID()
-        let record = ZhihuPublishRecord(id: recordID, taskID: taskID, runID: token,
+        let publishRecord = ZhihuPublishRecord(id: recordID, taskID: taskID, runID: token,
             accountIdentity: pageIdentity.accountIdentity, accountStableID: account.stableID,
             accountAliases: account.aliases, questionID: proof.questionID, expectedTextHash: proof.expectedTextHash,
             bodyVersion: proof.bodyVersion, sourceText: proof.expectedText, status: .attemptStarted,
             attemptStartedAt: Date(), clickCallCount: 0, clickResult: "not-called",
             answerID: nil, answerURL: nil, authorIdentity: nil, readbackText: nil,
             resultDetail: "attemptStarted 已持久化，尚未调用 click")
-        zhihuPublishRecords.append(record)
+        zhihuPublishRecords.append(publishRecord)
         guard saveZhihuPublishRecords() else {
             zhihuPublishRecords.removeAll { $0.id == recordID }
             throw MikaError("发布 attemptStarted 持久化失败，按策略未点击")
