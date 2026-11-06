@@ -377,10 +377,18 @@ enum SiteMode: String {
         var stages=[];
         var poll=function(cb){var end=Date.now()+700;var check=function(){if(gone())return cb(true);if(Date.now()>=end)return cb(false);setTimeout(check,80);};check();};
         var safe=function(el){var t=(lab(el)+' '+(el.getAttribute('aria-label')||'')).toLowerCase();return d.approved||!(d.keywords||[]).some(function(k){return t.indexOf(k)>=0;});};
+        var maskOutsideDialog=function(cb){
+          var dialogs=dialogElements().filter(function(x){return container===x||container.contains(x);});
+          var dlg=dialogs.find(function(x){var r=x.getBoundingClientRect();return r.width<innerWidth*.9||r.height<innerHeight*.9;})||null;
+          var points=[[8,8],[innerWidth-8,8],[8,innerHeight-8],[innerWidth-8,innerHeight-8]],pick=null;
+          for(var i=0;i<points.length;i++){var p=points[i];if(!dlg){pick=p;break;}var r=dlg.getBoundingClientRect();if(p[0]<r.left||p[0]>r.right||p[1]<r.top||p[1]>r.bottom){pick=p;break;}}
+          if(!pick)return cb(false);var el=document.elementFromPoint(pick[0],pick[1]);if(!el||!safe(el))return cb(false);
+          stages.push('hit-blocker-mask-outside');seqOn(el,'pointer',function(){poll(cb);},{x:pick[0],y:pick[1]});
+        };
         var plan=[
           function(cb){var c=findCloser(container,null);if(!c)return cb(false);if(!safe(c)){finish(false,'refused-sensitive');return;}stages.push('hit-blocker-close');seqOn(c,'pointer',function(){poll(cb);});},
-          function(cb){stages.push('hit-blocker-escape');document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}));document.dispatchEvent(new KeyboardEvent('keyup',{key:'Escape',code:'Escape',bubbles:true}));poll(cb);},
-          function(cb){stages.push('hit-blocker-corner');var r=container.getBoundingClientRect(),x=Math.max(1,r.left+10),y=Math.max(1,r.top+10),el=document.elementFromPoint(x,y);if(!el||el!==container||!safe(el))return cb(false);seqOn(el,'pointer',function(){poll(cb);},{x:x,y:y});}
+          function(cb){maskOutsideDialog(cb);},
+          function(cb){stages.push('hit-blocker-escape');document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}));document.dispatchEvent(new KeyboardEvent('keyup',{key:'Escape',code:'Escape',bubbles:true}));poll(cb);}
         ];
         var run=function(i){if(gone())return finish(true,'hit-blocker-cleared');if(i>=plan.length)return finish(false,'hit-blocker-still');plan[i](function(ok){if(ok)finish(true,stages[stages.length-1]);else run(i+1);});};run(0);
       };
@@ -2985,8 +2993,9 @@ enum TCProbeLogStore {
         func check(_ ok: Bool, _ label: String) { lines.append("\(ok ? "✓" : "✗") \(label)") }
         do {
             for mode in ["closable", "plain", "stubborn"] {
-                let closer = mode == "closable" ? "<button onclick='this.parentElement.remove()'>×</button>" : ""
-                let veil = mode == "plain" ? "" : "<div class='promo-veil' style='position:fixed;inset:0;z-index:1000'>\(closer)</div>"
+                let closer = mode == "closable" ? "<span class='avatar-close' aria-label='关闭' onclick='this.closest(\".promo-veil\").remove()' style='cursor:pointer'>×</span>" : ""
+                let dialog = "<section role='dialog' aria-modal='true' style='position:absolute;left:30%;top:25%;width:40%;height:35%;background:white'>修改我的头像\(closer)</section>"
+                let veil = mode == "plain" ? "" : "<div class='promo-veil' style='position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.3)'>\(dialog)</div>"
                 let html = "<html><meta name='viewport' content='width=device-width'><body><button id='target' style='margin:150px' onclick='window.originalClicks++'>原按钮</button>\(veil)<script>window.originalClicks=0;window.round47Mode='\(mode)';window.round47Ready=true;</script></body></html>"
                 tab.webView.loadHTMLString(html,baseURL:nil)
                 var ready = false
@@ -3006,7 +3015,7 @@ enum TCProbeLogStore {
                 do { try await dispatchClick(action,expected:target,approved:false,tab:tab) }
                 catch let error as MikaError { errorText = error.localizedDescription }
                 let clicked = (try await evaluate("window.originalClicks===1",on:tab)) as? Bool == true
-                check(mode == "stubborn" ? !clicked && errorText.contains(Self.modalUnresponsivePrefix) && errorText.contains("hit-blocker:") && errorText.contains("promo-veil") : clicked && errorText.isEmpty, "\(mode): 原点击／失败指纹回读")
+                check(mode == "stubborn" ? !clicked && errorText.contains(Self.modalUnresponsivePrefix) && errorText.contains("hit-blocker:") && errorText.contains("promo-veil") && errorText.contains("关闭 affordance") && errorText.contains("遮罩角点") && errorText.contains("Escape") : clicked && errorText.isEmpty, "\(mode): 原点击／失败指纹与已试手段回读")
                 if !errorText.isEmpty { lines.append("· \(errorText)") }
             }
             tab.webView.loadHTMLString("<html><body><iframe srcdoc=\"<div role='dialog'><button onclick='this.parentElement.remove()'>关闭窗</button></div>\"></iframe></body></html>",baseURL:nil)
@@ -3480,6 +3489,7 @@ enum TCProbeLogStore {
         let gone: Bool
         let stage: String
         let stages: [String]
+        let fingerprint: String
     }
 
     /// 向弹窗所在 frame 下达点按指令并等第一份 click-report（只有持有
@@ -3503,7 +3513,8 @@ enum TCProbeLogStore {
                                         clicked: (first["clicked"] as? Bool) ?? false,
                                         gone: (first["gone"] as? Bool) ?? false,
                                         stage: (first["stage"] as? String) ?? "",
-                                        stages: (first["stages"] as? [String]) ?? [])
+                                        stages: (first["stages"] as? [String]) ?? [],
+                                        fingerprint: (first["sig"] as? String) ?? "unobservable")
             }
             try? await Task.sleep(for: .milliseconds(200))
         }
@@ -3672,12 +3683,20 @@ enum TCProbeLogStore {
                 let report = await dispatchFrameClick(on: tab, label: label, approved: approved, blockerOnly: true)
                 if report?.stage == "refused-sensitive" { throw MikaError("敏感操作未经确认") }
                 blockerCensus = await probeFrames(on: tab)
+                if let report {
+                    for method in report.stages {
+                        let closed = !blockerCensus.hits.contains(where: { $0.sig == report.fingerprint })
+                        AgentTraceStore.shared.appendEngineAction(action: "hit-blocker-close", targetFingerprint: report.fingerprint,
+                            method: method, result: closed && method == report.stages.last ? "closed" : "persisted",
+                            pageURL: tab.webView.url?.absoluteString ?? "")
+                    }
+                }
                 if !blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) { break }
             }
             if blockerCensus.hits.contains(where: { $0.sig.hasPrefix("hit-blocker:") }) {
                 let evidence = blockerCensus.summary
                 await captureFailureSnapshot(context: "命中阻挡层关闭失败：\(evidence)", tab: tab)
-                throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)")
+                throw MikaError("\(Self.modalUnresponsivePrefix)：\(evidence)。已试关闭手段：模态子树关闭 affordance → 对话框外遮罩角点 → Escape；每次均重新普查，指纹仍在")
             }
         }
         if probe == "ready-dialog" {

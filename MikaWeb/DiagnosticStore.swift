@@ -40,6 +40,27 @@ final class AgentTraceStore: ObservableObject {
         }
     }
 
+    /// 不经模型调用的引擎动作也必须可从同一份 JSONL 逐项还原。保留六组
+    /// 外壳，避免导出端为 engine 行另开不兼容 schema。
+    func appendEngineAction(action: String, targetFingerprint: String, method: String,
+                            result: String, pageURL: String) {
+        let unknown: [String: Any] = ["observability": "unobservable", "value": NSNull()]
+        append([
+            "schemaVersion": 1,
+            "source": "engine",
+            "identityAndConfig": ["timestamp": timestamp(), "buildSHA": Self.buildSHA,
+                                    "buildNumber": Self.buildNumber, "source": "engine"],
+            "rawInput": ["action": action, "targetFingerprint": targetFingerprint,
+                         "method": method, "pageURL": pageURL],
+            "rawOutput": ["result": result],
+            "actualExecution": ["action": action, "targetFingerprint": targetFingerprint,
+                                "method": method, "result": result, "pageURL": pageURL],
+            "independentObservation": ["source": "engine", "pageURL": pageURL,
+                                       "targetFingerprint": targetFingerprint],
+            "stateAndResult": ["result": result, "failureType": result == "closed" || result == "success" ? unknown as Any : result as Any]
+        ])
+    }
+
     func exportURL() throws -> URL {
         try queue.sync {
             guard FileManager.default.fileExists(atPath: file.path) else {
@@ -95,6 +116,25 @@ final class AgentTraceStore: ObservableObject {
             "\(identity?["requestedModel"] as? String == "synthetic-model" && identity?["requestedEffort"] as? String == "low" ? "✓" : "✗") 实际请求模型与 effort 已记录",
             "\(observation?["candidateState"] != nil && observation?["committedState"] != nil ? "✓" : "✗") 候选状态与已提交状态分开",
             "\(encoded.contains("unobservable") && !encoded.contains("\"counterNode\":0") ? "✓" : "✗") unobservable 未转成数值"
+        ]
+    }
+
+    func verifySyntheticEngineTrace() -> [String] {
+        let record: [String: Any] = [
+            "schemaVersion": 1, "source": "engine",
+            "identityAndConfig": ["source": "engine"],
+            "rawInput": ["action": "hit-blocker-close", "targetFingerprint": "modal#avatar", "method": "close-affordance", "pageURL": "https://example.test/editor"],
+            "rawOutput": ["result": "closed"],
+            "actualExecution": ["action": "hit-blocker-close", "targetFingerprint": "modal#avatar", "method": "close-affordance", "result": "closed", "pageURL": "https://example.test/editor"],
+            "independentObservation": ["source": "engine"], "stateAndResult": ["result": "closed"]
+        ]
+        append(record)
+        let execution = record["actualExecution"] as? [String: Any]
+        let groups = ["identityAndConfig", "rawInput", "rawOutput", "actualExecution", "independentObservation", "stateAndResult"]
+        return [
+            "\(groups.allSatisfy { record[$0] != nil } ? "✓" : "✗") engine 行与六组 schema 兼容",
+            "\(record["source"] as? String == "engine" ? "✓" : "✗") source=engine",
+            "\(execution?["action"] as? String == "hit-blocker-close" && execution?["targetFingerprint"] as? String == "modal#avatar" && execution?["method"] as? String == "close-affordance" && execution?["result"] as? String == "closed" && execution?["pageURL"] as? String == "https://example.test/editor" ? "✓" : "✗") 动作、指纹、手段、结果、URL 齐全"
         ]
     }
 }

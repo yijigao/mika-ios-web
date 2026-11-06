@@ -1939,9 +1939,10 @@ struct OpenStall {
                                     let trace = web.takeEditorTypeTrace()
                                     traceInputStrategies = trace
                                 }
-                                record(action)
+                                record(action, suffix: typeVerificationSuffix(for: action, trace: traceInputStrategies, page: page))
                                 if action.action == "type", !traceInputStrategies.isEmpty {
                                     appendStep("note", "type 策略阶梯：\(traceInputStrategies.joined(separator: "；"))")
+                                    appendDisabledButtonObservation(from: page)
                                 }
                                 if action.action == "click" { appendStep("effect", clickEffectDescription()) }
                                 // 卡点逐项验收记账（LADDER-FIX F2）：真实
@@ -2179,10 +2180,15 @@ struct OpenStall {
             executionSerial += 1
             try await web.execute(saved.0, expected: target, approved: true)
             try await checkpoint(token)
-            record(saved.0)
             if saved.0.action == "type" {
                 let trace = web.takeEditorTypeTrace()
-                if !trace.isEmpty { appendStep("note", "type 策略阶梯：\(trace.joined(separator: "；"))") }
+                traceInputStrategies = trace
+                noteTypedContent(action: saved.0, element: target)
+            }
+            record(saved.0, suffix: typeVerificationSuffix(for: saved.0, trace: traceInputStrategies, page: page))
+            if saved.0.action == "type", !traceInputStrategies.isEmpty {
+                appendStep("note", "type 策略阶梯：\(traceInputStrategies.joined(separator: "；"))")
+                appendDisabledButtonObservation(from: page)
             }
             if saved.0.action == "click" { appendStep("effect", clickEffectDescription()) }
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
@@ -2889,6 +2895,9 @@ struct OpenStall {
                 appendStep("bypass", "绕行梯第 2 级「直达 URL」落空：\(outcome.facts.line)，推进下一级")
             case .dialogNavBypass:
                 let outcome = await attemptDialogNavBypass(token: token)
+                AgentTraceStore.shared.appendEngineAction(action: "dialog-navigation-bypass", targetFingerprint: "active-dialog-census",
+                    method: "save-if-editor-then-navigate", result: outcome.success ? "success" : "failed: \(outcome.note)",
+                    pageURL: web.executionTab.webView.url?.absoluteString ?? "")
                 if thermalPaused { throw ThermalPause() }
                 bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
                 appendStep("bypass", "绕行梯第 3 级「弹窗导航绕行」：\(outcome.note)")
@@ -3041,6 +3050,9 @@ struct OpenStall {
         }
         if bypassLadder.attempted.contains(.dialogNavBypass) { return false }
         let outcome = await attemptDialogNavBypass(token: token)
+        AgentTraceStore.shared.appendEngineAction(action: "dialog-navigation-bypass", targetFingerprint: "active-dialog-census",
+            method: "save-if-editor-then-navigate", result: outcome.success ? "success" : "failed: \(outcome.note)",
+            pageURL: web.executionTab.webView.url?.absoluteString ?? "")
         bypassLadder.markAttempted(.dialogNavBypass, note: outcome.note)
         appendStep("bypass", "弹窗导航绕行：\(outcome.note)")
         if outcome.success, openStall != nil {
@@ -3792,6 +3804,44 @@ struct OpenStall {
         // 状态卡的已完成里程碑在记账点同步（程序事实，不经模型转述，H1）
         stateCard.addCompleted("\(action.action)：\(action.reason)")
         appendTrace(action: action, suffix: suffix)
+    }
+
+    /// committed 全文相等是 type 的独立真值；按钮 disabled 属于另一动作的
+    /// 页面观测，只能备注，不能改写已经核实的输入结论。
+    private func typeVerificationSuffix(for action: AgentAction, trace: [String], page: PageState) -> String {
+        guard action.action == "type" else { return "" }
+        if trace.contains(where: { $0.contains("committed-override") }) {
+            return "（已核实：Draft committed 包含所写全文，committed-override）"
+        }
+        return trace.contains(where: { $0.contains("count-ok") }) ? "（已核实：全文与编辑器信号一致）" : ""
+    }
+
+    private func appendDisabledButtonObservation(from page: PageState) {
+        let disabled = page.elements.filter { $0.tag == "button" && $0.disabled }
+        guard !disabled.isEmpty else { return }
+        let labels = disabled.prefix(5).map { $0.text.isEmpty ? ($0.ariaLabel.isEmpty ? "#\($0.index)" : $0.ariaLabel) : $0.text }
+        appendStep("observation", "按钮 disabled 读数仅作观测备注（\(labels.joined(separator: "／"))）；不推翻已核实的 committed 全文，不作为内容状态结论")
+    }
+
+    func verifyCommittedTruthPresentation() async -> [String] {
+        var lines = await WebController().verifyFrozenDraftCommitted()
+        let actionData = try? JSONSerialization.data(withJSONObject: ["action":"type", "index":0, "text":"全文", "reason":"自检四十九"])
+        let action = actionData.flatMap { try? JSONDecoder().decode(AgentAction.self, from: $0) }
+        let disabledPublish = PageElement(index: 1, tag: "button", type: "", text: "发布", placeholder: "", href: "", name: "", inputType: "", ariaLabel: "", nameSource: "text", inView: true, sensitive: true, disabled: true, editable: false)
+        let page = PageState(url: "https://example.test/editor", title: "fixture", text: "", elements: [disabledPublish], epoch: nil)
+        if let action {
+            let pass = typeVerificationSuffix(for: action, trace: ["committed-override(count=0),strategy=paste-plain"], page: page)
+            let fail = typeVerificationSuffix(for: action, trace: ["committed-miss-veto,strategy=paste-plain"], page: page)
+            var card = TaskStateCard(goal: "自检四十九")
+            card.addWrite(target: "正文编辑器", body: action.text, verification: "verified")
+            card.addCompleted("type：\(action.reason)\(pass)")
+            let stepResult = "type：\(action.reason)\(pass)"
+            let modelReport = stepResult + "\n" + card.promptBlock() + "\n按钮 disabled 仅作观测备注，不影响 committed 结论"
+            let consistent = stepResult.contains("已核实") && card.promptBlock().contains("核实=verified") && card.promptBlock().contains("已核实") && modelReport.contains("已核实")
+            lines.append("\(page.elements.first?.disabled == true && consistent && !modelReport.contains("未提交") ? "✓" : "✗") 甲：count 0＋disabled＋committed 全文 ⇒ 步骤/状态卡/模型回报统一为已核实，无「未提交」")
+            lines.append("\(fail.isEmpty ? "✓" : "✗") 乙：committed 不含全文 ⇒ 不产生已核实结论，维持 fail-closed")
+        } else { lines.append("✗ 自检四十九 action fixture 构造失败") }
+        return lines
     }
 
     private func appendTrace(action: AgentAction, suffix: String) {

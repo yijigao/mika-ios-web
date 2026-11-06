@@ -335,6 +335,26 @@ struct SelfTestView: View {
                 conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检四十八：FAIL" : "自检四十八：六字段组 PASS，合成记录已落盘可导出")
                 dismiss()
             }.disabled(!engine.active)
+            Button("自检四十九：committed 真值全链呈现") {
+                Task { @MainActor in
+                    let lines = await engine.verifyCommittedTruthPresentation()
+                    for line in lines { conversation.localFeedback("自检四十九：\(line)") }
+                }
+                dismiss()
+            }.disabled(!engine.active)
+            Button("自检五十：无按钮模态关闭") {
+                Task { @MainActor in
+                    let lines = await WebController().verifyHitBlockerClose()
+                    for line in lines { conversation.localFeedback("自检五十：\(line)") }
+                }
+                dismiss()
+            }.disabled(!engine.active)
+            Button("自检五十一：引擎动作 trace") {
+                let lines = AgentTraceStore.shared.verifySyntheticEngineTrace()
+                for line in lines { conversation.localFeedback("自检五十一：\(line)") }
+                conversation.localFeedback(lines.contains { $0.hasPrefix("✗") } ? "自检五十一：FAIL" : "自检五十一：engine 行已落盘可导出")
+                dismiss()
+            }.disabled(!engine.active)
             Button("自检四十五：真页 Draft 单发取证") {
                 guard !realPageForensicsRunning else { return }
                 realPageForensicsRunning = true
