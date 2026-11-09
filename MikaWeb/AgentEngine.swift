@@ -4,6 +4,7 @@ import BackgroundTasks
 import Combine
 #if DEBUG && targetEnvironment(simulator)
 import WebKit
+import Darwin
 #endif
 enum StaleTargetPolicy {
     static func isStaleTarget(errorDomain: String, code: Int, message: String) -> Bool {
@@ -2222,17 +2223,25 @@ struct OpenStall {
                             executionSerial += 1
                             let previous = conversationTaskID.flatMap { readbackTabs.readbackTab(forTask: $0) }.flatMap { readbackTabs.entries[$0] }
                             let sourceID = web.executionTab.id
-                            let tab = try await auditedDispatch(name: "open_new_tab", pageURL: action.url) {
-                                try web.openTabForExecution(urlString: action.url)
-                            }
-                            if let taskID = conversationTaskID {
-                                if let oldID = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "readback"),
-                                   let previous, previous.tabID == oldID {
-                                    replacedReadbackTabIDs.insert(oldID)
-                                    await recycleReadbackTab(previous, for: taskID, expectedGeneration: token, excluding: [tab.id])
+                            let callMarker = DispatchCallMarker()
+                            do {
+                                let tab = try await auditedDispatch(name: "open_new_tab", pageURL: action.url,
+                                                                    callMarker: callMarker) {
+                                    try web.openTabForExecution(urlString: action.url)
                                 }
+                                if let taskID = conversationTaskID {
+                                    if let oldID = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "readback"),
+                                       let previous, previous.tabID == oldID {
+                                        replacedReadbackTabIDs.insert(oldID)
+                                        await recycleReadbackTab(previous, for: taskID, expectedGeneration: token, excluding: [tab.id])
+                                    }
+                                }
+                                try await checkpoint(token)
+                            } catch {
+                                // The marker stays false when dispatch preparation fails before the operation call.
+                                if callMarker.entered { await reconcileBlockingOutcomes(trigger: "post-navigation") }
+                                throw error
                             }
-                            try await checkpoint(token)
                             await reconcileBlockingOutcomes(trigger: "post-navigation")
                             record(action)
                             loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.url, outcome: "ok")
@@ -2344,15 +2353,23 @@ struct OpenStall {
                             // 快照，任务继续；其余错误照旧上抛。
                             record(action)
                             var executedOK = true
+                            let callMarker = DispatchCallMarker()
                             do {
                                 try await checkpoint(token)
                                 executionSerial += 1
-                                try await auditedDispatch(name: action.action, pageURL: page.url) {
+                                try await auditedDispatch(name: action.action, pageURL: page.url,
+                                                          callMarker: callMarker) {
                                     try await web.execute(action, expected: nil)
                                 }
                                 try await checkpoint(token)
                             } catch {
-                                guard Self.isUnexecutableActionError(error) else { throw error }
+                                guard Self.isUnexecutableActionError(error) else {
+                                    // A checkpoint or dispatch preparation failure has not entered the operation.
+                                    if ["navigate", "open_new_tab"].contains(action.action) && callMarker.entered {
+                                        await reconcileBlockingOutcomes(trigger: "post-navigation")
+                                    }
+                                    throw error
+                                }
                                 executedOK = false
                                 handleInvalidAction(action)
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.action, outcome: "invalid-action")
@@ -7714,11 +7731,112 @@ extension AgentStatus {
 // Round 1 CLI-only WK regression driver. It uses production runTargeted,
 // confirm/runConfirmed, auditedDispatch, receipt stores and snapshot recovery.
 // It never calls a model and only loads the bundled CSP-isolated fixture.
+private final class GateBatchFixtureServer: @unchecked Sendable {
+    private let html: Data
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "mikaweb.gate-batch1.fixture")
+    private var listenFD: Int32 = -1
+
+    init() throws {
+        guard let url = Bundle.main.url(forResource: "test-gate-batch1", withExtension: "html") else {
+            throw MikaError("缺少测试页 test-gate-batch1")
+        }
+        html = try Data(contentsOf: url)
+    }
+
+    func start() throws -> URL {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw MikaError("Gate fixture socket failed") }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fd, 8) == 0 else {
+            close(fd)
+            throw MikaError("Gate fixture listener failed")
+        }
+        var actual = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &actual) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        guard named == 0 else {
+            close(fd)
+            throw MikaError("Gate fixture port lookup failed")
+        }
+        lock.lock(); listenFD = fd; lock.unlock()
+        queue.async { [self] in acceptLoop() }
+        return URL(string: "http://127.0.0.1:\(UInt16(bigEndian: actual.sin_port))/test-gate-batch1.html")!
+    }
+
+    func stop() {
+        lock.lock()
+        let fd = listenFD
+        listenFD = -1
+        lock.unlock()
+        if fd >= 0 { shutdown(fd, SHUT_RDWR); close(fd) }
+    }
+
+    private func acceptLoop() {
+        while true {
+            lock.lock(); let fd = listenFD; lock.unlock()
+            if fd < 0 { return }
+            var clientAddress = sockaddr()
+            var length = socklen_t(MemoryLayout<sockaddr>.size)
+            let client = accept(fd, &clientAddress, &length)
+            if client < 0 { return }
+            handle(client)
+        }
+    }
+
+    private func handle(_ client: Int32) {
+        defer { close(client) }
+        var noSignal: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var request = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while request.count < 32768 {
+            let received = recv(client, &chunk, chunk.count, 0)
+            if received <= 0 { return } // Empty or early closed connections are harmless.
+            request.append(contentsOf: chunk[0..<received])
+            if request.range(of: Data([13, 10, 13, 10])) != nil { break }
+        }
+        guard let line = String(data: request, encoding: .utf8)?.components(separatedBy: "\r\n").first else { return }
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return }
+        let path = parts[1].split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
+        let found = parts[0] == "GET" && path.hasSuffix("test-gate-batch1.html")
+        let body = found ? html : Data()
+        let header = "HTTP/1.0 \(found ? "200 OK" : "404 Not Found")\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        var response = Data(header.utf8)
+        response.append(body)
+        response.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var sent = 0
+            while sent < bytes.count {
+                let count = send(client, base.advanced(by: sent), bytes.count - sent, 0)
+                if count <= 0 { return } // Client closed early.
+                sent += count
+            }
+        }
+    }
+}
+
 private struct GateBatchWKContext {
     let engine: AgentEngine
     let web: WebController
     let host: WKSelfTestHost
     let auditURL: URL
+    let pageURL: URL?
 }
 
 extension AgentEngine {
@@ -7741,7 +7859,8 @@ extension AgentEngine {
         return try JSONDecoder().decode(AgentAction.self, from: data)
     }
     private static func gateContext(_ label: String, reset: Bool = true,
-                                    sessionID: UUID = UUID(), taskID: UUID = UUID()) async throws -> GateBatchWKContext {
+                                    sessionID: UUID = UUID(), taskID: UUID = UUID(),
+                                    pageURL: URL? = nil) async throws -> GateBatchWKContext {
         if reset {
             // Only reachable from this isolated simulator CLI workflow.
             for key in [outcomeLedgerKey, executionReceiptsKey, taskClaimsKey] {
@@ -7752,7 +7871,12 @@ extension AgentEngine {
         web.showSessionTabs(sessionID)
         web.beginExecution(sessionID: sessionID)
         let host = WKSelfTestHost(tab: web.executionTab, suite: "gate-batch1-\(label)")
-        try await host.loadLocalAndWait("test-gate-batch1", readinessJavaScript: "!!window.__gate")
+        if let pageURL {
+            try await host.loadURLAndWait(pageURL, expectedPath: "test-gate-batch1.html",
+                                          readinessJavaScript: "!!window.__gate")
+        } else {
+            try await host.loadLocalAndWait("test-gate-batch1", readinessJavaScript: "!!window.__gate")
+        }
         let engine = AgentEngine(web: web, settings: SettingsStore(), restoreSession: false)
         engine.runSessionID = sessionID; engine.conversationTaskID = taskID
         engine.goal = "闸门受控 WK 检查 \(label)"; engine.taskText = engine.goal
@@ -7764,11 +7888,14 @@ extension AgentEngine {
         engine.gateSelfTestAuditStore = ExecutionAuditStore(fileURL: auditURL)
         try FileManager.default.createDirectory(at: SessionStore.shared.snapshotURL(for: sessionID)
             .deletingLastPathComponent(), withIntermediateDirectories: true)
-        return GateBatchWKContext(engine: engine, web: web, host: host, auditURL: auditURL)
+        return GateBatchWKContext(engine: engine, web: web, host: host, auditURL: auditURL,
+                                  pageURL: pageURL)
     }
     private static func gateEvaluate(_ context: GateBatchWKContext, _ script: String) async throws -> Any? {
-        guard context.web.executionTab.webView.url?.isFileURL == true,
-              context.web.executionTab.webView.url?.lastPathComponent == "test-gate-batch1.html" else {
+        guard let url = context.web.executionTab.webView.url,
+              url.lastPathComponent == "test-gate-batch1.html",
+              (url.isFileURL || (url.scheme == "http" && url.host == "127.0.0.1" &&
+                                  url == context.pageURL)) else {
             throw MikaError("Gate self-test refused non-fixture page")
         }
         return try await context.web.executionTab.webView.evaluateJavaScript(script)
@@ -7836,7 +7963,17 @@ extension AgentEngine {
             var checks: [[String: Any]] = []
             var details: [String: Any] = [:]
             do {
-                let c = try await Self.gateContext(id); context = c
+                var fixtureServer: GateBatchFixtureServer?
+                defer { fixtureServer?.stop() }
+                let pageURL: URL?
+                if ["model_driven_recovery", "model_driven_recovery_insufficient"].contains(id) {
+                    let server = try GateBatchFixtureServer()
+                    pageURL = try server.start()
+                    fixtureServer = server
+                } else {
+                    pageURL = nil
+                }
+                let c = try await Self.gateContext(id, pageURL: pageURL); context = c
                 _ = try await Self.gateEvaluate(c, "window.__gate.reset()")
                 switch id {
                 case "normal_execution":
@@ -7897,7 +8034,7 @@ extension AgentEngine {
                     guard c.engine.saveOutcomeLedger() else { throw MikaError("Legacy scenario setup could not persist") }
                     details["scenarioSetup"] = ["method": "production verified record reshaped to legacy nil taskID/actionID/dispatchState/verificationVerdict; statusNote pending",
                                                 "before": Self.gateJSON(original), "after": Self.gateJSON(legacy)]
-                    let recovered = try await Self.gateContext(id + "-new-task", reset: false)
+                    let recovered = try await Self.gateContext(id + "-new-task", reset: false, pageURL: pageURL)
                     context = recovered
                     guard recovered.engine.outcomeLedger.contains(where: { $0.id == legacy.id && $0.unresolved }),
                           recovered.engine.conversationTaskID != original.taskID else {

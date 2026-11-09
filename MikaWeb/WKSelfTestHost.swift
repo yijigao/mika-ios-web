@@ -26,6 +26,15 @@ import WebKit
     }
 
     @discardableResult
+    func loadURLAndWait(_ url: URL, expectedPath: String, readinessJavaScript: String,
+                        timeout: TimeInterval = 12) async throws -> [String: Any] {
+        let previousEpoch = tab.documentEpoch
+        tab.webView.load(URLRequest(url: url))
+        return try await wait(afterEpoch: previousEpoch, expectedPath: expectedPath,
+                              readinessJavaScript: readinessJavaScript, timeout: timeout)
+    }
+
+    @discardableResult
     func wait(afterEpoch: Int? = nil, expectedPath: String? = nil,
               readinessJavaScript: String, timeout: TimeInterval = 12) async throws -> [String: Any] {
         let started = ProcessInfo.processInfo.systemUptime
