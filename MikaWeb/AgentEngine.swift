@@ -2442,7 +2442,7 @@ struct OpenStall {
                                 persistSnapshot()
                                 refreshThermalState()
                                 guard thermalGate.allowsHeavyWork() else { pauseForThermal(); return }
-                                try await auditedDispatch(name: "recovery-reload", pageURL: page.url) {
+                                try await auditedDispatch(name: "recovery-reload", pageURL: web.executionTab.webView.url?.absoluteString ?? "") {
                                     web.reloadExecutionTab()
                                 }
                             }
