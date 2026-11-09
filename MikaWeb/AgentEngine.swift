@@ -37,6 +37,26 @@ struct AgentStep: Identifiable {
     let id: Int
     let action, reason: String
 }
+private struct PendingExecutionAuthorization: Codable {
+    var id: UUID
+    var taskID: UUID
+    var accountKey: String
+    var site: String
+    var pageURL: String
+    var targetKey: String
+    var parameterHash: String
+    var executionRevision: Int
+    var issuedAt: Date
+    var expired: Bool { Date().timeIntervalSince(issuedAt) >= 60 }
+}
+private final class DispatchCallMarker { var entered = false }
+struct TaskProgressSnapshot: Codable {
+    var taskID: UUID
+    var stage: String
+    var result: String
+    var next: String
+    var updatedAt: Date
+}
 /// 模型决策步预算（WECHAT-COVER-FIX Part C）：计数的唯一对象是
 /// 「模型返回一个动作」这一事件（引擎在两个模型通道与确认后通道的
 /// 动作取得点各调一次 consumeDecision）。以下一律不计数：引擎注记
@@ -698,6 +718,7 @@ struct OpenStall {
     @Published var taskText = ""
     @Published private(set) var status: AgentStatus = .idle
     @Published private(set) var steps: [AgentStep] = []
+    @Published private(set) var progressBySession: [UUID: TaskProgressSnapshot] = [:]
     @Published private(set) var active = true
     @Published private(set) var conversationTaskID: UUID?
     @Published private(set) var waitingInput: WaitingInput?
@@ -815,14 +836,17 @@ struct OpenStall {
     /// 成果台账（OUTCOME-LEDGER，结构与分类见 OutcomeLedger.swift）：已真实
     /// 执行并留痕的提交类关键动作。App 会话级——start() 不清（用户追问在
     /// App 里就是一条新任务，台账必须跨得过任务界），自有持久化＋随会话
-    /// 快照双写，进程被杀重开仍在；24 小时过期、最多 20 条（见 prunedOutcomes）。
+    /// 快照双写，进程被杀重开仍在；未决条目不按时间和条数裁剪。
     private(set) var outcomeLedger: [OutcomeRecord] = []
+    private var outcomeLedgerDecodeFailed = false
+    private var executionReceipts: [ExecutionReceipt] = []
+    private var executionReceiptsDecodeFailed = false
+    private var pendingExecutionAuthorization: PendingExecutionAuthorization?
+    private var currentActionID: UUID?
     /// 成果主张的任务归属与终局状态。与旧 OutcomeRecord 分表保存，避免改动
     /// 既有台账格式；claim.id 与 OutcomeRecord.id 相同。
     private var taskClaims: [TaskStateClaim] = []
-    /// 软门已提醒过的台账条目 id（本进程内）：同一条目只拦第一次重复提交；
-    /// 模型收到提醒后仍坚持、或用户在新任务里明确要求重发时放行，由落记
-    /// 路径回记为再次提交。进程重启后集合清空，会再提醒一次（软门口径）。
+    /// 旧软门兼容字段；当前重复提交由结构化回执永久阻断自动重放。
     private var outcomeGateFired: Set<UUID> = []
     /// 重复提交被拦下时给模型的提醒：随下一次模型调用注入后清除（步流里
     /// 另有一条 outcome 步，用户可见）。
@@ -893,6 +917,9 @@ struct OpenStall {
         var elementLabel: String
         var stage: Stage
         var confirmationToken: UUID?
+        var confirmationIssuedAt: Date? = nil
+        var confirmationRevision: Int? = nil
+        var targetKey: String? = nil
         /// 上传前页面图像清单基线（WECHAT-COVER-FIX Part B）：选文件
         /// 阶段开始前采集，收口时与上传后的清单作差——「页面新增图像」
         /// 是封面缩略图/预览图出现的客观第二回读。仅存源串（元数据）。
@@ -994,6 +1021,11 @@ struct OpenStall {
             Task { @MainActor [weak self] in self?.applyIdleTimerPolicy() }
         }
         loadOutcomeLedger()
+        loadExecutionReceipts()
+        if let data = UserDefaults.standard.data(forKey: "taskProgress.v1"),
+           let saved = try? JSONDecoder().decode([UUID: TaskProgressSnapshot].self, from: data) {
+            progressBySession = saved
+        }
         loadZhihuPublishRecords()
         loadTaskClaims()
         saveTaskClaims()
@@ -1390,7 +1422,11 @@ struct OpenStall {
         return lines
     }
     func stop() {
-        generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        if let authorization = pendingExecutionAuthorization {
+            _ = appendExecutionAudit(event: "authorization-revoked", actionID: authorization.id,
+                                     pageURL: authorization.pageURL, evidenceRef: "task-stopped")
+        }
+        generation = UUID(); worker?.cancel(); worker = nil; pending = nil; pendingExecutionAuthorization = nil
         scheduleReadbackRecycling()
         thermalPaused = false
         discardPendingUpload()
@@ -1660,7 +1696,7 @@ struct OpenStall {
     /// 会话隔离的是状态卡里的引用与快照双写），切会话清了它会让别的
     /// 会话刚提交过的动作失去防重保护；快照恢复时按 id 合并回来。
     private func resetRuntimeState() {
-        generation = UUID(); worker?.cancel(); worker = nil; pending = nil
+        generation = UUID(); worker?.cancel(); worker = nil; pending = nil; pendingExecutionAuthorization = nil; currentActionID = nil
         goal = ""; taskText = ""; steps = []; stepSeq = 0; answerContext = []; waitingInput = nil
         lastStaleKey = nil; staleStreak = 0; transientStreak = 0
         loopDetector.reset(); pendingLoopHint = nil; loadedSkillNames = []; loadedSkillVersions = [:]; loadedSkillBodies = ""
@@ -1816,13 +1852,65 @@ struct OpenStall {
     func confirm(execute: Bool) {
         guard active, let saved = pending else { return }
         pending = nil
+        guard let authorization = pendingExecutionAuthorization, !authorization.expired else {
+            _ = appendExecutionAudit(event: "authorization-expired", actionID: pendingExecutionAuthorization?.id ?? UUID(),
+                                     pageURL: saved.2, evidenceRef: "60-second-deadline-or-legacy-snapshot")
+            pendingExecutionAuthorization = nil
+            appendStep("authorization", "审批已超过 60 秒或旧快照缺少绑定记录，默认拒绝；未派发")
+            status = .paused("审批已过期，请按当前页面重新发起动作")
+            persistSnapshot()
+            return
+        }
         if !execute {
+            _ = appendExecutionAudit(event: "authorization-denied", actionID: authorization.id,
+                                     pageURL: authorization.pageURL, evidenceRef: "user-rejected-before-dispatch")
+            pendingExecutionAuthorization = nil
             appendStep("skip", "用户跳过：\(saved.0.reason)")
             // 用户明确跳过是关键事实：钉进状态卡，后续轮次不得再提议同一步
             stateCard.pinFact("用户决定跳过：\(saved.0.reason)")
             launch(); return
         }
+        guard appendExecutionAudit(event: "authorization-approved", actionID: authorization.id,
+                                   pageURL: authorization.pageURL, evidenceRef: "ui-confirm") else {
+            pendingExecutionAuthorization = nil
+            status = .paused("授权审计写入失败，未派发")
+            persistSnapshot()
+            return
+        }
         launch(confirmed: saved)
+    }
+
+    private func authorizationParameterHash(_ action: AgentAction) -> String {
+        let bodyHash = currentContentFingerprint().hash
+        return ZhihuPublishPolicy.hash([action.action, action.text, action.url, bodyHash].joined(separator: "|"))
+    }
+
+    private func executionDecision(_ action: AgentAction, _ target: PageElement) -> SafetyPolicy.Decision {
+        let existing = SafetyPolicy.check(action, target)
+        if existing != .allow { return .manual }
+        guard action.action == "click" else { return .allow }
+        let label = [target.text, target.ariaLabel, target.name, target.placeholder].joined(separator: " ").lowercased()
+        let destructive = ["delete", "remove", "erase", "删除", "移除", "清空", "注销"].contains(where: label.contains)
+        return SubmissionClassifier.isSubmissionElement(target) || destructive ? .confirm : .allow
+    }
+
+    private func accountKey(for pageURL: String) async -> String {
+        if URL(string: pageURL)?.host?.contains("zhihu.com") == true {
+            return (await web.readZhihuPageIdentity()).accountIdentity
+        }
+        return "session:\(runSessionID.uuidString)"
+    }
+
+    private func expirePendingAuthorization(id: UUID) {
+        guard let authorization = pendingExecutionAuthorization, authorization.id == id,
+              authorization.expired, pending != nil else { return }
+        pending = nil
+        pendingExecutionAuthorization = nil
+        _ = appendExecutionAudit(event: "authorization-expired", actionID: id,
+                                 pageURL: authorization.pageURL, evidenceRef: "60-second-deadline")
+        appendStep("authorization", "审批 60 秒到期，默认拒绝；未派发")
+        status = .paused("审批已过期，请按当前页面重新发起动作")
+        persistSnapshot()
     }
 
     private func nextAgentAction(prompt: String, page: PageState) async throws -> AgentAction {
@@ -1955,6 +2043,12 @@ struct OpenStall {
                         traceFinalAction = nil
                         traceRewriteReason = "none"
                         let action = try await nextAgentAction(prompt: prompt, page: page)
+                        let actionID = UUID()
+                        currentActionID = actionID
+                        guard appendExecutionAudit(event: "model-attempt-\(Self.safeAuditName(action.action))", actionID: actionID,
+                                                   pageURL: page.url, evidenceRef: "model-decision") else {
+                            throw MikaError("审计日志写入失败，动作未派发")
+                        }
                         // 预算计数点（Part C）：模型返回一个动作＝一次决策，
                         // 全引擎只在此一处计数（runConfirmed 执行的是已计数的
                         // 已确认动作，后续动作回到主循环同一计数点取得）；
@@ -1969,6 +2063,8 @@ struct OpenStall {
                                                     "gate": "zhihuAutoPublishEnabled", "enabled": false]
                                 traceRewriteReason = "production auto-publish switch is off"
                                 appendStep("publish-decision", "知乎自动发表开关关闭：attempt_publish_once 已由引擎拦截，未调用网页点击")
+                                _ = appendExecutionAudit(event: "refusal-publish-switch-off", actionID: actionID,
+                                                         pageURL: page.url, evidenceRef: "production-switch")
                                 AgentTraceStore.shared.appendEngineAction(action: "attempt_publish_once",
                                     targetFingerprint: currentZhihuPublishBinding?.buttonIdentity ?? "unbound",
                                     method: "engine-production-switch", result: "blocked-switch-off",
@@ -1995,16 +2091,22 @@ struct OpenStall {
                            Self.isZhihuAnswerPublishTarget(page.elements[action.index], pageURL: page.url) {
                             switch currentZhihuDecision {
                             case .some(.readbackOnly(let why)), .some(.alreadyPublished(let why)):
+                                _ = appendExecutionAudit(event: "refusal-publish-replay", actionID: actionID,
+                                                         pageURL: page.url, evidenceRef: "zhihu-publish-ledger")
                                 record(action, suffix: "（未执行：知乎专用发布账拦截——\(why)）")
                                 appendStep("publish-decision", "模型再次请求发布未执行：\(why)；点击次数保持不变，只允许回读/报告")
                                 continue
                             case .some(.blocked(let why)):
+                                _ = appendExecutionAudit(event: "refusal-publish-policy", actionID: actionID,
+                                                         pageURL: page.url, evidenceRef: "zhihu-proof-or-authorization")
                                 record(action, suffix: "（未执行：知乎发布证据缺口——\(why)）")
                                 appendStep("publish-decision", "模型发布点击未执行：\(why)；不得借 disabled、计数或旧 verified 绕过 WriteProof/唯一绑定")
                                 continue
                             default: break
                             }
                             record(action, suffix: "（未执行：知乎回答提交只允许走专用一次点击门）")
+                            _ = appendExecutionAudit(event: "refusal-publish-generic-click", actionID: actionID,
+                                                     pageURL: page.url, evidenceRef: "dedicated-path-only")
                             appendStep("publish-decision", "知乎发布点击未执行：授权=\(currentZhihuAuthorization.explanation)；通用 click 不得旁路专用策略/未决账")
                             continue
                         }
@@ -2026,6 +2128,10 @@ struct OpenStall {
                                 continue
                             }
                             var finalSummary = action.summary
+                            if !pendingThisRun.isEmpty && Self.containsCompletionClaim(summary: finalSummary) {
+                                finalSummary = "本任务有提交尝试结果未确认；请先独立回读实际成果，不得重放。"
+                                appendStep("audit", "未决提交覆盖模型完成断言：结案只报告结果未确认")
+                            }
                             if let currentTaskID = conversationTaskID,
                                URL(string: page.url)?.host?.contains("zhihu.com") == true {
                                 let publish = matchedZhihuPublishRecord ?? zhihuPublishRecords.last(where: { $0.taskID == currentTaskID })
@@ -2035,9 +2141,9 @@ struct OpenStall {
                                     let publicationText = publish?.status.display ?? "未尝试"
                                     let evidence = publish?.answerURL.map { "；结案证据：\($0)" } ?? ""
                                     let truthful = "正文：\(writeText)；发布：\(publicationText)\(evidence)"
-                                    finalSummary = Self.containsCompletionClaim(summary: action.summary)
+                                    finalSummary = Self.containsCompletionClaim(summary: finalSummary)
                                         ? truthful
-                                        : truthful + (action.summary.isEmpty ? "" : "。\(action.summary)")
+                                        : truthful + (finalSummary.isEmpty ? "" : "。\(finalSummary)")
                                     appendStep("audit", "知乎结案门修正：正文核实与发布结果分开；最终口径固定为「\(truthful)」")
                                 }
                             }
@@ -2108,7 +2214,9 @@ struct OpenStall {
                             executionSerial += 1
                             let previous = conversationTaskID.flatMap { readbackTabs.readbackTab(forTask: $0) }.flatMap { readbackTabs.entries[$0] }
                             let sourceID = web.executionTab.id
-                            let tab = try web.openTabForExecution(urlString: action.url)
+                            let tab = try await auditedDispatch(name: "open_new_tab", pageURL: action.url) {
+                                try web.openTabForExecution(urlString: action.url)
+                            }
                             if let taskID = conversationTaskID {
                                 if let oldID = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "readback"),
                                    let previous, previous.tabID == oldID {
@@ -2188,7 +2296,10 @@ struct OpenStall {
                                 // 带出——saved 才说「去相册最近项目找它」，
                                 // denied/failed 明说图只在附件里，不让用户
                                 // 去相册空找。
-                                let coverResult = await CoverGenerator.generateAndSaveToPhotos(title: coverTitle, subtitle: action.subtitle, template: CoverTemplate.from(action.template), sessionID: runSessionID)
+                                let coverResult = try await auditedDispatch(name: "generate_cover", pageURL: page.url) {
+                                    await CoverGenerator.generateAndSaveToPhotos(title: coverTitle, subtitle: action.subtitle,
+                                        template: CoverTemplate.from(action.template), sessionID: runSessionID)
+                                }
                                 if let produced = coverResult.record {
                                     appendStep("cover", "已自产封面「\(produced.displayName)」并存入本会话附件（编号 \(String(produced.id.uuidString.prefix(8)))，版式 \(CoverTemplate.from(action.template).label)，900×383，来源＝本任务生成）；\(coverResult.photo?.stepDescription(fileName: produced.displayName) ?? "未同步系统相册")；设为网页封面时用 upload_file 引用该编号（任务生成文件免 SP-01 确认卡），设没设上以页面回读为准")
                                     loopFingerprint = LoopDetector.fingerprint(action: "generate_cover", target: coverTitle, outcome: "ok")
@@ -2227,7 +2338,9 @@ struct OpenStall {
                             do {
                                 try await checkpoint(token)
                                 executionSerial += 1
-                                try await web.execute(action, expected: nil)
+                                try await auditedDispatch(name: action.action, pageURL: page.url) {
+                                    try await web.execute(action, expected: nil)
+                                }
                                 try await checkpoint(token)
                             } catch {
                                 guard Self.isUnexecutableActionError(error) else { throw error }
@@ -2321,7 +2434,9 @@ struct OpenStall {
                                 persistSnapshot()
                                 refreshThermalState()
                                 guard thermalGate.allowsHeavyWork() else { pauseForThermal(); return }
-                                web.reloadExecutionTab() // 连败第 2 次：先重载执行页一次再试
+                                try await auditedDispatch(name: "recovery-reload", pageURL: page.url) {
+                                    web.reloadExecutionTab()
+                                }
                             }
                             if !active { try await checkpoint(token) } // 后台出的错先驻停、回前台再重试
                             try await Task.sleep(for: .milliseconds(Int(backoff * 1000)))
@@ -2378,6 +2493,7 @@ struct OpenStall {
     /// 确认或跳过；再次确认时会重新走本段的复核，仍不会误执行。非瞬时错误照旧上抛
     /// 判失败（含上述安全失败与手输转等待）。
     private func runConfirmed(_ saved: (AgentAction, PageElement, String, Int), token: UUID) async throws -> ConfirmedOutcome {
+        var receiptID: UUID?
         do {
             try await checkpoint(token)
             let page = try await web.state()
@@ -2393,14 +2509,36 @@ struct OpenStall {
                 appendStep("publish-decision", "确认/恢复的知乎回答提交已拦截；将按当前授权、账号未决账、WriteProof 与唯一绑定重新编排")
                 return .proceed
             }
+            let accountNow = await accountKey(for: page.url)
+            guard let taskID = conversationTaskID, let authorization = pendingExecutionAuthorization,
+                  !authorization.expired,
+                  authorization.taskID == taskID,
+                  authorization.site == (URL(string: page.url)?.host ?? ""),
+                  authorization.pageURL == page.url,
+                  authorization.targetKey == ElementDescriptor(target).key,
+                  authorization.parameterHash == authorizationParameterHash(saved.0),
+                  authorization.executionRevision == saved.3,
+                  web.executionRevision == saved.3,
+                  authorization.accountKey == accountNow else {
+                _ = appendExecutionAudit(event: "authorization-invalid", actionID: pendingExecutionAuthorization?.id ?? UUID(),
+                                         pageURL: page.url, evidenceRef: "scope-target-parameter-revision-or-account-drift")
+                throw MikaError("审批范围、目标、关键内容、页面代次或账号已变化，未派发")
+            }
+            pendingExecutionAuthorization = nil
             if SafetyPolicy.check(saved.0, target) == .manual {
                 waitingInput = .manual(id: UUID(), text: "请手动填写密码或验证码后继续")
                 status = .waitingManual("请手动填写密码或验证码后继续")
                 persistSnapshot()
                 return .halted
             }
+            receiptID = try prepareSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2)
             executionSerial += 1
-            try await web.execute(saved.0, expected: target, approved: true)
+            try await auditedDispatch(name: saved.0.action, pageURL: saved.2,
+                actionID: receiptID.flatMap { id in outcomeLedger.first(where: { $0.id == id })?.actionID } ?? authorization.id,
+                critical: true) {
+                try await web.execute(saved.0, expected: target, approved: true, expectedPageURL: saved.2)
+            }
+            if let receiptID { updateSubmissionDispatch(recordID: receiptID, state: .sent, evidence: "web.execute-returned") }
             try await checkpoint(token)
             if saved.0.action == "type" {
                 let trace = web.takeEditorTypeTrace()
@@ -2415,15 +2553,19 @@ struct OpenStall {
             if saved.0.action == "click" { appendStep("effect", clickEffectDescription()) }
             // 经用户确认执行的提交类动作同样落台账（确认本身即用户的明确
             // 指示，此路不设软门；台账记下后防的是后续轮次的无意识重复）
-            if let outcome = noteSubmissionIfNeeded(action: saved.0, element: target, pageURL: saved.2) {
-                appendStep("outcome", outcome.note)
-                // VERIFY-1：确认路径同样过独立核验（shadow 记录，就地补步）
-                await runPostSubmissionVerification(recordID: outcome.recordID, element: target, pageURL: saved.2, before: page, token: token)
+            if let receiptID {
+                appendStep("outcome", "提交派发回执已落盘；核验仍待独立回读（\(receiptID)）")
+                await runPostSubmissionVerification(recordID: receiptID, element: target, pageURL: saved.2, before: page, token: token)
                 if let vstep = pendingVerificationStep { appendStep("verify", vstep); pendingVerificationStep = nil }
             }
+            receiptID = nil
             try await Task.sleep(for: .milliseconds(500))
             return .proceed
         } catch {
+            if let receiptID {
+                updateSubmissionDispatch(recordID: receiptID, state: .unknown, evidence: "execute-or-followup-error")
+                throw MikaError("提交派发结果未决，已阻断自动重放：\(error.localizedDescription)")
+            }
             guard token == generation else { throw CancellationError() }
             if error is CancellationError { throw error }
             // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改）：这是
@@ -2491,7 +2633,7 @@ struct OpenStall {
         let attachment = reference.isEmpty ? nil : AttachmentStore.shared.findAttachment(reference: reference, sessionID: runSessionID)
         let isTaskGenerated = attachment?.origin == .taskGenerated
         let needsConfirm = SafetyPolicy.uploadDecision(isTaskGenerated: isTaskGenerated) == .confirm
-        var upload = PendingUpload(id: UUID(), attachmentID: attachment?.id,
+        var upload = PendingUpload(id: currentActionID ?? UUID(), attachmentID: attachment?.id,
                                    attachmentName: attachment?.displayName ?? "（在系统选择器中现选的文件）",
                                    isTaskGenerated: isTaskGenerated,
                                    pageURL: snapshot.url,
@@ -2504,13 +2646,29 @@ struct OpenStall {
         // 用户文件在哪——是否图片、是否已存入系统相册，此刻定格。
         upload.isImage = attachment?.contentType.hasPrefix("image/") ?? false
         upload.savedToPhotos = attachment?.savedToPhotos == true
+        upload.targetKey = ElementDescriptor(target).key
         if needsConfirm {
             upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: attachment?.id, pageURL: snapshot.url)
+            upload.confirmationIssuedAt = Date()
+            upload.confirmationRevision = web.executionRevision
             pendingUpload = upload
             let text = "上传前请确认：将把文件「\(upload.attachmentName)」上传到 \(upload.pageHost.isEmpty ? "当前页面" : upload.pageHost)"
             waitingInput = .manual(id: upload.id, text: text)
             status = .waitingManual(text)
             appendStep("upload", "已定位文件控件（\(upload.elementLabel)），按 SP-01 先出确认卡：文件「\(upload.attachmentName)」→ \(upload.pageHost.isEmpty ? upload.pageURL : upload.pageHost)，等用户确认")
+            guard appendExecutionAudit(event: "authorization-requested", actionID: upload.id,
+                                       pageURL: upload.pageURL, evidenceRef: "sp01-60-second-deadline") else {
+                discardPendingUpload()
+                waitingInput = nil
+                status = .paused("上传授权审计写入失败，未派发")
+                persistSnapshot()
+                return .waiting
+            }
+            let uploadID = upload.id
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(60))
+                self?.expirePendingUpload(id: uploadID)
+            }
         } else {
             pendingUpload = upload
             appendStep("upload", "已定位文件控件（\(upload.elementLabel)），文件为本任务生成物、SP-01 豁免确认")
@@ -2533,24 +2691,60 @@ struct OpenStall {
     /// waitingInput 同步更新（对话里留一条 manual 条目）。
     private func beginUploadPickStage() async -> Bool {
         guard var upload = pendingUpload else { return false }
+        guard let page = try? await web.state(), page.url == upload.pageURL,
+              let targetKey = upload.targetKey,
+              page.elements.contains(where: { $0.index == upload.elementIndex && $0.tag == "input" &&
+                  $0.inputType.lowercased() == "file" && ElementDescriptor($0).key == targetKey }) else {
+            status = .paused("上传目标或页面已变化，文件未供给页面")
+            appendStep("upload", "派发前目标漂移：上传控件不再匹配，未供文件")
+            return false
+        }
         upload.stage = .pickFile
         // 双回读基线（Part B）：触发控件前先存页面图像清单——收口时
         // 只有「上传后新增的图像」才算封面/预览出现的第二回读证据
         upload.preUploadImages = await web.probePageImages()
         pendingUpload = upload
-        var supplyArmed = false
-        if let attachmentID = upload.attachmentID,
-           let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
-            supplyArmed = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
+        guard persistSnapshot() else {
+            status = .paused("上传现场持久化失败，文件未供给页面")
+            return false
         }
         // 上传结构化诊断（EDITOR-ENTRY-BIND 第 4 项）：触发前记控件
         // 形态、触发后记面板回调与供文件消费——下次真机在真实编辑
         // 器里跑上传，从步流就能判「控件没找到/回调没触发/页面不
         // 认」是哪一种，不再只有一句「回读未确认」。只加诊断，不
         // 改上传机制与 SP-01 语义。
-        let controlContext = await web.fileInputContext(index: upload.elementIndex)
-        let panelStart = Date()
-        let triggered = await web.triggerFileInput(index: upload.elementIndex)
+        let dispatch: (supplyArmed: Bool, controlContext: String, panelStart: Date, triggered: Bool)
+        do {
+            dispatch = try await auditedDispatch(name: "upload_file", pageURL: upload.pageURL,
+                                                 actionID: upload.id, critical: true) {
+                var armed = false
+                if let attachmentID = upload.attachmentID,
+                   let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
+                    armed = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
+                }
+                let context = await web.fileInputContext(index: upload.elementIndex)
+                guard let dispatchPage = try? await web.state(), dispatchPage.url == upload.pageURL,
+                      let targetKey = upload.targetKey,
+                      dispatchPage.elements.contains(where: { $0.index == upload.elementIndex &&
+                          ElementDescriptor($0).key == targetKey && $0.inputType.lowercased() == "file" }) else {
+                    web.disarmUploadSupply()
+                    throw MikaError("上传派发前目标已变化")
+                }
+                let start = Date()
+                let triggered = await web.triggerFileInput(index: upload.elementIndex)
+                return (armed, context, start, triggered)
+            }
+        } catch {
+            web.disarmUploadSupply()
+            status = .paused("上传派发或审计未决，请先核对页面；文件不自动重放")
+            appendStep("upload", "上传未继续：\(error.localizedDescription)；按 unknown 保守处理")
+            persistSnapshot()
+            return false
+        }
+        let supplyArmed = dispatch.supplyArmed
+        let controlContext = dispatch.controlContext
+        let panelStart = dispatch.panelStart
+        let triggered = dispatch.triggered
         if supplyArmed {
             try? await Task.sleep(for: .milliseconds(1200))
             let panel = web.openPanelActivity(since: panelStart)
@@ -2601,6 +2795,18 @@ struct OpenStall {
     /// 发起 upload_file 拿新卡）；消费成功才进入选文件阶段。
     func confirmPendingUpload() {
         guard let upload = pendingUpload, upload.stage == .confirmUpload else { return }
+        guard let issuedAt = upload.confirmationIssuedAt,
+              Date().timeIntervalSince(issuedAt) < 60,
+              upload.confirmationRevision == web.executionRevision,
+              upload.pageURL == (web.executionTab.webView.url?.absoluteString ?? "") else {
+            discardPendingUpload()
+            waitingInput = nil
+            status = .paused("上传审批过期或目标已变化，未派发")
+            _ = appendExecutionAudit(event: "authorization-denied", actionID: upload.id,
+                                     pageURL: upload.pageURL, evidenceRef: "deadline-or-target-drift")
+            persistSnapshot()
+            return
+        }
         if let token = upload.confirmationToken {
             guard AttachmentStore.shared.consumeUploadConfirmation(token, attachmentID: upload.attachmentID, pageURL: upload.pageURL) else {
                 pendingUpload = nil
@@ -2611,6 +2817,14 @@ struct OpenStall {
             }
         }
         appendStep("upload", "用户已确认上传文件「\(upload.attachmentName)」（SP-01 一次性确认已消费，不可复用）")
+        guard appendExecutionAudit(event: "authorization-approved", actionID: upload.id,
+                                   pageURL: upload.pageURL, evidenceRef: "sp01-ui-confirm") else {
+            discardPendingUpload()
+            waitingInput = nil
+            status = .paused("上传授权审计写入失败，文件未供给页面")
+            persistSnapshot()
+            return
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             // 自动供文件命中时选文件阶段已自行收口，任务直接续跑；
@@ -2627,7 +2841,21 @@ struct OpenStall {
         discardPendingUpload()
         waitingInput = nil
         appendStep("upload", "用户取消了上传（文件「\(upload.attachmentName)」未上传），请继续任务的其他部分，不要反复要求上传同一文件")
+        _ = appendExecutionAudit(event: "authorization-denied", actionID: upload.id,
+                                 pageURL: upload.pageURL, evidenceRef: "user-cancel")
         launch()
+    }
+
+    private func expirePendingUpload(id: UUID) {
+        guard let upload = pendingUpload, upload.id == id, upload.stage == .confirmUpload,
+              let issuedAt = upload.confirmationIssuedAt, Date().timeIntervalSince(issuedAt) >= 60 else { return }
+        discardPendingUpload()
+        waitingInput = nil
+        status = .paused("上传审批 60 秒到期，默认拒绝")
+        _ = appendExecutionAudit(event: "authorization-expired", actionID: id,
+                                 pageURL: upload.pageURL, evidenceRef: "60-second-deadline")
+        appendStep("upload", "上传审批 60 秒到期，默认拒绝；文件未供给页面")
+        persistSnapshot()
     }
 
     /// 选文件阶段收口：「已选好」→ 回读页面文件控件的持有状态核验（只报
@@ -2645,6 +2873,8 @@ struct OpenStall {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if self.pendingTabScene != nil { self.applyPendingTabRestore() }
+            try? await Task.sleep(for: .milliseconds(500))
             await verifyPickedUpload(upload: upload)
             launch()
         }
@@ -2659,6 +2889,7 @@ struct OpenStall {
         let host = upload.pageHost
         let baseline = Set(upload.preUploadImages)
         let names = await web.probeFileInput(index: index)
+        var verified = false
         if names.isEmpty {
             // 诊断口径（EDITOR-ENTRY-BIND）：第二回读也照取——控件
             // 未持有但页面已出现新图（页面用另一控件/弹窗收文件）
@@ -2674,10 +2905,21 @@ struct OpenStall {
                 appendStep("upload", "上传回读核验（unknown）：文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），但页面上未见新增的封面/预览图像——封面可能尚未设上或预览未渲染，不要声称封面已设好；下一轮看页面现状再判断（可稍等预览出现或核对封面区）")
                 appendStep("upload", "上传诊断小结：回读①控件持有＝✓（\(names.joined(separator: "、"))）；回读②页面新增图像＝✗无；结论＝unknown（单回读过、双回读未齐）")
             } else {
+                verified = true
                 appendStep("upload", "上传回读核验（双回读通过）：页面文件控件已持有文件 \(names.joined(separator: "、"))（目标页面 \(host.isEmpty ? "当前页面" : host)），且页面新增了 \(newImages.count) 处图像（封面缩略图/预览已出现）——两项回读相互印证，封面已设上；是否已提交到服务器以下一轮页面反馈为准")
                 appendStep("upload", "上传诊断小结：回读①控件持有＝✓（\(names.joined(separator: "、"))）；回读②页面新增图像＝✓ \(newImages.count) 处；结论＝双回读通过")
-                stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
             }
+        }
+        let audited = appendExecutionAudit(event: verified ? "verification-verified" : "verification-unknown",
+                                           actionID: upload.id, pageURL: upload.pageURL,
+                                           evidenceRef: verified ? "file-input-and-preview" : "upload-readback-incomplete")
+        let receipt = executionReceipts.last(where: { $0.actionID == upload.id && $0.critical })
+        let receiptSaved = receipt.map { entry in
+            updateExecutionReceipt(id: entry.id, state: entry.dispatchState,
+                                   evidence: "upload-readback", verdict: verified && audited ? .verified : .unknown)
+        } ?? true
+        if verified && audited && receiptSaved {
+            stateCard.addCompleted("upload_file：页面已持有文件 \(names.joined(separator: "、"))，封面/预览图像已出现（双回读）")
         }
     }
 
@@ -2733,19 +2975,46 @@ struct OpenStall {
                 return try registerStrategySwitch(key: descriptor.key, label: label)
             }
             if action.action == "click", Self.isZhihuAnswerPublishTarget(target, pageURL: snapshot.url) {
+                _ = appendExecutionAudit(event: "refusal-zhihu-generic-click", actionID: currentActionID ?? UUID(),
+                                         pageURL: snapshot.url, evidenceRef: "dedicated-policy-required")
                 record(action, suffix: "（未执行：runTargeted 不能绕过知乎专用一次点击门）")
                 appendStep("publish-decision", "runTargeted 的知乎回答提交已拦截；授权/未决账/WriteProof/绑定统一由专用门裁决")
                 return .strategySwitch
             }
-            switch SafetyPolicy.check(action, target) {
+            if action.action == "click", let block = duplicateSubmissionBlock(element: target, pageURL: snapshot.url) {
+                pendingOutcomeStep = block.step
+                pendingOutcomeHint = block.hint
+                return .duplicateBlocked
+            }
+            switch executionDecision(action, target) {
             case .manual:
+                _ = appendExecutionAudit(event: "refusal-manual-redline", actionID: currentActionID ?? UUID(),
+                                         pageURL: snapshot.url, evidenceRef: "safety-policy-manual")
                 record(action, suffix: "（未执行，请手动输入）")
-                waitingInput = .manual(id: UUID(), text: "密码或疑似验证码字段，请在网页手动填写后点继续")
-                status = .waitingManual("密码或疑似验证码字段，请在网页手动填写后点继续")
+                waitingInput = .manual(id: UUID(), text: "付款、授权、密码或验证码等敏感步骤须由 Joey 本人处理，完成后点继续")
+                status = .waitingManual("敏感步骤须由 Joey 本人处理")
                 return .waiting
             case .confirm:
-                pending = (action, target, snapshot.url, web.executionRevision)
+                let revision = web.executionRevision
+                let account = await accountKey(for: snapshot.url)
+                try await checkpoint(token)
+                guard web.executionRevision == revision else { return try registerStrategySwitch(key: descriptor.key, label: label) }
+                let authorization = PendingExecutionAuthorization(id: currentActionID ?? UUID(), taskID: conversationTaskID ?? runSessionID,
+                    accountKey: account, site: URL(string: snapshot.url)?.host ?? "", pageURL: snapshot.url,
+                    targetKey: ElementDescriptor(target).key, parameterHash: authorizationParameterHash(action),
+                    executionRevision: revision, issuedAt: Date())
+                guard appendExecutionAudit(event: "authorization-requested", actionID: authorization.id,
+                                           pageURL: snapshot.url, evidenceRef: "60-second-deadline") else {
+                    throw MikaError("审计日志写入失败，未发起审批")
+                }
+                pendingExecutionAuthorization = authorization
+                pending = (action, target, snapshot.url, revision)
                 status = .waitingConfirm(action)
+                persistSnapshot()
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(60))
+                    self?.expirePendingAuthorization(id: authorization.id)
+                }
                 return .waiting
             case .allow:
                 break
@@ -2753,15 +3022,17 @@ struct OpenStall {
             // 重复提交软门（OUTCOME-LEDGER）：只拦自主路径的 click——确认路径
             // （runConfirmed）是用户亲手确认，不经此门；拦下后本轮不执行，
             // 提醒步与下一轮注入提醒都已置位，模型应改走列表核查路径
-            if action.action == "click", let block = duplicateSubmissionBlock(element: target, pageURL: snapshot.url) {
-                pendingOutcomeStep = block.step
-                pendingOutcomeHint = block.hint
-                return .duplicateBlocked
-            }
+            var receiptID: UUID?
             do {
                 try await checkpoint(token)
+                receiptID = try prepareSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url)
                 executionSerial += 1
-                try await web.execute(action, expected: target)
+                try await auditedDispatch(name: action.action, pageURL: snapshot.url,
+                    actionID: receiptID.flatMap { id in outcomeLedger.first(where: { $0.id == id })?.actionID },
+                    critical: receiptID != nil) {
+                    try await web.execute(action, expected: target, expectedPageURL: snapshot.url)
+                }
+                if let receiptID { updateSubmissionDispatch(recordID: receiptID, state: .sent, evidence: "web.execute-returned") }
                 try await checkpoint(token)
                 if action.action == "click", let resolution = web.takeBlockerResolution() {
                     appendStep("modal-resolution", "生产点击阻挡处理分账：\(resolution)")
@@ -2772,16 +3043,18 @@ struct OpenStall {
                 // 成功再落台账条目（说明经 pendingOutcomeStep 由调用方补步）
                 if action.action == "type" { await noteTypedContent(action: action, element: target) }
                 if action.action == "click" {
-                    if let outcome = noteSubmissionIfNeeded(action: action, element: target, pageURL: snapshot.url) {
-                        pendingOutcomeStep = outcome.note
-                        // VERIFY-1：落记后随即独立核验（shadow，verify 步经
-                        // pendingVerificationStep 在 outcome 步之后补入）
-                        await runPostSubmissionVerification(recordID: outcome.recordID, element: target, pageURL: snapshot.url, before: modelPage, token: token)
+                    if let receiptID {
+                        pendingOutcomeStep = "提交派发回执已落盘；核验仍待独立回读（\(receiptID)）"
+                        await runPostSubmissionVerification(recordID: receiptID, element: target, pageURL: snapshot.url, before: modelPage, token: token)
                     }
                     await noteOverlayDiagnosticAfterClick(clicked: original)
                 }
                 return .executed
             } catch {
+                if let receiptID {
+                    updateSubmissionDispatch(recordID: receiptID, state: .unknown, evidence: "execute-or-followup-error")
+                    throw MikaError("提交派发结果未决，已阻断自动重放：\(error.localizedDescription)")
+                }
                 // 弹窗点按无响应（COVER-CONSENT 立、AUTONOMY-FIX 改、
                 // LADDER-FIX 补卡点联动）：能力类卡点，不是失效类错误，
                 // 重找重试只会再连败——不停车等用户代劳。卡点已在开时：
@@ -3071,7 +3344,9 @@ struct OpenStall {
             return false
         }
         do {
-            try await web.execute(click, expected: target)
+            try await auditedDispatch(name: "rung-reveal-click", pageURL: page.url) {
+                try await web.execute(click, expected: target, expectedPageURL: page.url)
+            }
         } catch {
             appendStep("bypass", "绕行梯第 1 级引擎揭示复判：候选点击抛错：\(error.localizedDescription)")
             return false
@@ -3108,7 +3383,9 @@ struct OpenStall {
                 if let harvest = outcome.result {
                     do {
                         executionSerial += 1
-                        try await web.loadOnExecutionTab(harvest.url)
+                        try await auditedDispatch(name: "rung-navigation", pageURL: harvest.url) {
+                            try web.loadOnExecutionTab(harvest.url)
+                        }
                     } catch {
                         // 候选地址导航失败：记为此级失败、推进下一级，
                         // 不让一个坏候选杀掉整个任务
@@ -3335,7 +3612,11 @@ struct OpenStall {
                 pauseForThermal()
                 return (false, "设备发热严重，已暂停自动重载")
             }
-            web.reloadExecutionTab()
+            do {
+                try await auditedDispatch(name: "dialog-reload", pageURL: originalURL) {
+                    web.reloadExecutionTab()
+                }
+            } catch { return (false, "重载审计或派发失败：\(error.localizedDescription)") }
             try? await Task.sleep(for: .milliseconds(800))
             _ = await web.settledCapture()
             let after = await web.dialogCensus()
@@ -3361,7 +3642,9 @@ struct OpenStall {
         guard SafetyPolicy.check(saveAction, saveElement) == .allow else {
             return (false, "保存入口未过安全策略（非 .allow），不代点，此级失败")
         }
-        do { try await web.execute(saveAction, expected: saveElement) } catch {
+        do { try await auditedDispatch(name: "dialog-save-click", pageURL: originalURL) {
+            try await web.execute(saveAction, expected: saveElement, expectedPageURL: originalURL)
+        } } catch {
             return (false, "保存点击抛错：\(error.localizedDescription)")
         }
         let settled = await web.settledCapture()
@@ -3370,9 +3653,13 @@ struct OpenStall {
             return (false, "原页地址不可解析，此级失败")
         }
         do {
-            try await web.loadOnExecutionTab("\(scheme)://\(host)/")
+            try await auditedDispatch(name: "dialog-leave-navigation", pageURL: "\(scheme)://\(host)/") {
+                try web.loadOnExecutionTab("\(scheme)://\(host)/")
+            }
             try? await Task.sleep(for: .milliseconds(500))
-            try await web.loadOnExecutionTab(originalURL)
+            try await auditedDispatch(name: "dialog-return-navigation", pageURL: originalURL) {
+                try web.loadOnExecutionTab(originalURL)
+            }
         } catch { return (false, "导航往返抛错：\(error.localizedDescription)") }
         _ = await web.settledCapture()
         let after = await web.dialogCensus()
@@ -3446,7 +3733,7 @@ struct OpenStall {
         func fmt(_ ok: Bool) -> String { ok ? "✓" : "✗" }
         // 合成页用 window.name 模拟「重载即消失」的会话级弹窗：重复跑
         // 自检时先清掉该标记，保证每次都从弹窗在场的基线开始
-        _ = try? await web.evaluate("(()=>{window.name='';return 'reset';})()")
+        _ = try? await web.evaluateForManualSelfTest("(()=>{window.name='';return 'reset';})()")
         do { try web.loadLocalOnExecutionTab("test-autonomy") } catch {
             lines.append("✗ 合成测试页 test-autonomy 加载失败：\(error.localizedDescription)")
             return lines
@@ -3702,17 +3989,17 @@ struct OpenStall {
         dock.taskStarted()
         await Task.yield()
         let frameBefore = web.webView.frame.size
-        let viewportBefore = (try? await web.evaluate("window.innerWidth")) as? NSNumber
+        let viewportBefore = (try? await web.evaluateForManualSelfTest("window.innerWidth")) as? NSNumber
         dock.toggle()
         await Task.yield()
         let frameAfter = web.webView.frame.size
-        let viewportAfter = (try? await web.evaluate("window.innerWidth")) as? NSNumber
+        let viewportAfter = (try? await web.evaluateForManualSelfTest("window.innerWidth")) as? NSNumber
         let sameFrame = abs(frameBefore.width - frameAfter.width) < 0.5 && abs(frameBefore.height - frameAfter.height) < 0.5
         let sameViewport = viewportBefore?.doubleValue == viewportAfter?.doubleValue && viewportBefore != nil
         lines.append("\(mark(sameFrame && sameViewport)) 显示→隐藏前后 WKWebView frame=\(frameBefore)→\(frameAfter)、viewport=\(viewportBefore?.intValue ?? -1)→\(viewportAfter?.intValue ?? -1)，均不变")
 
         let token = UUID().uuidString
-        let probe = (try? await web.evaluate("(()=>{window.__mikaFloatingHidden='\(token)';return window.__mikaFloatingHidden;})()")) as? String
+        let probe = (try? await web.evaluateForManualSelfTest("(()=>{window.__mikaFloatingHidden='\(token)';return window.__mikaFloatingHidden;})()")) as? String
         lines.append("\(mark(probe == token)) 隐藏状态 JS 探针注入并回读成功（agent 执行未挂起）")
         return lines
     }
@@ -4060,12 +4347,113 @@ struct OpenStall {
         stepSeq += 1
         steps.append(AgentStep(id: stepSeq, action: action, reason: reason))
         persistSnapshot()
+        saveTaskProgress()
         syncContinuedProgress()
+    }
+    private func saveTaskProgress() {
+        guard let taskID = conversationTaskID else { return }
+        let matching = outcomeLedger.last { $0.taskID == taskID }
+        let unresolved = matching?.unresolved == true
+        let result = matching.map { "派发 \($0.dispatchState?.rawValue ?? "unknown")；核验 \($0.verificationVerdict?.rawValue ?? "unknown")" }
+            ?? stateCard.zhihuPublicationStatus.map { "知乎发布：\($0)" } ?? "尚无可核实成果"
+        let next: String
+        if unresolved { next = "独立回读实际结果，未决动作禁止重放" }
+        else if case .waitingConfirm = status { next = "在 60 秒内确认或拒绝" }
+        else if case .waitingManual = status { next = "完成当前人工步骤" }
+        else if case .done = status { next = "查看成果与证据" }
+        else if case .failed = status { next = "查看失败记录并处理" }
+        else { next = "按当前页面继续任务" }
+        let stage = steps.last.map { "第 \($0.id) 步：\(Self.safeAuditName($0.action))" } ?? "等待开始"
+        progressBySession[runSessionID] = TaskProgressSnapshot(taskID: taskID, stage: stage,
+            result: result, next: next, updatedAt: Date())
+        if let data = try? JSONEncoder().encode(progressBySession) {
+            UserDefaults.standard.set(data, forKey: "taskProgress.v1")
+        }
+    }
+    @discardableResult private func appendExecutionAudit(event: String, actionID: UUID,
+                                                         pageURL: String, evidenceRef: String) -> Bool {
+        var safeURL = ""
+        if let url = URLComponents(string: pageURL), let scheme = url.scheme {
+            safeURL = "\(scheme)://\(url.host ?? "")"
+        }
+        return ExecutionAuditStore.shared.append(ExecutionAuditRecord(
+            id: UUID(), recordedAt: Date(), taskID: conversationTaskID ?? runSessionID,
+            actionID: actionID, event: event, pageURL: safeURL,
+            evidenceRef: evidenceRef))
+    }
+    private func auditedDispatch<T>(name: String, pageURL: String, actionID: UUID? = nil,
+                                    critical: Bool = false,
+                                    callMarker: DispatchCallMarker? = nil,
+                                    operation: @MainActor () async throws -> T) async throws -> T {
+        let identifier = actionID ?? currentActionID ?? UUID()
+        let receiptID = UUID()
+        let taskID = conversationTaskID ?? runSessionID
+        let safeName = Self.safeAuditName(name)
+        guard !executionReceiptsDecodeFailed else { throw MikaError("派发回执无法解码，已停止动作") }
+        let readOnlyOrNavigation: Set<String> = ["navigate", "scroll", "wait", "open_new_tab",
+            "rung-navigation", "dialog-leave-navigation", "dialog-return-navigation",
+            "zhihu-readback-navigation", "recovery-reload", "dialog-reload"]
+        let host = URL(string: pageURL)?.host ?? ""
+        let unresolvedOutcome = outcomeLedger.contains { record in
+            record.unresolved && record.actionID != Optional(identifier) &&
+                (record.taskID == Optional(taskID) || (record.taskID == nil && record.host == host))
+        }
+        guard readOnlyOrNavigation.contains(safeName) ||
+              (!executionReceipts.contains(where: { $0.taskID == taskID && $0.blocksDependencies }) && !unresolvedOutcome) else {
+            throw MikaError("本任务有未决副作用，已阻断依赖动作；请先独立回读")
+        }
+        executionReceipts.append(ExecutionReceipt(id: receiptID, actionID: identifier, taskID: taskID, actionName: safeName,
+            targetHash: ZhihuPublishPolicy.hash(pageURL), critical: critical, dispatchState: .unknown,
+            verificationVerdict: critical ? .unknown : nil, evidenceRef: "prepared-before-call",
+            createdAt: Date(), updatedAt: Date()))
+        guard saveExecutionReceipts() else { throw MikaError("派发回执持久化失败，动作未派发") }
+        guard appendExecutionAudit(event: "attempt-\(Self.safeAuditName(name))", actionID: identifier,
+                                   pageURL: pageURL, evidenceRef: "host-dispatch") &&
+              appendExecutionAudit(event: "dispatch-prepared", actionID: identifier,
+                                   pageURL: pageURL, evidenceRef: "before-call") else {
+            updateExecutionReceipt(id: receiptID, state: .notSent, evidence: "audit-failed-before-call")
+            throw MikaError("审计日志写入失败，动作未派发")
+        }
+        do {
+            callMarker?.entered = true
+            let result = try await operation()
+            guard appendExecutionAudit(event: "dispatch-sent", actionID: identifier,
+                                       pageURL: pageURL, evidenceRef: "call-returned"),
+                  updateExecutionReceipt(id: receiptID, state: .sent, evidence: "call-returned") else {
+                updateExecutionReceipt(id: receiptID, state: .unknown, evidence: "post-call-log-or-receipt-failed")
+                throw MikaError("派发后审计写入失败，结果按 unknown 停止")
+            }
+            return result
+        } catch {
+            updateExecutionReceipt(id: receiptID, state: .unknown, evidence: "call-or-followup-error")
+            _ = appendExecutionAudit(event: "dispatch-unknown", actionID: identifier,
+                                     pageURL: pageURL, evidenceRef: "call-or-followup-error")
+            throw error
+        }
+    }
+    @discardableResult private func updateExecutionReceipt(id: UUID, state: OutcomeRecord.DispatchState,
+                                                            evidence: String, verdict: VerificationVerdict? = nil) -> Bool {
+        guard let index = executionReceipts.firstIndex(where: { $0.id == id }) else { return false }
+        executionReceipts[index].dispatchState = state
+        executionReceipts[index].evidenceRef = evidence
+        executionReceipts[index].updatedAt = Date()
+        if let verdict { executionReceipts[index].verificationVerdict = verdict }
+        return saveExecutionReceipts()
+    }
+    private static func safeAuditName(_ name: String) -> String {
+        let known: Set<String> = ["click", "type", "scroll", "navigate", "open_new_tab", "wait",
+            "set_site_mode", "use_skill", "upload_file", "generate_cover", "done", "ask_user",
+            "rung-reveal-click", "rung-navigation", "dialog-reload", "dialog-save-click",
+            "dialog-leave-navigation", "dialog-return-navigation", "recovery-reload",
+            "zhihu-readback-navigation", "zhihu-publish"]
+        return known.contains(name) ? name : "unrecognized"
     }
     private func record(_ action: AgentAction, suffix: String = "") {
         appendStep(action.action, action.reason + suffix)
         // 状态卡的已完成里程碑在记账点同步（程序事实，不经模型转述，H1）
-        stateCard.addCompleted("\(action.action)：\(action.reason)")
+        stateCard.addCompleted(action.action == "click"
+            ? "点击尝试已记录；成果以独立核验为准"
+            : "\(action.action)：\(action.reason)")
         appendTrace(action: action, suffix: suffix)
     }
 
@@ -4208,21 +4596,52 @@ struct OpenStall {
     }()
     private static func outcomeTime(_ date: Date) -> String { outcomeTimeFormatter.string(from: date) }
 
-    /// 台账封顶口径：只留 24 小时内的最近 20 条——定力要守的是「刚提交过
-    /// 的别再交一遍」，过期与溢出的老条目留着只会污染注入。
+    /// 未决尝试永不按时间或条数裁剪；只裁已决条目。
     private static func prunedOutcomes(_ records: [OutcomeRecord]) -> [OutcomeRecord] {
-        let fresh = records.filter { Date().timeIntervalSince($0.recordedAt) < 24 * 3600 }
-        return Array(fresh.suffix(20))
+        let resolved = Array(records.filter { !$0.unresolved && Date().timeIntervalSince($0.recordedAt) < 24 * 3600 }.suffix(20))
+        let unresolved = records.filter { $0.unresolved }
+        return (resolved + unresolved).sorted { $0.recordedAt < $1.recordedAt }
     }
     private func loadOutcomeLedger() {
-        guard let data = UserDefaults.standard.data(forKey: Self.outcomeLedgerKey),
-              let records = try? JSONDecoder().decode([OutcomeRecord].self, from: data) else { return }
+        guard let data = UserDefaults.standard.data(forKey: Self.outcomeLedgerKey) else { return }
+        guard let records = try? JSONDecoder().decode([OutcomeRecord].self, from: data) else {
+            outcomeLedgerDecodeFailed = true
+            return
+        }
         outcomeLedger = Self.prunedOutcomes(records)
     }
-    private func saveOutcomeLedger() {
+    @discardableResult private func saveOutcomeLedger() -> Bool {
+        guard !outcomeLedgerDecodeFailed else { return false }
         outcomeLedger = Self.prunedOutcomes(outcomeLedger)
-        if let data = try? JSONEncoder().encode(outcomeLedger) {
-            UserDefaults.standard.set(data, forKey: Self.outcomeLedgerKey)
+        guard let data = try? JSONEncoder().encode(outcomeLedger) else { return false }
+        UserDefaults.standard.set(data, forKey: Self.outcomeLedgerKey)
+        guard let saved = UserDefaults.standard.data(forKey: Self.outcomeLedgerKey),
+              let decoded = try? JSONDecoder().decode([OutcomeRecord].self, from: saved) else { return false }
+        return decoded.count == outcomeLedger.count && zip(decoded, outcomeLedger).allSatisfy { pair in
+            pair.0.id == pair.1.id && pair.0.dispatchState == pair.1.dispatchState && pair.0.verificationVerdict == pair.1.verificationVerdict
+        }
+    }
+
+    private static let executionReceiptsKey = "executionReceipts.v1"
+    private func loadExecutionReceipts() {
+        guard let data = UserDefaults.standard.data(forKey: Self.executionReceiptsKey) else { return }
+        guard let saved = try? JSONDecoder().decode([ExecutionReceipt].self, from: data) else {
+            executionReceiptsDecodeFailed = true
+            return
+        }
+        executionReceipts = saved
+    }
+    @discardableResult private func saveExecutionReceipts() -> Bool {
+        guard !executionReceiptsDecodeFailed else { return false }
+        let pending = executionReceipts.filter { !$0.resolved }
+        let settled = Array(executionReceipts.filter { $0.resolved && Date().timeIntervalSince($0.updatedAt) < 24 * 3600 }.suffix(20))
+        executionReceipts = (settled + pending).sorted { $0.createdAt < $1.createdAt }
+        guard let data = try? JSONEncoder().encode(executionReceipts) else { return false }
+        UserDefaults.standard.set(data, forKey: Self.executionReceiptsKey)
+        guard let stored = UserDefaults.standard.data(forKey: Self.executionReceiptsKey),
+              let decoded = try? JSONDecoder().decode([ExecutionReceipt].self, from: stored) else { return false }
+        return decoded.count == executionReceipts.count && zip(decoded, executionReceipts).allSatisfy { pair in
+            pair.0.id == pair.1.id && pair.0.dispatchState == pair.1.dispatchState && pair.0.verificationVerdict == pair.1.verificationVerdict
         }
     }
 
@@ -4286,6 +4705,7 @@ struct OpenStall {
         }
     }
     private func saveTaskClaims() {
+        guard !outcomeLedgerDecodeFailed else { return }
         let liveIDs = Set(outcomeLedger.map(\.id))
         taskClaims = taskClaims.filter { liveIDs.contains($0.id) }
         if let data = try? JSONEncoder().encode(taskClaims) {
@@ -4539,49 +4959,66 @@ struct OpenStall {
         appendStep("draft-restore", "已按任务/会话关联取回稿件：draft=\(draft.id.uuidString)、version=\(draft.version)、sourceTask=\(draft.sourceTaskID.uuidString)、account=\(draft.target.accountStableID)、question=\(draft.target.questionID)、instruction=\(instruction.prefix(32))；旧页面凭证未移植")
     }
 
-    /// 提交类点击真正执行成功后的落记（runTargeted 自主路径与 runConfirmed
-    /// 确认路径共用）：返回要补进轨迹的 outcome 步文案与台账条目 id
-    /// （VERIFY-1 核验记录据此关联），非提交类返回 nil。
-    /// 同一性命中已有条目时不重复建条——更新其时间与状态并注明再次提交
-    /// （软门已提醒后坚持执行、或经用户确认执行的重发走的正是这条）。
-    private func noteSubmissionIfNeeded(action: AgentAction, element: PageElement, pageURL: String) -> (note: String, recordID: UUID)? {
+    /// Persist the conservative receipt before any submission can reach WK.
+    private func prepareSubmissionIfNeeded(action: AgentAction, element: PageElement, pageURL: String) throws -> UUID? {
         guard action.action == "click", SubmissionClassifier.isSubmissionElement(element) else { return nil }
+        guard !outcomeLedgerDecodeFailed else { throw MikaError("成果台账无法解码，已停止提交以免重复") }
         let (hash, prefix) = currentContentFingerprint()
         let host = URL(string: pageURL)?.host ?? ""
         let label = Self.elementLabel(of: element)
-        if let index = outcomeLedger.firstIndex(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }) {
-            outcomeLedger[index].recordedAt = Date()
-            outcomeLedger[index].resubmittedAt = Date()
-            if taskClaims.first(where: { $0.id == outcomeLedger[index].id })?.verifiedByUser != true {
-                outcomeLedger[index].statusNote = "再次提交（经提醒或用户确认后执行），待核查"
-            }
-            saveOutcomeLedger()
-            return ("成果台账更新：同一内容已再次提交（「\(label)」），条目时间与状态已更新——后续仍按已提交内容对待，不得无意识再发", outcomeLedger[index].id)
+        guard !outcomeLedger.contains(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }) else {
+            throw MikaError("同一目标已有提交记录，已阻断重放；请先独立回读")
         }
-        let record = OutcomeRecord(id: UUID(), pageURL: pageURL, host: host, elementLabel: label,
+        let actionID = currentActionID ?? UUID()
+        var record = OutcomeRecord(id: UUID(), pageURL: pageURL, host: host, elementLabel: label,
                                     contentFingerprint: hash, contentPrefix: prefix,
-                                    statusNote: "已提交（待核查）", recordedAt: Date(), resubmittedAt: nil)
+                                    statusNote: "派发未决（尚未确认调用）", recordedAt: Date(), resubmittedAt: nil)
+        record.taskID = conversationTaskID
+        record.actionID = actionID
+        record.dispatchState = .unknown
+        record.verificationVerdict = .unknown
+        record.dispatchEvidence = "prepared-before-dispatch"
         outcomeLedger.append(record)
+        guard saveOutcomeLedger() else { throw MikaError("提交回执持久化失败，未派发") }
+        guard appendExecutionAudit(event: "dispatch-prepared", actionID: actionID,
+                                   pageURL: pageURL, evidenceRef: record.id.uuidString) else {
+            updateSubmissionDispatch(recordID: record.id, state: .notSent, evidence: "audit-write-failed-before-call")
+            throw MikaError("审计日志写入失败，未派发提交")
+        }
         if let taskID = conversationTaskID {
             taskClaims.append(TaskStateClaim(id: record.id, sourceTaskID: taskID,
-                                             text: "在 \(host.isEmpty ? "本地页面" : host) 点了「\(label)」提交\(prefix.isEmpty ? "内容" : "内容「\(prefix)…」")"))
+                                             text: "在 \(host.isEmpty ? "本地页面" : host) 尝试「\(label)」提交\(prefix.isEmpty ? "内容" : "内容「\(prefix)…」")"))
         }
-        saveOutcomeLedger()
         saveTaskClaims()
-        let contentDesc = prefix.isEmpty ? "（正文未留指纹，按页面与按钮记账）" : "内容「\(prefix)…」"
-        return ("成果台账已记录：\(Self.outcomeTime(record.recordedAt)) 在 \(host.isEmpty ? "本地页面" : host) 提交了\(contentDesc)（按钮「\(label)」），状态：已提交（待核查）", record.id)
+        return record.id
     }
 
-    // MARK: - 动作后核验（VERIFY-1：shadow 记录，不阻断、不重放）
+    private func updateSubmissionDispatch(recordID: UUID, state: OutcomeRecord.DispatchState, evidence: String) {
+        guard let index = outcomeLedger.firstIndex(where: { $0.id == recordID }) else { return }
+        let record = outcomeLedger[index]
+        let audited = appendExecutionAudit(event: "dispatch-\(state.rawValue)", actionID: record.actionID ?? recordID,
+                                           pageURL: record.pageURL, evidenceRef: recordID.uuidString)
+        let effectiveState: OutcomeRecord.DispatchState = audited ? state : .unknown
+        outcomeLedger[index].dispatchState = effectiveState
+        outcomeLedger[index].dispatchEvidence = audited ? evidence : "audit-write-failed-after-call"
+        outcomeLedger[index].statusNote = effectiveState == .sent ? "已派发，等待独立核验" :
+            (effectiveState == .notSent ? "未派发" : "派发结果未知，禁止自动重放")
+        if !saveOutcomeLedger() {
+            if let current = outcomeLedger.firstIndex(where: { $0.id == recordID }) {
+                outcomeLedger[current].dispatchState = .unknown
+                outcomeLedger[current].statusNote = "回执写入失败，按派发未知处理"
+            }
+        }
+    }
+
+    // MARK: - 动作后核验（正式回写与防重放）
 
     /// 台账落记后随即运行的独立核验：settle 采样取新鲜证据 →
     /// ActionVerifier 三值判定 → 记录 append 落盘 verification-log
     /// .jsonl（台账旁记录）→ 步流补一条 verify 提示步（经
     /// pendingVerificationStep 在 outcome 步之后补入，runConfirmed 路径
-    /// 就地补）。shadow 口径：判定只记录与提示——不改台账状态、不拦
-    /// 动作、不自动重提/重发；unknown 只提示，contradicted 只标分歧，
-    /// 是否转正式阻断门留待 shadow 数据裁决。全程不抛错：取证异常
-    /// 本身记为 unknown，绝不让核验层把已执行的动作拖成失败。
+    /// 就地补）。只有日志与台账都写成 verified 才晋级成果主张；其余
+    /// 状态保持未决，阻断自动重放。取证异常保守记 unknown。
     private func runPostSubmissionVerification(recordID: UUID, element: PageElement, pageURL: String, before: PageState, token: UUID) async {
         let prefix = outcomeLedger.first(where: { $0.id == recordID })?.contentPrefix ?? currentContentFingerprint().prefix
         let label = Self.elementLabel(of: element)
@@ -4591,15 +5028,45 @@ struct OpenStall {
                                           settled: capture.settled, contentPrefix: prefix)
         let record = ActionVerifier.makeRecord(sessionID: runSessionID.uuidString, outcomeRecordID: recordID,
                                                actionLabel: label, pageURL: pageURL, result: result, settled: capture.settled)
-        VerificationLogStore.shared.append(record)
+        let logged = VerificationLogStore.shared.append(record)
+        let auditLogged = appendExecutionAudit(event: "verification-\(logged ? result.verdict.rawValue : "log-failed")",
+            actionID: outcomeLedger.first(where: { $0.id == recordID })?.actionID ?? recordID,
+            pageURL: pageURL, evidenceRef: logged ? record.id.uuidString : "verification-log-write-failed")
+        let recorded = logged && auditLogged
+        let actionID = outcomeLedger.first(where: { $0.id == recordID })?.actionID
+        var receiptRecorded = false
+        if let actionID, let id = executionReceipts.last(where: { $0.actionID == actionID && $0.critical })?.id {
+            receiptRecorded = updateExecutionReceipt(id: id, state: .sent, evidence: record.id.uuidString,
+                                                     verdict: recorded ? result.verdict : .unknown)
+        }
+        var promoted = false
+        if let index = outcomeLedger.firstIndex(where: { $0.id == recordID }) {
+            // A failed evidence write cannot promote a result to success.
+            let completeEvidence = recorded && receiptRecorded && outcomeLedger[index].dispatchState == .sent
+            outcomeLedger[index].verificationVerdict = completeEvidence ? result.verdict : .unknown
+            outcomeLedger[index].verificationEvidenceID = completeEvidence ? record.id : nil
+            outcomeLedger[index].statusNote = completeEvidence && result.verdict == .verified
+                ? "已核实" : "提交结果未决，禁止自动重放"
+            let persisted = saveOutcomeLedger()
+            if !persisted, let current = outcomeLedger.firstIndex(where: { $0.id == recordID }) {
+                outcomeLedger[current].verificationVerdict = .unknown
+                outcomeLedger[current].statusNote = "台账写入失败，提交结果未决"
+            }
+            promoted = completeEvidence && persisted && result.verdict == .verified
+            if completeEvidence && persisted && result.verdict == .verified,
+               let claimIndex = taskClaims.firstIndex(where: { $0.id == recordID }) {
+                _ = taskClaims[claimIndex].setStatus(.verified)
+                saveTaskClaims()
+            }
+        }
         let evidenceText = result.evidence.first ?? result.weakEvidence.first ?? "无 conclusive 证据"
         switch result.verdict {
         case .verified:
-            pendingVerificationStep = "动作后核验（影子记录）：verified——\(evidenceText)。该结论由核验层独立回读得出，与台账「待核查」并存记录，不改变流程。"
+            pendingVerificationStep = "动作后核验：\(promoted ? "verified，台账已回写" : "证据链不完整，结果保持 unknown")——\(evidenceText)。"
         case .contradicted:
-            pendingVerificationStep = "动作后核验（影子记录）：contradicted——\(evidenceText)。核验与执行器自报（已提交）分歧，已落盘记录；shadow 期只提示不阻断、不自动重发，请结合页面现状判断。"
+            pendingVerificationStep = "动作后核验：contradicted——\(evidenceText)。已阻断自动重发，请回读实际结果。"
         case .unknown:
-            pendingVerificationStep = "动作后核验（影子记录）：unknown——\(evidenceText)。证据不足以下结论，仅提示不阻断、不自动重发；需要确认现状时按台账口径去列表/记录页核查。"
+            pendingVerificationStep = "动作后核验：unknown——\(evidenceText)。已阻断自动重发，请去列表/记录页核查。"
         }
     }
 
@@ -4674,31 +5141,28 @@ struct OpenStall {
         return lines
     }
 
-    /// 重复提交软门：本次自主点击若命中台账里同一条目、且该条目本进程内
-    /// 还没提醒过——拦下本次点击，返回步流文案与当轮注入提醒；已提醒过的
-    /// 条目放行（模型已收到提醒仍坚持、或用户明确要求重发），执行后由
-    /// noteSubmissionIfNeeded 回记为再次提交。这就是「软」：只拦第一次
-    /// 无意识重复，不做硬阻断；确认路径（用户亲手点的确认）不经此门。
+    /// 任何匹配的提交记录都阻断自动重放；confirmed 路径在派发前也
+    /// 由 prepareSubmissionIfNeeded 做同一检查。
     private func duplicateSubmissionBlock(element: PageElement, pageURL: String) -> (step: String, hint: String)? {
         guard SubmissionClassifier.isSubmissionElement(element) else { return nil }
         let (hash, _) = currentContentFingerprint()
         let host = URL(string: pageURL)?.host ?? ""
         let label = Self.elementLabel(of: element)
-        guard let record = outcomeLedger.first(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }),
-              !outcomeGateFired.contains(record.id) else { return nil }
-        outcomeGateFired.insert(record.id)
+        guard let record = outcomeLedger.first(where: { Self.outcomeMatches($0, fingerprint: hash, host: host, pageURL: pageURL, label: label) }) else { return nil }
+        _ = appendExecutionAudit(event: "refusal-duplicate", actionID: currentActionID ?? UUID(),
+                                 pageURL: pageURL, evidenceRef: record.id.uuidString)
         let when = Self.outcomeTime(record.recordedAt)
         let contentDesc = record.contentPrefix.isEmpty ? "该内容" : "内容「\(record.contentPrefix)…」"
         let shownStatus = Self.displayedOutcomeStatus(record.statusNote)
         let step = "重复提交提醒：\(contentDesc)已于 \(when) 在 \(record.host.isEmpty ? "本地页面" : record.host) 提交过（状态：\(shownStatus)），本次重复提交已拦下未执行——先去内容列表/记录页核查现状再决定"
-        let hint = "【重复提交提醒】你刚才试图再次提交的\(contentDesc)已于 \(when) 提交过，台账状态：\(shownStatus)。本次点击已被拦下、没有执行。现在先去该站的内容列表/记录页核查这条内容的当前状态（如审核中/已发布），再决定下一步：状态正常就向用户复述核实结果，不要回编辑器凭残稿重发；只有用户明确要求重新提交时，才再次点击提交（再次点击会放行，reason 里注明系用户要求）。"
+        let hint = "【重复提交阻断】\(contentDesc)已有派发记录，核验=\(record.verificationVerdict?.rawValue ?? "unknown")。本次点击未执行。先去内容列表或记录页独立回读；unknown/contradicted 不得自动重放。"
         return (step, hint)
     }
 
     /// 只看本次运行落记、且仍待核查的条目；台账本身跨任务保存。
     private static func pendingOutcomes(_ records: [OutcomeRecord], since startedAt: Date?) -> [OutcomeRecord] {
         guard let startedAt else { return [] }
-        return records.filter { $0.recordedAt >= startedAt && $0.statusNote.contains("待核查") }
+        return records.filter { $0.recordedAt >= startedAt && $0.unresolved }
     }
 
     /// 完成断言词前四字内有否定词时不触发；「未核实」出现在断言之后
@@ -4764,7 +5228,9 @@ struct OpenStall {
         }
         let old = sample(start.addingTimeInterval(-1), "已提交（待核查）")
         let current = sample(start, "已提交（待核查）")
-        let checked = sample(start.addingTimeInterval(1), "页面回读已核实")
+        var checked = sample(start.addingTimeInterval(1), "页面回读已核实")
+        checked.dispatchState = .sent
+        checked.verificationVerdict = .verified
         let pending = Self.pendingOutcomes([old, current, checked], since: start)
         lines.append("\(pending.count == 1 && pending[0].id == current.id ? "✓" : "✗") 运行起点筛选：旧任务待核查与已离开待核查状态的条目均不入门")
         let legacy = Self.displayedOutcomeStatus("已核实（完成总结）：旧总结")
@@ -5831,7 +6297,9 @@ struct OpenStall {
             let claim = taskClaims.first { $0.id == record.id }
             let scope = claim?.sourceTaskID == currentID ? "本任务" : "背景只读"
             let confirmed = claim?.verifiedByUser == true ? "（据用户确认，终局）" : ""
-            return "· [\(scope)] \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 点了「\(record.elementLabel)」：\(content)，状态：\(Self.displayedOutcomeStatus(record.statusNote))\(confirmed)"
+            let dispatch = record.dispatchState?.rawValue ?? "unknown"
+            let verdict = record.verificationVerdict?.rawValue ?? "unknown"
+            return "· [\(scope)] \(Self.outcomeTime(record.recordedAt)) 在 \(record.host.isEmpty ? "本地页面" : record.host) 尝试「\(record.elementLabel)」：\(content)，派发=\(dispatch)，核验=\(verdict)，说明：\(Self.displayedOutcomeStatus(record.statusNote))\(confirmed)"
         }
         if hasForeignUnverified { lines.append("· 上个任务有未核实记录（不属于本任务）") }
         guard !lines.isEmpty else { return "" }
@@ -6085,7 +6553,10 @@ struct OpenStall {
             if !last.answerURL.isEmpty, !alreadyOnDetail, !openedDetail {
                 do {
                     let sourceID = web.executionTab.id
-                    let tab = try web.openTabForExecution(urlString: last.answerURL)
+                    let tab = try await auditedDispatch(name: "zhihu-readback-navigation", pageURL: last.answerURL,
+                                                        actionID: recordID) {
+                        try web.openTabForExecution(urlString: last.answerURL)
+                    }
                     if let taskID = conversationTaskID {
                         _ = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "zhihu-answer-detail")
                     }
@@ -6099,6 +6570,20 @@ struct OpenStall {
                     try? await Task.sleep(for: .milliseconds(500))
                     continue
                 }
+                let auditVerified = appendExecutionAudit(event: "verification-verified", actionID: recordID,
+                    pageURL: last.answerURL, evidenceRef: last.answerID.isEmpty ? target.questionID : last.answerID)
+                let receipt = executionReceipts.last(where: { $0.actionID == recordID && $0.critical })
+                let receiptVerified = auditVerified && (receipt.map { entry in
+                    updateExecutionReceipt(id: entry.id, state: .sent, evidence: "zhihu-answer-detail",
+                                           verdict: .verified)
+                } ?? true) // Existing pre-upgrade attempts have their own durable Zhihu ledger.
+                guard auditVerified && receiptVerified else {
+                    zhihuPublishRecords[index].status = .unknown
+                    zhihuPublishRecords[index].readbackCompletedAt = Date()
+                    zhihuPublishRecords[index].resultDetail = "核验审计或回执写入失败，保持 unknown"
+                    _ = saveZhihuPublishRecords()
+                    return .unknown
+                }
                 zhihuPublishRecords[index].status = verdict
                 zhihuPublishRecords[index].answerID = last.answerID.isEmpty ? nil : last.answerID
                 zhihuPublishRecords[index].answerURL = last.answerURL.isEmpty ? nil : last.answerURL
@@ -6106,7 +6591,11 @@ struct OpenStall {
                 zhihuPublishRecords[index].readbackText = last.bodyText
                 zhihuPublishRecords[index].readbackCompletedAt = Date()
                 zhihuPublishRecords[index].resultDetail = "question/author/full-body readback matched; pageState=\(last.pageState)"
-                _ = saveZhihuPublishRecords()
+                guard saveZhihuPublishRecords() else {
+                    zhihuPublishRecords[index].status = .unknown
+                    zhihuPublishRecords[index].resultDetail = "核验结果台账写入失败，保持 unknown"
+                    return .unknown
+                }
                 stateCard.setZhihuStatus(write: "已核实", publication: verdict.display)
                 AgentTraceStore.shared.appendEngineAction(action: "zhihu-publish-readback",
                     targetFingerprint: last.answerID.isEmpty ? target.questionID : last.answerID,
@@ -6123,7 +6612,10 @@ struct OpenStall {
                last.answerURL != web.executionTab.webView.url?.absoluteString {
                 do {
                     let sourceID = web.executionTab.id
-                    let tab = try web.openTabForExecution(urlString: last.answerURL)
+                    let tab = try await auditedDispatch(name: "zhihu-readback-navigation", pageURL: last.answerURL,
+                                                        actionID: recordID) {
+                        try web.openTabForExecution(urlString: last.answerURL)
+                    }
                     if let taskID = conversationTaskID {
                         _ = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID, sourceTabID: sourceID, purpose: "zhihu-answer-detail")
                     }
@@ -6140,6 +6632,12 @@ struct OpenStall {
         zhihuPublishRecords[index].readbackCompletedAt = Date()
         zhihuPublishRecords[index].resultDetail = ZhihuPublishPolicy.unknownNotice
         _ = saveZhihuPublishRecords()
+        if let receipt = executionReceipts.last(where: { $0.actionID == recordID && $0.critical }) {
+            _ = updateExecutionReceipt(id: receipt.id, state: receipt.dispatchState,
+                                       evidence: "zhihu-readback-unknown", verdict: .unknown)
+        }
+        _ = appendExecutionAudit(event: "verification-unknown", actionID: recordID,
+                                 pageURL: last.answerURL, evidenceRef: "bounded-readback-window")
         stateCard.setZhihuStatus(write: "已核实", publication: ZhihuPublishPolicy.unknownNotice)
         AgentTraceStore.shared.appendEngineAction(action: "zhihu-publish-readback",
             targetFingerprint: target.questionID, method: "bounded-read-only-20s", result: "unknown",
@@ -6218,7 +6716,7 @@ struct OpenStall {
             currentZhihuDecision = .blocked("落账前账号连续性无法确认")
             return
         }
-        let recordID = UUID()
+        let recordID = currentActionID ?? UUID()
         let publishRecord = ZhihuPublishRecord(id: recordID, taskID: taskID, runID: token,
             accountIdentity: pageIdentity.accountIdentity, accountStableID: account.stableID,
             accountAliases: account.aliases, questionID: proof.questionID, expectedTextHash: proof.expectedTextHash,
@@ -6254,8 +6752,12 @@ struct OpenStall {
             return
         }
         executionSerial += 1
+        let clickMarker = DispatchCallMarker()
         do {
-            let result = try await web.attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: recordID)
+            let result = try await auditedDispatch(name: "zhihu-publish", pageURL: safetyPage.url,
+                                                   actionID: recordID, critical: true, callMarker: clickMarker) {
+                try await web.attemptZhihuPublishOnce(proof: proof, binding: binding, attemptID: recordID)
+            }
             if let i = zhihuPublishRecords.firstIndex(where: { $0.id == recordID }) {
                 zhihuPublishRecords[i].status = .attempted
                 zhihuPublishRecords[i].clickCallCount = 1
@@ -6283,9 +6785,11 @@ struct OpenStall {
         } catch {
             if let i = zhihuPublishRecords.firstIndex(where: { $0.id == recordID }) {
                 zhihuPublishRecords[i].status = .unknown
-                zhihuPublishRecords[i].clickCallCount = 1
-                zhihuPublishRecords[i].clickResult = "call-failed-or-unknown: \(error.localizedDescription)"
-                zhihuPublishRecords[i].resultDetail = ZhihuPublishPolicy.unknownNotice
+                zhihuPublishRecords[i].clickCallCount = clickMarker.entered ? 1 : 0
+                zhihuPublishRecords[i].clickResult = clickMarker.entered
+                    ? "call-failed-or-unknown: \(error.localizedDescription)" : "not-called-before-dispatch: \(error.localizedDescription)"
+                zhihuPublishRecords[i].resultDetail = clickMarker.entered
+                    ? ZhihuPublishPolicy.unknownNotice : "派发前失败，标准 click() 未调用；未决记录保留防重放"
             }
             _ = saveZhihuPublishRecords()
             stateCard.setZhihuStatus(write: "已核实", publication: ZhihuPublishPolicy.unknownNotice)
@@ -6559,6 +7063,7 @@ struct OpenStall {
         var pendingActionJSON: String? // AgentAction 的 JSON（其 Decodable 容忍缺省字段）
         var pendingElement: PageElement?
         var pendingURL: String?
+        var pendingAuthorization: PendingExecutionAuthorization? = nil
         var waiting: WaitingDTO?
         var answersJSON: String // [QuestionAnswer] 的 JSON
         var skillNames: [String]? // 已加载 playbook 名（正文恢复时按名从 SkillStore 重读；可选字段，旧快照无此键照常解码）
@@ -6595,6 +7100,7 @@ struct OpenStall {
         // 凭据不落盘：恢复时若原阶段是选文件且文件非本任务生成，退回确认
         // 阶段重新出卡（见 restoreSnapshot 的 waitingManual 分支）。
         struct UploadDTO: Codable {
+            var actionID: UUID? = nil
             var attachmentID: UUID?
             var attachmentName: String
             var isTaskGenerated: Bool
@@ -6602,6 +7108,10 @@ struct OpenStall {
             var elementIndex: Int
             var elementLabel: String
             var wasPickStage: Bool
+            var confirmationIssuedAt: Date? = nil
+            var confirmationRevision: Int? = nil
+            var targetKey: String? = nil
+            var preUploadImages: [String]? = nil
         }
         var upload: UploadDTO? = nil
         // WECHAT-COVER-FIX Part C 起：模型步预算现场（段内已用/当前段/
@@ -6711,6 +7221,7 @@ struct OpenStall {
                                        steps: steps.map { SessionSnapshot.StepDTO(id: $0.id, action: $0.action, reason: $0.reason) },
                                        statusKind: kind, statusText: text,
                                        pendingActionJSON: pendingJSON, pendingElement: pendingElement, pendingURL: pendingURL,
+                                       pendingAuthorization: pendingExecutionAuthorization,
                                        waiting: waitingDTO, answersJSON: String(decoding: answersData, as: UTF8.self),
                                        skillNames: loadedSkillNames,
                                        skillVersions: loadedSkillVersions,
@@ -6725,10 +7236,15 @@ struct OpenStall {
                                        zhihuPublishAuthorization: currentZhihuAuthorization,
                                        preservedDraftID: activePreservedDraft?.id,
                                        upload: pendingUpload.map { upload in
-                                           SessionSnapshot.UploadDTO(attachmentID: upload.attachmentID, attachmentName: upload.attachmentName,
+                                           SessionSnapshot.UploadDTO(actionID: upload.id,
+                                                                     attachmentID: upload.attachmentID, attachmentName: upload.attachmentName,
                                                                      isTaskGenerated: upload.isTaskGenerated, pageURL: upload.pageURL,
                                                                      elementIndex: upload.elementIndex, elementLabel: upload.elementLabel,
-                                                                     wasPickStage: upload.stage == .pickFile)
+                                                                     wasPickStage: upload.stage == .pickFile,
+                                                                     confirmationIssuedAt: upload.confirmationIssuedAt,
+                                                                     confirmationRevision: upload.confirmationRevision,
+                                                                     targetKey: upload.targetKey,
+                                                                     preUploadImages: upload.preUploadImages)
                                        },
                                        modelStepsUsed: stepBudget.segmentUsed, budgetSegment: stepBudget.segment,
                                        totalModelSteps: stepBudget.totalUsed, stepLimitPaused: stepLimitPaused,
@@ -6754,11 +7270,13 @@ struct OpenStall {
             if UserDefaults.standard.object(forKey: Self.snapshotKey) != nil {
                 UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
             }
+            if saved { saveTaskProgress() }
             return saved
         } catch { return false }
     }
 
     private func clearSnapshot() {
+        saveTaskProgress()
         // 清的是任务所属会话的快照（M1：按 runSessionID，不随查看会话走）
         let url = SessionStore.shared.snapshotURL(for: runSessionID)
         try? FileManager.default.removeItem(at: url)
@@ -6884,13 +7402,20 @@ struct OpenStall {
         }
         switch snapshot.statusKind {
         case "waitingConfirm":
+            pendingExecutionAuthorization = snapshot.pendingAuthorization
             if let json = snapshot.pendingActionJSON,
                let action = try? JSONDecoder().decode(AgentAction.self, from: Data(json.utf8)),
-               let element = snapshot.pendingElement, let url = snapshot.pendingURL {
-                pending = (action, element, url, 0)
+               let element = snapshot.pendingElement, let url = snapshot.pendingURL,
+               let authorization = pendingExecutionAuthorization, !authorization.expired {
+                pending = (action, element, url, authorization.executionRevision)
                 status = .waitingConfirm(action)
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(max(0, 60 - Date().timeIntervalSince(authorization.issuedAt))))
+                    self?.expirePendingAuthorization(id: authorization.id)
+                }
             } else {
-                status = .paused("上次任务在 App 退出时中断，点继续可接着跑")
+                pendingExecutionAuthorization = nil
+                status = .paused("上次审批已过期或缺少绑定记录，已默认拒绝；请重新发起")
             }
         case "waitingManual":
             status = .waitingManual(snapshot.statusText)
@@ -6899,15 +7424,38 @@ struct OpenStall {
             // 任务生成，退回确认阶段重新确认（旧确认不复用）；本任务生成
             // 的文件才直接恢复到选文件阶段（用户需在页面上重新点控件）。
             if let dto = snapshot.upload {
-                var upload = PendingUpload(id: UUID(), attachmentID: dto.attachmentID, attachmentName: dto.attachmentName,
+                var upload = PendingUpload(id: dto.actionID ?? UUID(), attachmentID: dto.attachmentID, attachmentName: dto.attachmentName,
                                            isTaskGenerated: dto.isTaskGenerated, pageURL: dto.pageURL,
                                            pageHost: URL(string: dto.pageURL)?.host ?? "",
                                            elementIndex: dto.elementIndex, elementLabel: dto.elementLabel,
                                            stage: .confirmUpload, confirmationToken: nil)
-                if dto.wasPickStage && dto.isTaskGenerated {
+                upload.targetKey = dto.targetKey
+                upload.confirmationIssuedAt = dto.confirmationIssuedAt
+                upload.confirmationRevision = dto.confirmationRevision
+                upload.preUploadImages = dto.preUploadImages ?? []
+                if dto.wasPickStage {
+                    guard dto.preUploadImages != nil else {
+                        status = .paused("旧版上传现场缺少回读基线，按 unknown 停止自动续传")
+                        return
+                    }
                     upload.stage = .pickFile
+                    pendingUpload = upload
+                    let text = "上次上传可能已派发。先检查页面文件控件与预览，再点「已选好」做独立回读；文件不会自动重供。"
+                    waitingInput = .manual(id: upload.id, text: text)
+                    status = .waitingManual(text)
+                    _ = appendExecutionAudit(event: "recovery-upload-unknown", actionID: upload.id,
+                                             pageURL: upload.pageURL, evidenceRef: "process-restart-no-replay")
+                    return
                 } else {
-                    upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: dto.attachmentID, pageURL: dto.pageURL)
+                    if let issuedAt = upload.confirmationIssuedAt,
+                       Date().timeIntervalSince(issuedAt) < 60 {
+                        upload.confirmationToken = AttachmentStore.shared.issueUploadConfirmation(attachmentID: dto.attachmentID, pageURL: dto.pageURL)
+                    } else {
+                        status = .paused("上次上传审批已过期，文件未供给页面")
+                        pendingUpload = nil
+                        waitingInput = nil
+                        return
+                    }
                 }
                 // 找图指引字段按附件记录现查回填（COVER-UPLOAD-FIX C）；
                 // 恢复到选文件阶段且附件可解析时重新武装待供文件——
@@ -6916,9 +7464,6 @@ struct OpenStall {
                    let record = AttachmentStore.shared.record(id: attachmentID, sessionID: runSessionID) {
                     upload.isImage = record.contentType.hasPrefix("image/")
                     upload.savedToPhotos = record.savedToPhotos == true
-                    if upload.stage == .pickFile {
-                        _ = web.armUploadSupply(url: AttachmentStore.shared.fileURL(for: record), fileName: record.displayName)
-                    }
                 }
                 pendingUpload = upload
                 let text = upload.stage == .confirmUpload

@@ -13,10 +13,11 @@ import Foundation
 // 口径要点：
 // - 「会话级」按 App 会话理解：台账跨任务、跨进程存活（自有 UserDefaults
 //   持久化＋随会话快照双写，见 AgentEngine）。新任务不清台账——追问在 App
-//   里就是一条新任务，台账必须跨得过这道界；24 小时过期、最多 20 条封顶。
+//   里就是一条新任务，台账必须跨得过这道界；未决永久保留，仅已决条目裁剪。
 // - 内容只存规范化正文的哈希指纹与前 24 字短前缀，不存全文副本（正文已在
 //   对话条目与页面里）；凭据不经此路。
 struct OutcomeRecord: Codable, Identifiable {
+    enum DispatchState: String, Codable, Equatable { case sent, notSent = "not_sent", unknown }
     var id: UUID
     /// 提交发生的页面地址（完整 URL）与主机名（file URL 时主机为空串）
     var pageURL: String
@@ -28,12 +29,44 @@ struct OutcomeRecord: Codable, Identifiable {
     var contentFingerprint: String
     /// 内容短前缀（规范化正文前 24 字），仅供人／模型辨认，不存全文
     var contentPrefix: String
-    /// 状态说明：落记时为「已提交（待核查）」；done 可附未经独立核实的
-    /// 结案自述，仍保持待核查。旧「已核实（完成总结）」仅展示时降级。
+    /// 旧展示说明；派发与核验真值分别由结构字段承载。
     var statusNote: String
     var recordedAt: Date
     /// 经软门提醒（或用户确认）后再次提交的最近时间（可选，旧记录无此键照常解码）
     var resubmittedAt: Date?
+    // Optional for v1 UserDefaults and SessionSnapshot compatibility. A missing
+    // receipt is unresolved, never proof that a submission was not dispatched.
+    var taskID: UUID? = nil
+    var actionID: UUID? = nil
+    var dispatchState: DispatchState? = nil
+    var verificationVerdict: VerificationVerdict? = nil
+    var dispatchEvidence: String? = nil
+    var verificationEvidenceID: UUID? = nil
+    var unresolved: Bool {
+        dispatchState != .notSent && (dispatchState != .sent || verificationVerdict != .verified)
+    }
+}
+
+/// One host-dispatch attempt. Receipt and business verification are separate axes.
+/// A prepared receipt starts as unknown so a crash can never imply not_sent.
+struct ExecutionReceipt: Codable, Identifiable {
+    var id: UUID
+    var actionID: UUID
+    var taskID: UUID
+    var actionName: String
+    var targetHash: String
+    var critical: Bool
+    var dispatchState: OutcomeRecord.DispatchState
+    var verificationVerdict: VerificationVerdict?
+    var evidenceRef: String
+    var createdAt: Date
+    var updatedAt: Date
+
+    var blocksDependencies: Bool {
+        critical && dispatchState != .notSent &&
+            (dispatchState != .sent || verificationVerdict != .verified)
+    }
+    var resolved: Bool { !blocksDependencies && dispatchState != .unknown }
 }
 
 /// 提交类元素的判定与内容指纹（与 SafetyPolicy 分工：SafetyPolicy 管

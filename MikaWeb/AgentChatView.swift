@@ -44,6 +44,20 @@ struct AgentChatView: View {
                     .font(.caption).foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let progress = engine.progressBySession[conversation.displayedSessionID] {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("任务进度").font(.caption).bold()
+                    Text("做到：\(progress.stage)")
+                    Text("结果：\(progress.result)")
+                    Text("下一步：\(progress.next)")
+                }
+                .font(.caption2)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityElement(children: .combine)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {

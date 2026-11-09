@@ -10,8 +10,7 @@ import Foundation
 // unknown 绝不触发重放。本单是窄版试点：
 // - 覆盖范围＝成果台账的提交类动作集合（SubmissionClassifier，click 路径
 //   落记时触发），普通浏览动作（滚动/展开/导航）不纳入；
-// - shadow 先行：三值只落盘记录＋步流提示，不改变台账落记与软门行为，
-//   不阻断、不重发；转正式阻断门的门槛留待按 shadow 数据另行裁决；
+// - 三值回写成果台账；unknown/contradicted 阻断自动重放；
 // - 判定以确定性断言与服务端回读为主（页面正文区出现提交内容、跳转＋
 //   成功文案、编辑器自报状态类证据），toast 与接口成功只是弱证据、
 //   单独不构成 verified。本版不调模型核验：断言不 conclusive 即
@@ -75,20 +74,24 @@ final class VerificationLogStore {
     let fileURL: URL
     init(fileURL: URL) { self.fileURL = fileURL }
 
-    func append(_ record: VerificationRecord) {
+    @discardableResult func append(_ record: VerificationRecord) -> Bool {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(record) else { return }
+        guard let data = try? encoder.encode(record) else { return false }
         var line = data
         line.append(0x0A)
-        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
+        do {
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: fileURL)
             defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-        } else {
-            try? line.write(to: fileURL, options: [.atomic])
-        }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+            handle.synchronizeFile()
+            return true
+        } catch { return false }
     }
 
     func loadAll() -> [VerificationRecord] {
@@ -99,7 +102,7 @@ final class VerificationLogStore {
         }
     }
 
-    /// shadow 分歧统计口径：总数、三值分布、分歧数（contradicted 数，
+    /// 分歧统计口径：总数、三值分布、分歧数（contradicted 数，
     /// 与 diverged 计数互为校验）。误杀/精确率需人工复核标注，不在此
     /// 自动计算（见案卷的统计口径节）。
     struct Stats {
@@ -118,6 +121,42 @@ final class VerificationLogStore {
             if r.diverged { s.diverged += 1 }
         }
         return s
+    }
+}
+
+/// Durable event stream. It contains identifiers and evidence references only;
+/// request text and page content stay in the existing session stores.
+struct ExecutionAuditRecord: Codable {
+    var id: UUID
+    var recordedAt: Date
+    var taskID: UUID
+    var actionID: UUID
+    var event: String
+    var pageURL: String
+    var evidenceRef: String
+}
+
+final class ExecutionAuditStore {
+    static let shared = ExecutionAuditStore(fileURL: VerificationLogStore.defaultFileURL
+        .deletingLastPathComponent().appendingPathComponent("execution-audit.jsonl"))
+    let fileURL: URL
+    init(fileURL: URL) { self.fileURL = fileURL }
+
+    @discardableResult func append(_ record: ExecutionAuditRecord) -> Bool {
+        guard var line = try? JSONEncoder().encode(record) else { return false }
+        line.append(0x0A)
+        do {
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: fileURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+            handle.synchronizeFile()
+            return true
+        } catch { return false }
     }
 }
 

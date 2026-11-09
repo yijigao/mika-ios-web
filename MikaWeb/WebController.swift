@@ -2056,8 +2056,11 @@ enum TCProbeLogStore {
             return "\(actual == expected ? "✓" : "✗") \(name)：期望 \(String(describing: expected))，实际 \(String(describing: actual))"
         }
     }
-    /// 当前页求值（BrowserDockView 滚动比例读取／恢复用）
-    func evaluate(_ script: String) async throws -> Any? { try await evaluate(script, on: activeTab) }
+    /// 手动自检专用；模型执行会话期间不暴露原始脚本求值入口。
+    func evaluateForManualSelfTest(_ script: String) async throws -> Any? {
+        guard executionSessionID == nil else { throw MikaError("任务执行期间禁止原始 JS 自检通道") }
+        return try await evaluate(script, on: activeTab)
+    }
     private func captureType4IgnoredEvaluationError(_ error: Error, script: String, on tab: BrowserTab) {
         guard tab.type4IgnoredEvaluationErrors != nil else { return }
         let native = error as NSError
@@ -2113,8 +2116,12 @@ enum TCProbeLogStore {
         }
         throw MikaError("目标元素已失效")
     }
-    func execute(_ action: AgentAction, expected: PageElement? = nil, approved: Bool = false) async throws {
+    func execute(_ action: AgentAction, expected: PageElement? = nil, approved: Bool = false,
+                 expectedPageURL: String? = nil) async throws {
         let tab = executionTab
+        if let expectedPageURL, tab.webView.url?.absoluteString != expectedPageURL {
+            throw MikaError("派发前页面目标已变化")
+        }
         switch action.action {
         case "navigate": try tab.load(action.url)
         case "set_site_mode":
