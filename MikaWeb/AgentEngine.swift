@@ -7702,8 +7702,8 @@ extension AgentEngine {
         context.engine.currentActionID = UUID()
         return try await context.engine.runTargeted(action, modelPage: page, token: context.engine.generation)
     }
-    private static func gateRequest(_ context: GateBatchWKContext) async throws {
-        let result = try await gateRun(context, label: "发布测试稿")
+    private static func gateRequest(_ context: GateBatchWKContext, label: String = "发布测试稿") async throws {
+        let result = try await gateRun(context, label: label)
         guard case .waiting = result, context.engine.pending != nil,
               context.engine.pendingExecutionAuthorization != nil else {
             throw MikaError("Submission did not reach production approval gate")
@@ -7734,7 +7734,7 @@ extension AgentEngine {
 
     func verifyGateBatch1WK() async -> [String: Any] {
         try? FileManager.default.createDirectory(at: Self.gateBatchDirectory, withIntermediateDirectories: true)
-        let ids = ["normal_execution", "denial", "approval_expiry", "target_drift",
+        let ids = ["normal_execution", "denial", "approval_expiry", "target_drift", "post_validation_change",
                    "duplicate_request", "post_dispatch_disconnect", "log_failure"]
         var cases: [[String: Any]] = []
         for id in ids {
@@ -7807,7 +7807,9 @@ extension AgentEngine {
                     try await Self.gateWaitWorker(c.engine)
                     let driftState = try await Self.gateState(c)
                     let targetRejected: Bool = {
-                        if case .failed(let reason) = c.engine.status { return reason.contains("目标已变化") }
+                        if case .failed = c.engine.status {
+                            return Self.gateAudit(c).contains { $0["event"] as? String == "authorization-invalid" }
+                        }
                         return false
                     }()
                     checks.append(Self.gateCheck("live target re-resolution blocks changed DOM before dispatch", targetRejected && c.engine.executionReceipts.isEmpty && driftState["submissions"] as? Int == 0))
@@ -7822,6 +7824,34 @@ extension AgentEngine {
                     let revisionState = try await Self.gateState(revision)
                     checks.append(Self.gateCheck("actual navigation revision change invalidates approval", revision.web.executionRevision != oldRevision && revision.engine.executionReceipts.isEmpty && revisionState["submissions"] as? Int == 0 && Self.gateAudit(revision).contains { $0["event"] as? String == "authorization-invalid" }))
                     details["revisionDrift"] = try await Self.gateEvidence(revision)
+                case "post_validation_change":
+                    // 检查后变更反例：授权校验先通过；目的地在派发流自身的
+                    // scrollIntoView 步被换——那一步在 probeClickContext 全量校验
+                    // 之后、最终点击守卫之前，故拦下它的只能是最终一致性校验。
+                    // 审计出现 authorization-invalid 说明拦点在前置校验（本用例设计
+                    // 失败）；出现 dispatch-sent 说明未拦住。
+                    try await Self.gateRequest(c, label: "提交链接稿")
+                    let boundAuthorization = c.engine.pendingExecutionAuthorization!
+                    _ = try await Self.gateEvaluate(c, "window.__gate.armHrefSwap()")
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    let swapState = try await Self.gateState(c)
+                    let swapEvents = Self.gateAudit(c).compactMap { $0["event"] as? String }
+                    checks.append(Self.gateCheck("destination swapped after authorization is blocked at final dispatch, never sent",
+                        swapState["swapped"] as? Bool == true &&
+                        swapState["linkHref"] as? String == "#dest-swapped" &&
+                        swapState["linkClicks"] as? Int == 0 &&
+                        swapEvents.contains("authorization-approved") &&
+                        !swapEvents.contains("authorization-invalid") &&
+                        swapEvents.contains("dispatch-prepared") &&
+                        swapEvents.contains("dispatch-unknown") &&
+                        !swapEvents.contains("dispatch-sent")))
+                    checks.append(Self.gateCheck("blocked link dispatch stays unresolved and out of the success ledger",
+                        c.engine.outcomeLedger.count == 1 &&
+                        c.engine.outcomeLedger.first?.dispatchState == .unknown &&
+                        c.engine.outcomeLedger.first?.verificationVerdict != .verified &&
+                        c.engine.executionReceipts.contains { $0.critical && $0.dispatchState == .unknown }))
+                    details["authorizationBeforeSwap"] = Self.gateJSON(boundAuthorization)
                 case "duplicate_request":
                     for mode in ["silent", "rejected"] {
                         let d = try await Self.gateContext("duplicate-\(mode)")

@@ -67,7 +67,7 @@ class GateResultValidation(unittest.TestCase):
         first["cases"].pop(0)
         result = combine(first, restart, SHA)
         self.assertFalse(result["passed"])
-        self.assertEqual(len(result["cases"]), 8)
+        self.assertEqual(len(result["cases"]), 9)
         self.assertEqual(result["cases"][0]["status"], "fail")
 
 if __name__ == "__main__":

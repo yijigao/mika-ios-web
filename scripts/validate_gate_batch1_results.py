@@ -7,7 +7,7 @@ from pathlib import Path
 
 CASE_IDS = (
     "normal_execution", "denial", "approval_expiry", "target_drift",
-    "duplicate_request", "post_dispatch_disconnect", "crash_recovery", "log_failure",
+    "duplicate_request", "post_dispatch_disconnect", "crash_recovery", "log_failure", "post_validation_change",
 )
 
 def missing_case(name, reason):
@@ -27,8 +27,8 @@ def combine(first, restart, sha):
         if result.get("passed") is not True:
             errors.append(f"{name}: suite did not pass")
     rows = first.get("cases", []) + restart.get("cases", [])
-    if not isinstance(rows, list) or len(rows) != 8 or {r.get("id") for r in rows} != set(CASE_IDS):
-        errors.append("require exactly eight unique named cases across both processes")
+    if not isinstance(rows, list) or len(rows) != 9 or {r.get("id") for r in rows} != set(CASE_IDS):
+        errors.append("require exactly nine unique named cases across both processes")
     for row in rows:
         name = row.get("id", "missing")
         if row.get("passed") is not True or row.get("status") != "pass":

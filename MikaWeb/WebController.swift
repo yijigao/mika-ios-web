@@ -2189,6 +2189,7 @@ enum TCProbeLogStore {
         const expected=\(json),e=document.querySelector('[data-mika-idx="\(action.index)"]');
         if(!e||!e.isConnected)throw new Error('目标元素已失效');
         if(e.tagName.toLowerCase()!==expected.tag||!!e.isContentEditable!==!!expected.editable)throw new Error('目标元素已变化');
+        if((e.href||'')!==expected.href)throw new Error('目标元素已变化');
         const labels=[...(e.labels||[])].map(x=>(x.innerText||'').trim()).join(' ');
         const names=[(e.innerText||'').trim(),(e.getAttribute('aria-label')||'').trim(),(e.title||'').trim(),(e.getAttribute('alt')||'').trim(),labels,(e.placeholder||'').trim(),String(e.value||'').trim()];
         if(expected.text&&expected.nameSource!=='none'&&expected.nameSource!=='bg'&&expected.nameSource!=='icon'&&!names.some(x=>x.slice(0,300)===expected.text))throw new Error('目标元素已变化');
