@@ -16,6 +16,9 @@ import SwiftUI
     let engine: AgentEngine
     let conversation: AgentConversationStore
     let diagnostics: DiagnosticStore
+    #if DEBUG && targetEnvironment(simulator)
+    var gateBatchSelfTestStarted = false
+    #endif
     init() {
         let web = WebController()
         let settings = SettingsStore()
@@ -44,7 +47,22 @@ struct MikaWebApp: App {
             ContentView(web: graph.web, settings: graph.settings, engine: graph.engine, conversation: graph.conversation, diagnostics: graph.diagnostics)
                 .task {
                     #if DEBUG && targetEnvironment(simulator)
-                    if ProcessInfo.processInfo.arguments.contains("--mika-type4-restart-check") {
+                    if ProcessInfo.processInfo.arguments.contains("--mika-gate-batch1-selftest") ||
+                       ProcessInfo.processInfo.arguments.contains("--mika-gate-batch1-restart-check") {
+                        guard !graph.gateBatchSelfTestStarted else { return }
+                        graph.gateBatchSelfTestStarted = true
+                        let restart = ProcessInfo.processInfo.arguments.contains("--mika-gate-batch1-restart-check")
+                        let result: [String: Any]
+                        if restart { result = await graph.engine.verifyGateBatch1RestartWK() }
+                        else { result = await graph.engine.verifyGateBatch1WK() }
+                        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                            .appendingPathComponent("GateBatch1", isDirectory: true)
+                        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                        let name = restart ? "gate-batch1-restart.json" : "gate-batch1-preflight.json"
+                        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+                            try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
+                        }
+                    } else if ProcessInfo.processInfo.arguments.contains("--mika-type4-restart-check") {
                         let lines = await graph.engine.verifyZhihuProcessRestartCheckpoint()
                         let result: [String: Any] = [
                             "runtime":"WKWebView", "buildSHA":AgentTraceStore.buildSHA,

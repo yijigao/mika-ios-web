@@ -2,6 +2,9 @@ import SwiftUI
 import UIKit
 import BackgroundTasks
 import Combine
+#if DEBUG && targetEnvironment(simulator)
+import WebKit
+#endif
 enum StaleTargetPolicy {
     static func isStaleTarget(errorDomain: String, code: Int, message: String) -> Bool {
         guard errorDomain == "WKErrorDomain", code == 4 else { return false }
@@ -842,6 +845,11 @@ struct OpenStall {
     private var executionReceipts: [ExecutionReceipt] = []
     private var executionReceiptsDecodeFailed = false
     private var pendingExecutionAuthorization: PendingExecutionAuthorization?
+    #if DEBUG && targetEnvironment(simulator)
+    // Fault injection only in the simulator CLI suite; no model/web-accessible setter.
+    private var gateSelfTestAuditStore: ExecutionAuditStore?
+    private var gateSelfTestAfterDispatch: (() throws -> Void)?
+    #endif
     private var currentActionID: UUID?
     /// 成果主张的任务归属与终局状态。与旧 OutcomeRecord 分表保存，避免改动
     /// 既有台账格式；claim.id 与 OutcomeRecord.id 相同。
@@ -4376,7 +4384,11 @@ struct OpenStall {
         if let url = URLComponents(string: pageURL), let scheme = url.scheme {
             safeURL = "\(scheme)://\(url.host ?? "")"
         }
-        return ExecutionAuditStore.shared.append(ExecutionAuditRecord(
+        var store = ExecutionAuditStore.shared
+        #if DEBUG && targetEnvironment(simulator)
+        if let isolated = gateSelfTestAuditStore { store = isolated }
+        #endif
+        return store.append(ExecutionAuditRecord(
             id: UUID(), recordedAt: Date(), taskID: conversationTaskID ?? runSessionID,
             actionID: actionID, event: event, pageURL: safeURL,
             evidenceRef: evidenceRef))
@@ -4417,6 +4429,9 @@ struct OpenStall {
         do {
             callMarker?.entered = true
             let result = try await operation()
+            #if DEBUG && targetEnvironment(simulator)
+            try gateSelfTestAfterDispatch?()
+            #endif
             guard appendExecutionAudit(event: "dispatch-sent", actionID: identifier,
                                        pageURL: pageURL, evidenceRef: "call-returned"),
                   updateExecutionReceipt(id: receiptID, state: .sent, evidence: "call-returned") else {
@@ -7601,3 +7616,385 @@ extension AgentStatus {
     var isRunningForSteer: Bool { if case .running = self { return true }; return false }
     var isTerminalForFold: Bool { switch self { case .done, .failed, .ended: return true; default: return false } }
 }
+
+#if DEBUG && targetEnvironment(simulator)
+// Round 1 CLI-only WK regression driver. It uses production runTargeted,
+// confirm/runConfirmed, auditedDispatch, receipt stores and snapshot recovery.
+// It never calls a model and only loads the bundled CSP-isolated fixture.
+private struct GateBatchWKContext {
+    let engine: AgentEngine
+    let web: WebController
+    let host: WKSelfTestHost
+    let auditURL: URL
+}
+
+extension AgentEngine {
+    private static let gateBatchBody = "闸门首批受控稿件：这段完整正文必须由生产输入链写入，并由独立页面列表回读。"
+    private static var gateBatchEnvironment: String {
+        ProcessInfo.processInfo.environment["MIKA_GATE_ENVIRONMENT"] ?? "local iOS Simulator"
+    }
+    private static var gateBatchDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GateBatch1", isDirectory: true)
+    }
+    private static func gateJSON<T: Encodable>(_ value: T) -> Any {
+        guard let data = try? JSONEncoder().encode(value),
+              let object = try? JSONSerialization.jsonObject(with: data) else { return NSNull() }
+        return object
+    }
+    private static func gateAction(_ name: String, index: Int = -1, text: String = "") throws -> AgentAction {
+        let data = try JSONSerialization.data(withJSONObject: ["action": name, "index": index,
+            "text": text, "summary": "受控检查结束，结果见回执", "reason": "gate batch1 controlled WK driver"])
+        return try JSONDecoder().decode(AgentAction.self, from: data)
+    }
+    private static func gateContext(_ label: String, reset: Bool = true,
+                                    sessionID: UUID = UUID(), taskID: UUID = UUID()) async throws -> GateBatchWKContext {
+        if reset {
+            // Only reachable from this isolated simulator CLI workflow.
+            for key in [outcomeLedgerKey, executionReceiptsKey, taskClaimsKey] {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        let web = WebController()
+        web.showSessionTabs(sessionID)
+        web.beginExecution(sessionID: sessionID)
+        let host = WKSelfTestHost(tab: web.executionTab, suite: "gate-batch1-\(label)")
+        try await host.loadLocalAndWait("test-gate-batch1", readinessJavaScript: "!!window.__gate")
+        let engine = AgentEngine(web: web, settings: SettingsStore(), restoreSession: false)
+        engine.runSessionID = sessionID; engine.conversationTaskID = taskID
+        engine.goal = "闸门受控 WK 检查 \(label)"; engine.taskText = engine.goal
+        engine.stateCard = TaskStateCard(goal: engine.goal)
+        engine.status = .running; engine.active = true
+        engine.controlledActions = [try gateAction("done")]
+        engine.stepBudget = StepBudget(limit: 25)
+        let auditURL = gateBatchDirectory.appendingPathComponent("\(label)-audit.jsonl")
+        engine.gateSelfTestAuditStore = ExecutionAuditStore(fileURL: auditURL)
+        try FileManager.default.createDirectory(at: SessionStore.shared.snapshotURL(for: sessionID)
+            .deletingLastPathComponent(), withIntermediateDirectories: true)
+        return GateBatchWKContext(engine: engine, web: web, host: host, auditURL: auditURL)
+    }
+    private static func gateEvaluate(_ context: GateBatchWKContext, _ script: String) async throws -> Any? {
+        guard context.web.executionTab.webView.url?.isFileURL == true,
+              context.web.executionTab.webView.url?.lastPathComponent == "test-gate-batch1.html" else {
+            throw MikaError("Gate self-test refused non-fixture page")
+        }
+        return try await context.web.executionTab.webView.evaluateJavaScript(script)
+    }
+    private static func gateState(_ context: GateBatchWKContext) async throws -> [String: Any] {
+        guard let raw = try await gateEvaluate(context, "window.__gate.state()") as? String,
+              let result = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
+            throw MikaError("Gate fixture state missing")
+        }
+        return result
+    }
+    private static func gateAudit(_ context: GateBatchWKContext) -> [[String: Any]] {
+        guard let raw = try? String(contentsOf: context.auditURL, encoding: .utf8) else { return [] }
+        return raw.split(separator: "\n").compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+        }
+    }
+    private static func gateRun(_ context: GateBatchWKContext, label: String,
+                                text: String? = nil) async throws -> TargetedOutcome {
+        let page = try await context.web.state()
+        let element = page.elements.first { text != nil ? $0.tag == "textarea" : $0.text == label }
+        guard let element else { throw MikaError("Gate fixture target missing: \(label)") }
+        let action = try gateAction(text == nil ? "click" : "type", index: element.index, text: text ?? "")
+        context.engine.currentActionID = UUID()
+        return try await context.engine.runTargeted(action, modelPage: page, token: context.engine.generation)
+    }
+    private static func gateRequest(_ context: GateBatchWKContext) async throws {
+        let result = try await gateRun(context, label: "发布测试稿")
+        guard case .waiting = result, context.engine.pending != nil,
+              context.engine.pendingExecutionAuthorization != nil else {
+            throw MikaError("Submission did not reach production approval gate")
+        }
+    }
+    private static func gateWaitWorker(_ engine: AgentEngine) async throws {
+        let deadline = Date().addingTimeInterval(35)
+        while Date() < deadline {
+            if case .running = engine.status { try await Task.sleep(for: .milliseconds(100)) }
+            else { return }
+        }
+        engine.worker?.cancel()
+        throw MikaError("Gate production worker timed out")
+    }
+    private static func gateCheck(_ name: String, _ passed: Bool) -> [String: Any] {
+        ["assertion": name, "passed": passed]
+    }
+    private static func gateEvidence(_ context: GateBatchWKContext) async throws -> [String: Any] {
+        ["taskID": context.engine.conversationTaskID?.uuidString ?? "missing",
+         "sessionID": context.engine.runSessionID.uuidString,
+         "fixture": try await gateState(context), "host": context.host.observations,
+         "auditRef": context.auditURL.lastPathComponent, "audit": gateAudit(context),
+         "receipts": gateJSON(context.engine.executionReceipts),
+         "outcomes": gateJSON(context.engine.outcomeLedger),
+         "progress": gateJSON(context.engine.progressBySession[context.engine.runSessionID]),
+         "status": String(describing: context.engine.status)]
+    }
+
+    func verifyGateBatch1WK() async -> [String: Any] {
+        try? FileManager.default.createDirectory(at: Self.gateBatchDirectory, withIntermediateDirectories: true)
+        let ids = ["normal_execution", "denial", "approval_expiry", "target_drift",
+                   "duplicate_request", "post_dispatch_disconnect", "log_failure"]
+        var cases: [[String: Any]] = []
+        for id in ids {
+            var context: GateBatchWKContext?
+            var checks: [[String: Any]] = []
+            var details: [String: Any] = [:]
+            do {
+                let c = try await Self.gateContext(id); context = c
+                _ = try await Self.gateEvaluate(c, "window.__gate.reset()")
+                switch id {
+                case "normal_execution":
+                    var preparedBeforeReturn = true
+                    c.engine.gateSelfTestAfterDispatch = { [weak engine = c.engine] in
+                        guard let engine,
+                              let data = UserDefaults.standard.data(forKey: Self.executionReceiptsKey),
+                              let saved = try? JSONDecoder().decode([ExecutionReceipt].self, from: data),
+                              let last = saved.last else { preparedBeforeReturn = false; return }
+                        preparedBeforeReturn = preparedBeforeReturn && last.dispatchState == .unknown &&
+                            last.taskID == engine.conversationTaskID
+                    }
+                    _ = try await Self.gateRun(c, label: "正文", text: Self.gateBatchBody)
+                    for _ in 0..<2 {
+                        let result = try await Self.gateRun(c, label: "展开详情")
+                        checks.append(Self.gateCheck("low risk click executes without waitingConfirm", {
+                            if case .executed = result { return c.engine.pending == nil }; return false
+                        }()))
+                    }
+                    try await Self.gateRequest(c)
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    c.engine.gateSelfTestAfterDispatch = nil
+                    let state = try await Self.gateState(c)
+                    let critical = c.engine.executionReceipts.last(where: { $0.critical })
+                    let linked = Self.gateAudit(c).filter { $0["actionID"] as? String == critical?.actionID.uuidString }
+                    let requiredEvents: Set<String> = ["authorization-requested", "authorization-approved", "attempt-click", "dispatch-prepared", "dispatch-sent", "verification-verified"]
+                    checks.append(Self.gateCheck("authorization, attempt, dispatch and verification share task/action IDs and evidence refs",
+                        requiredEvents.isSubset(of: Set(linked.compactMap { $0["event"] as? String })) &&
+                        linked.allSatisfy { $0["taskID"] as? String == c.engine.conversationTaskID?.uuidString && ($0["evidenceRef"] as? String)?.isEmpty == false }))
+                    checks += [Self.gateCheck("two low-risk effects, exactly one submission", state["low"] as? Int == 2 && state["submissions"] as? Int == 1),
+                        Self.gateCheck("complete body independently read back", state["records"] as? String == Self.gateBatchBody),
+                        Self.gateCheck("receipt existed durably before dispatch returned", preparedBeforeReturn),
+                        Self.gateCheck("only verified result reaches success ledger", c.engine.outcomeLedger.count == 1 && c.engine.outcomeLedger.first?.verificationVerdict == .verified && c.engine.taskClaims.last?.status == .verified),
+                        Self.gateCheck("one approval for submission; none for low risk clicks", Self.gateAudit(c).filter { $0["event"] as? String == "authorization-requested" }.count == 1)]
+                case "denial":
+                    try await Self.gateRequest(c)
+                    c.engine.confirm(execute: false)
+                    try await Self.gateWaitWorker(c.engine)
+                    c.engine.confirm(execute: true) // Stale approval after refusal has no authority.
+                    let state = try await Self.gateState(c)
+                    checks += [Self.gateCheck("explicit refusal never calls fixture handler", state["submissions"] as? Int == 0 && c.engine.executionReceipts.isEmpty),
+                        Self.gateCheck("denial audited with bound action ID", Self.gateAudit(c).contains { $0["event"] as? String == "authorization-denied" && $0["actionID"] != nil })]
+                case "approval_expiry":
+                    try await Self.gateRequest(c)
+                    guard let issued = c.engine.pendingExecutionAuthorization?.issuedAt else { throw MikaError("No approval timestamp") }
+                    // Real wall time: never backdate issuedAt or shorten the production deadline.
+                    while Date().timeIntervalSince(issued) < 61 { try await Task.sleep(for: .milliseconds(200)) }
+                    c.engine.confirm(execute: true) // Late UI callback must not dispatch.
+                    try await Task.sleep(for: .milliseconds(300))
+                    let elapsed = Date().timeIntervalSince(issued)
+                    details["elapsedSeconds"] = elapsed
+                    let expiredState = try await Self.gateState(c)
+                    checks += [Self.gateCheck("real 60-second deadline elapsed", elapsed >= 60),
+                        Self.gateCheck("expired approval discarded; late approval cannot dispatch", c.engine.pending == nil && c.engine.pendingExecutionAuthorization == nil && c.engine.executionReceipts.isEmpty && expiredState["submissions"] as? Int == 0),
+                        Self.gateCheck("expiry audit exists", Self.gateAudit(c).contains { $0["event"] as? String == "authorization-expired" })]
+                case "target_drift":
+                    try await Self.gateRequest(c)
+                    let before = c.engine.pendingExecutionAuthorization!
+                    _ = try await Self.gateEvaluate(c, "document.querySelector('#submit').textContent='另一个目标'")
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    let driftState = try await Self.gateState(c)
+                    let targetRejected: Bool = {
+                        if case .failed(let reason) = c.engine.status { return reason.contains("目标已变化") }
+                        return false
+                    }()
+                    checks.append(Self.gateCheck("live target re-resolution blocks changed DOM before dispatch", targetRejected && c.engine.executionReceipts.isEmpty && driftState["submissions"] as? Int == 0))
+                    details["authorizationBeforeDrift"] = Self.gateJSON(before)
+                    let revision = try await Self.gateContext("revision-drift")
+                    _ = try await Self.gateEvaluate(revision, "window.__gate.reset()")
+                    try await Self.gateRequest(revision)
+                    let oldRevision = revision.web.executionRevision
+                    try await revision.host.loadLocalAndWait("test-gate-batch1", readinessJavaScript: "!!window.__gate")
+                    revision.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(revision.engine)
+                    let revisionState = try await Self.gateState(revision)
+                    checks.append(Self.gateCheck("actual navigation revision change invalidates approval", revision.web.executionRevision != oldRevision && revision.engine.executionReceipts.isEmpty && revisionState["submissions"] as? Int == 0 && Self.gateAudit(revision).contains { $0["event"] as? String == "authorization-invalid" }))
+                    details["revisionDrift"] = try await Self.gateEvidence(revision)
+                case "duplicate_request":
+                    for mode in ["silent", "rejected"] {
+                        let d = try await Self.gateContext("duplicate-\(mode)")
+                        _ = try await Self.gateEvaluate(d, "window.__gate.reset('\(mode)')")
+                        _ = try await Self.gateRun(d, label: "正文", text: Self.gateBatchBody)
+                        try await Self.gateRequest(d)
+                        d.engine.confirm(execute: true)
+                        try await Self.gateWaitWorker(d.engine)
+                        let expected: VerificationVerdict = mode == "silent" ? .unknown : .contradicted
+                        var allRepeatsBlocked = true
+                        for _ in 0..<3 {
+                            let duplicate = try await Self.gateRun(d, label: "发布测试稿")
+                            if case .duplicateBlocked = duplicate { } else { allRepeatsBlocked = false }
+                        }
+                        var dependencyCalled = false
+                        do { try await d.engine.auditedDispatch(name: "click", pageURL: d.web.executionTab.webView.url!.absoluteString) { dependencyCalled = true } }
+                        catch { /* gate must stop before the operation closure */ }
+                        let duplicateState = try await Self.gateState(d)
+                        checks.append(Self.gateCheck("\(expected.rawValue) blocks all three repeats and dependency",
+                            allRepeatsBlocked && d.engine.outcomeLedger.last?.verificationVerdict == expected &&
+                            !dependencyCalled && duplicateState["submissions"] as? Int == 1 &&
+                            Self.gateAudit(d).filter { $0["event"] as? String == "refusal-duplicate" }.count == 3))
+                        details[mode] = try await Self.gateEvidence(d)
+                    }
+                case "post_dispatch_disconnect":
+                    try await Self.gateDisconnect(c)
+                    checks += Self.gateUnknownChecks(c, state: try await Self.gateState(c))
+                case "log_failure":
+                    let blocker = Self.gateBatchDirectory.appendingPathComponent("regular-file-blocker")
+                    try Data("not a directory".utf8).write(to: blocker, options: .atomic)
+                    c.engine.gateSelfTestAuditStore = ExecutionAuditStore(fileURL: blocker.appendingPathComponent("audit.jsonl"))
+                    var writeRejected = false
+                    do { _ = try await Self.gateRun(c, label: "展开详情") } catch { writeRejected = true }
+                    let failureState = try await Self.gateState(c)
+                    checks.append(Self.gateCheck("real filesystem audit failure stops before effect; not_sent has pre-call evidence", writeRejected && failureState["low"] as? Int == 0 && c.engine.executionReceipts.last?.dispatchState == .notSent && c.engine.executionReceipts.last?.evidenceRef == "audit-failed-before-call"))
+                    for key in [Self.executionReceiptsKey, Self.outcomeLedgerKey] {
+                        let corrupt = Data("{invalid gate ledger".utf8)
+                        // Construct a fresh engine over corrupt on-disk data, without clearing it.
+                        for k in [Self.executionReceiptsKey, Self.outcomeLedgerKey] { UserDefaults.standard.removeObject(forKey: k) }
+                        UserDefaults.standard.set(corrupt, forKey: key)
+                        let d = try await Self.gateContext("decode-\(key)", reset: false)
+                        _ = try await Self.gateEvaluate(d, "window.__gate.reset()")
+                        try await Self.gateRequest(d)
+                        d.engine.confirm(execute: true)
+                        try await Self.gateWaitWorker(d.engine)
+                        let decodeState = try await Self.gateState(d)
+                        checks.append(Self.gateCheck("\(key) decode failure preserves corrupt bytes and prevents dispatch", UserDefaults.standard.data(forKey: key) == corrupt && decodeState["submissions"] as? Int == 0 && (key == Self.executionReceiptsKey ? d.engine.executionReceiptsDecodeFailed : d.engine.outcomeLedgerDecodeFailed)))
+                        details[key] = try await Self.gateEvidence(d)
+                    }
+                default: throw MikaError("Unknown gate scenario")
+                }
+                let finalState = try await Self.gateState(c)
+                checks.append(Self.gateCheck("controlled fixture has no script errors", (finalState["errors"] as? [String])?.isEmpty == true))
+                details["observed"] = try await Self.gateEvidence(c)
+                let passed = !checks.isEmpty && checks.allSatisfy { $0["passed"] as? Bool == true }
+                if !passed { await c.host.captureFailure("gate-batch1 \(id) assertion failed") }
+                cases.append(["id": id, "passed": passed, "status": passed ? "pass" : "fail", "checks": checks, "evidence": details])
+            } catch {
+                await context?.host.captureFailure("gate-batch1 \(id): \(error.localizedDescription)")
+                details["error"] = error.localizedDescription
+                cases.append(["id": id, "passed": false, "status": "fail", "checks": checks, "evidence": details])
+            }
+        }
+        var checkpoint: [String: Any] = [:]
+        do {
+            let c = try await Self.gateContext("crash-recovery")
+            _ = try await Self.gateEvaluate(c, "window.__gate.reset()")
+            try await Self.gateDisconnect(c)
+            let state = try await Self.gateState(c)
+            guard Self.gateUnknownChecks(c, state: state).allSatisfy({ $0["passed"] as? Bool == true }),
+                  let receipt = c.engine.executionReceipts.last(where: { $0.critical }),
+                  let outcome = c.engine.outcomeLedger.last else { throw MikaError("Crash checkpoint not unknown") }
+            // Exercise the production retention policy with an aged unresolved record.
+            c.engine.outcomeLedger[c.engine.outcomeLedger.count - 1].recordedAt = Date().addingTimeInterval(-172800)
+            let terminal = (0..<25).map { _ -> OutcomeRecord in
+                var copy = outcome; copy.id = UUID(); copy.taskID = UUID(); copy.actionID = UUID()
+                copy.dispatchState = .sent; copy.verificationVerdict = .verified; return copy
+            }
+            c.engine.outcomeLedger = terminal + c.engine.outcomeLedger
+            guard c.engine.saveOutcomeLedger(), c.engine.outcomeLedger.count == 21,
+                  c.engine.outcomeLedger.contains(where: { $0.id == outcome.id }) else {
+                throw MikaError("Unresolved outcome lost during retention")
+            }
+            if let i = c.engine.executionReceipts.firstIndex(where: { $0.id == receipt.id }) {
+                c.engine.executionReceipts[i].createdAt = Date().addingTimeInterval(-172800)
+                c.engine.executionReceipts[i].updatedAt = Date().addingTimeInterval(-172800)
+            }
+            let settledReceipts = (0..<25).map { _ -> ExecutionReceipt in
+                var copy = receipt; copy.id = UUID(); copy.actionID = UUID(); copy.taskID = UUID()
+                copy.critical = false; copy.dispatchState = .sent; copy.verificationVerdict = .verified
+                return copy
+            }
+            c.engine.executionReceipts += settledReceipts
+            guard c.engine.saveExecutionReceipts(), c.engine.executionReceipts.count == 21,
+                  c.engine.executionReceipts.contains(where: { $0.id == receipt.id && $0.blocksDependencies }) else {
+                throw MikaError("Unresolved receipt lost during retention")
+            }
+            c.engine.status = .paused("派发后未决；重开后先独立回读，不自动重放")
+            guard c.engine.persistSnapshot() else { throw MikaError("Crash snapshot could not persist") }
+            UserDefaults.standard.synchronize()
+            checkpoint = ["ready": true, "buildSHA": AgentTraceStore.buildSHA,
+                "sessionID": c.engine.runSessionID.uuidString, "taskID": c.engine.conversationTaskID!.uuidString,
+                "receiptID": receipt.id.uuidString, "actionID": receipt.actionID.uuidString,
+                "outcomeID": outcome.id.uuidString, "submissions": state["submissions"] ?? -1,
+                "processID": ProcessInfo.processInfo.processIdentifier,
+                "unresolvedRetainedAcross24hAnd20Limit": true,
+                "beforeTermination": try await Self.gateEvidence(c)]
+            try JSONSerialization.data(withJSONObject: checkpoint, options: [.prettyPrinted, .sortedKeys])
+                .write(to: Self.gateBatchDirectory.appendingPathComponent("checkpoint.json"), options: .atomic)
+        } catch { checkpoint = ["ready": false, "error": error.localizedDescription] }
+        return ["schemaVersion": 1, "round": 1, "runtime": "WKWebView",
+            "environment": Self.gateBatchEnvironment, "driver": "bundled fixture + production engine + simulator CLI",
+            "buildSHA": AgentTraceStore.buildSHA, "cases": cases, "crashCheckpoint": checkpoint,
+            "passed": cases.count == 7 && cases.allSatisfy { $0["passed"] as? Bool == true } && checkpoint["ready"] as? Bool == true]
+    }
+
+    private static func gateDisconnect(_ context: GateBatchWKContext) async throws {
+        _ = try await gateRun(context, label: "正文", text: gateBatchBody)
+        try await gateRequest(context)
+        // The fixture handler has run, but transport completion is lost. Inject
+        // the error at the real dispatch return boundary, not into the verdict.
+        context.engine.gateSelfTestAfterDispatch = { throw URLError(.networkConnectionLost) }
+        context.engine.confirm(execute: true)
+        try await gateWaitWorker(context.engine)
+        context.engine.gateSelfTestAfterDispatch = nil
+    }
+    private static func gateUnknownChecks(_ context: GateBatchWKContext, state: [String: Any]) -> [[String: Any]] {
+        [gateCheck("fixture handler ran exactly once before simulated disconnect", state["submissions"] as? Int == 1),
+         gateCheck("dispatch unknown and verification unknown are separate durable fields", context.engine.executionReceipts.last(where: { $0.critical })?.dispatchState == .unknown && context.engine.executionReceipts.last(where: { $0.critical })?.verificationVerdict == .unknown && context.engine.outcomeLedger.last?.dispatchState == .unknown && context.engine.outcomeLedger.last?.verificationVerdict == .unknown),
+         gateCheck("unknown never promoted to success claim", context.engine.taskClaims.last?.status == .unverified)]
+    }
+
+    func verifyGateBatch1RestartWK() async -> [String: Any] {
+        var evidence: [String: Any] = [:]
+        var checks: [[String: Any]] = []
+        do {
+            let data = try Data(contentsOf: Self.gateBatchDirectory.appendingPathComponent("checkpoint.json"))
+            guard let marker = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rawSession = marker["sessionID"] as? String, let session = UUID(uuidString: rawSession),
+                  let rawTask = marker["taskID"] as? String, let task = UUID(uuidString: rawTask),
+                  let rawReceipt = marker["receiptID"] as? String, let receiptID = UUID(uuidString: rawReceipt),
+                  let rawOutcome = marker["outcomeID"] as? String, let outcomeID = UUID(uuidString: rawOutcome) else {
+                throw MikaError("Gate restart checkpoint missing or invalid")
+            }
+            let c = try await Self.gateContext("restart", reset: false, sessionID: session, taskID: task)
+            c.engine.restoreSnapshot(for: session, allowLegacy: false)
+            // Fixture localStorage retains the actual handler count across App death.
+            let before = try await Self.gateState(c)
+            checks += [Self.gateCheck("a new process runs the exact same SHA", marker["buildSHA"] as? String == AgentTraceStore.buildSHA && marker["processID"] as? Int != Int(ProcessInfo.processInfo.processIdentifier)),
+                Self.gateCheck("unresolved durable receipt and aged outcome survive restart", c.engine.executionReceipts.contains { $0.id == receiptID && $0.dispatchState == .unknown && $0.blocksDependencies } && c.engine.outcomeLedger.contains { $0.id == outcomeID && $0.unresolved } && marker["unresolvedRetainedAcross24hAnd20Limit"] as? Bool == true),
+                Self.gateCheck("visible task progress restored with stage, result, next step", {
+                    guard let progress = c.engine.progressBySession[session] else { return false }
+                    return progress.taskID == task && !progress.stage.isEmpty && progress.result.contains("unknown") && progress.next.contains("禁止重放")
+                }())]
+            // Restore must not execute on its own. A fresh duplicate and a dependent
+            // action both enter the production gates again and must be stopped.
+            let repeatResult = try await Self.gateRun(c, label: "发布测试稿")
+            var dependencyCalled = false
+            do { try await c.engine.auditedDispatch(name: "click", pageURL: c.web.executionTab.webView.url!.absoluteString) { dependencyCalled = true } }
+            catch { }
+            let after = try await Self.gateState(c)
+            checks.append(Self.gateCheck("restore, repeated request and dependency never replay the handler", {
+                if case .duplicateBlocked = repeatResult { return !dependencyCalled }; return false
+            }() && before["submissions"] as? Int == marker["submissions"] as? Int && after["submissions"] as? Int == 1))
+            evidence = ["checkpoint": marker, "before": before, "after": after,
+                        "restored": try await Self.gateEvidence(c), "processID": ProcessInfo.processInfo.processIdentifier]
+            if !checks.allSatisfy({ $0["passed"] as? Bool == true }) { await c.host.captureFailure("gate-batch1 crash recovery assertion failed") }
+        } catch { evidence["error"] = error.localizedDescription }
+        let passed = checks.count == 4 && checks.allSatisfy { $0["passed"] as? Bool == true }
+        return ["schemaVersion": 1, "round": 1, "runtime": "WKWebView",
+            "environment": Self.gateBatchEnvironment, "buildSHA": AgentTraceStore.buildSHA,
+            "passed": passed, "cases": [["id": "crash_recovery", "passed": passed,
+                "status": passed ? "pass" : "fail", "checks": checks, "evidence": evidence]]]
+    }
+}
+#endif

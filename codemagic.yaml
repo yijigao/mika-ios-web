@@ -94,3 +94,32 @@ workflows:
     artifacts:
       - build-type4.log
       - build/type4-evidence/**
+
+  gate-batch1-wk-selftest:
+    name: Gate batch 1 · eight WK runtime cases
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      xcode: latest
+    scripts:
+      - name: Validate project and self-test assets
+        script: |
+          set -euo pipefail
+          python3 scripts/validate_project.py
+          python3 -m unittest discover -s scripts -p test_gate_batch1_results.py
+          bash -n scripts/run_gate_batch1_wk_selftest.sh
+      - name: Build gate self-test simulator app without signing
+        script: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild build -project MikaWeb.xcodeproj -scheme MikaWeb -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/GateBatch1 \
+            -resultBundlePath build/GateBatch1Build.xcresult \
+            MIKA_BUILD_SHA="$(git rev-parse HEAD)" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build/gate-batch1-build.log
+      - name: Run eight controlled WK cases and collect both App processes
+        script: SIMCTL_CHILD_MIKA_GATE_ENVIRONMENT='Codemagic iOS Simulator' bash scripts/run_gate_batch1_wk_selftest.sh
+    artifacts:
+      - build/gate-batch1-build.log
+      - build/GateBatch1Build.xcresult
+      - build/gate-batch1-evidence/**

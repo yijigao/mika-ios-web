@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'">
+<title>Mika gate batch 1 controlled fixture</title>
+<style>body{font:20px system-ui;margin:24px}textarea{display:block;width:90%;height:80px}button{display:block;margin:18px 0;padding:12px}</style>
+<h1>闸门受控页</h1><textarea id="body" aria-label="测试正文"></textarea>
+<button id="low" type="button">展开详情</button><button id="submit" type="button">发布测试稿</button>
+<p id="status"></p><ul id="records"></ul>
+<script>
+'use strict';
+window.__gateErrors=[];
+addEventListener('error',e=>window.__gateErrors.push(String(e.message)));
+let submissions=Number(localStorage.getItem('mika-gate-batch1-count')||0),low=0,mode='accepted';
+document.querySelector('#low').onclick=()=>{low++;document.querySelector('#status').textContent='详情已展开 '+low;};
+document.querySelector('#submit').onclick=()=>{
+  submissions++;localStorage.setItem('mika-gate-batch1-count',String(submissions));
+  if(mode==='rejected'){document.querySelector('#status').textContent='提交失败：内容被拒绝';return;}
+  if(mode==='silent')return;
+  const li=document.createElement('li');li.textContent=document.querySelector('#body').value;
+  document.querySelector('#records').append(li);document.querySelector('#status').textContent='发布成功';
+};
+window.__gate={
+ reset(nextMode='accepted'){submissions=0;low=0;mode=nextMode;localStorage.setItem('mika-gate-batch1-count','0');document.querySelector('#body').value='';document.querySelector('#status').textContent='';document.querySelector('#records').replaceChildren();},
+ state(){return JSON.stringify({submissions,low,mode,body:document.querySelector('#body').value,records:Array.from(document.querySelectorAll('#records li'),li=>li.textContent).join('\n'),errors:window.__gateErrors});}
+};
+</script></html>

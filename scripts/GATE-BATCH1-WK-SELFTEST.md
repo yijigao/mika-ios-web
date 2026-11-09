@@ -1,0 +1,22 @@
+# Gate batch 1 WK assets — round 1 continuation
+
+Run Codemagic workflow **`gate-batch1-wk-selftest`** on `feat/gate-batch1` at the desired commit. This workflow has no automatic triggering or publishing rule. It builds an unsigned Debug simulator app, checks the embedded `MikaBuildSHA` against checkout HEAD, creates an isolated simulator and runs two App processes. Existing workflows retain their definitions. The workflow passes its environment label through `SIMCTL_CHILD_MIKA_GATE_ENVIRONMENT`; direct local launches default to `local iOS Simulator`.
+
+The launch flags are `--mika-gate-batch1-selftest` and, after `simctl terminate`, `--mika-gate-batch1-restart-check`. Both entrypoints and the two fault injection hooks are restricted to Debug simulator builds. The driver supplies controlled actions to the production engine, invokes `runTargeted` and native `confirm`, and uses the real `runConfirmed`, dispatch, verification and persistence paths. It does not call a model. The bundled `test-gate-batch1.html` has a CSP denying network connections and form actions. Direct test JavaScript refuses any other URL.
+
+| Result case ID | Runtime assertion prepared by this asset |
+|---|---|
+| `normal_execution` | Production type, two low risk clicks without confirmation, one authorized submission; exact body readback; verified success claim; shared task/action audit IDs; durable receipt exists before call return. |
+| `denial` | Native refusal and a stale approval callback cause zero submission handlers and no dispatch receipt; denial audited. |
+| `approval_expiry` | Real elapsed time at least 60 seconds (not a backdated timestamp); production expiry discards pending approval; late native callback dispatches nothing. |
+| `target_drift` | DOM target replacement and a separate real navigation revision change each block before dispatch. |
+| `duplicate_request` | Controlled silent response produces unknown, explicit rejection produces contradicted; three consecutive repeat requests per verdict and dependent dispatches remain blocked. |
+| `post_dispatch_disconnect` | After the actual WK submission handler runs once, a test-only hook throws networkConnectionLost before dispatch completion; dispatch and verdict stay unknown; no success claim. This is a controlled transport fault injection. |
+| `crash_recovery` | First process saves unknown receipt, snapshot, progress and real fixture handler count. Production retention is exercised with a 48h-old unresolved item and 25 terminal items. A different App process loads those stores; progress remains visible, repeated/dependent actions stay blocked and persistent fixture count remains one. Termination is performed by simctl, without a graceful task-stop callback. |
+| `log_failure` | Real audit filesystem failure (a regular file used as parent directory) stops before effect and produces evidenced not_sent; fresh engines load corrupt receipt and outcome bytes, block dispatch and preserve those bytes. |
+
+Artifacts are under `build/gate-batch1-evidence/`: `gate-batch1-preflight.json` (seven cases and crash checkpoint), `gate-batch1-restart.json` (eighth case), merged **`gate-batch1-result.json`**, checkpoint, per-context append-only audit JSONL, verification JSONL, host failure Trace/Diagnostics, launch logs, simulator details and `build-sha.txt`. Build log and xcresult are separate artifacts.
+
+Every case has `id`, boolean `passed`, `status` (`pass` / `fail`), individual checks and an evidence dictionary. Evidence includes fixture counters/body, host readiness observations, structured receipt/verdict fields, task/action IDs and audit references. The merger rejects a wrong SHA, absent/failed assertions, missing cases/evidence, a shortened approval window or the same process masquerading as restart. On missing artifacts it emits eight explicit failed rows and fails the workflow. The fixture results establish controlled WK behavior; they do not replace real-site or real-device acceptance.
+
+Local verification of these assets: `python3 scripts/validate_project.py`, `python3 -m unittest discover -s scripts -p test_gate_batch1_results.py`, `bash -n scripts/run_gate_batch1_wk_selftest.sh`, and `git diff --check`. The Python unit tests use synthetic JSON to test the merger; they are not WK results. Build and runtime evidence remain pending until Codemagic executes the workflow.
