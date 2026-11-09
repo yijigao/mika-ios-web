@@ -7735,7 +7735,7 @@ extension AgentEngine {
     func verifyGateBatch1WK() async -> [String: Any] {
         try? FileManager.default.createDirectory(at: Self.gateBatchDirectory, withIntermediateDirectories: true)
         let ids = ["normal_execution", "denial", "approval_expiry", "target_drift", "post_validation_change",
-                   "duplicate_request", "post_dispatch_disconnect", "log_failure"]
+                   "duplicate_request", "post_dispatch_disconnect", "log_failure", "rescan_relocation_swap", "pointer_sequence_swap"]
         var cases: [[String: Any]] = []
         for id in ids {
             var context: GateBatchWKContext?
@@ -7852,6 +7852,44 @@ extension AgentEngine {
                         c.engine.outcomeLedger.first?.verificationVerdict != .verified &&
                         c.engine.executionReceipts.contains { $0.critical && $0.dispatchState == .unknown }))
                     details["authorizationBeforeSwap"] = Self.gateJSON(boundAuthorization)
+                case "rescan_relocation_swap":
+                    try await Self.gateRequest(c, label: "提交链接稿")
+                    details["authorizationBeforeSwap"] = Self.gateJSON(c.engine.pendingExecutionAuthorization!)
+                    _ = try await Self.gateEvaluate(c, "window.__gate.armRescanSwap()")
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    let swapState = try await Self.gateState(c)
+                    let swapEvents = Self.gateAudit(c).compactMap { $0["event"] as? String }
+                    checks.append(Self.gateCheck("rescan scenario entered: original disabled after approval, same-label decoy revealed",
+                        swapState["rescanApplied"] as? Bool == true))
+                    checks.append(Self.gateCheck("rescan re-location refuses same-label target with unbound href; nothing clicked",
+                        swapState["decoyClicks"] as? Int == 0 && swapState["linkClicks"] as? Int == 0 && swapState["submissions"] as? Int == 0 &&
+                        swapEvents.contains("dispatch-unknown") && !swapEvents.contains("dispatch-sent") &&
+                        !swapEvents.contains("authorization-invalid")))
+                    checks.append(Self.gateCheck("blocked rescan dispatch stays unresolved and out of the success ledger",
+                        c.engine.outcomeLedger.count == 1 &&
+                        c.engine.outcomeLedger.first?.dispatchState == .unknown &&
+                        c.engine.outcomeLedger.first?.verificationVerdict != .verified &&
+                        c.engine.executionReceipts.contains { $0.critical && $0.dispatchState == .unknown }))
+                case "pointer_sequence_swap":
+                    try await Self.gateRequest(c, label: "提交弹窗稿")
+                    details["authorizationBeforeSwap"] = Self.gateJSON(c.engine.pendingExecutionAuthorization!)
+                    _ = try await Self.gateEvaluate(c, "window.__gate.armDlgSwap()")
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    let swapState = try await Self.gateState(c)
+                    let swapEvents = Self.gateAudit(c).compactMap { $0["event"] as? String }
+                    checks.append(Self.gateCheck("dialog target destination swapped mid-sequence",
+                        swapState["dlgSwapped"] as? Bool == true && swapState["dlgHref"] as? String == "#dlg-swapped"))
+                    checks.append(Self.gateCheck("pointer sequence aborted before click effect; nothing clicked or submitted",
+                        swapState["dlgClicks"] as? Int == 0 && swapState["submissions"] as? Int == 0 &&
+                        swapEvents.contains("dispatch-unknown") && !swapEvents.contains("dispatch-sent") &&
+                        !swapEvents.contains("authorization-invalid")))
+                    checks.append(Self.gateCheck("blocked pointer dispatch stays unresolved and out of the success ledger",
+                        c.engine.outcomeLedger.count == 1 &&
+                        c.engine.outcomeLedger.first?.dispatchState == .unknown &&
+                        c.engine.outcomeLedger.first?.verificationVerdict != .verified &&
+                        c.engine.executionReceipts.contains { $0.critical && $0.dispatchState == .unknown }))
                 case "duplicate_request":
                     for mode in ["silent", "rejected"] {
                         let d = try await Self.gateContext("duplicate-\(mode)")
@@ -7904,7 +7942,16 @@ extension AgentEngine {
                 default: throw MikaError("Unknown gate scenario")
                 }
                 let finalState = try await Self.gateState(c)
-                checks.append(Self.gateCheck("controlled fixture has no script errors", (finalState["errors"] as? [String])?.isEmpty == true))
+                let rawErrors = finalState["errors"] as? [String] ?? []
+                let guardRejection = Self.gateAudit(c).contains { $0["event"] as? String == "dispatch-unknown" } &&
+                    String(describing: c.engine.status).contains("JavaScript exception occurred")
+                var unaccountedErrors = rawErrors
+                if guardRejection, let index = unaccountedErrors.firstIndex(of: "Script error.") {
+                    unaccountedErrors.remove(at: index)
+                }
+                details["fixtureErrorAccounting"] = ["raw": rawErrors, "guardRejectionAttributable": guardRejection,
+                                                     "unaccounted": unaccountedErrors]
+                checks.append(Self.gateCheck("controlled fixture has no script errors", finalState["errors"] is [String] && unaccountedErrors.isEmpty))
                 details["observed"] = try await Self.gateEvidence(c)
                 let passed = !checks.isEmpty && checks.allSatisfy { $0["passed"] as? Bool == true }
                 if !passed { await c.host.captureFailure("gate-batch1 \(id) assertion failed") }
@@ -7965,7 +8012,7 @@ extension AgentEngine {
         return ["schemaVersion": 1, "round": 1, "runtime": "WKWebView",
             "environment": Self.gateBatchEnvironment, "driver": "bundled fixture + production engine + simulator CLI",
             "buildSHA": AgentTraceStore.buildSHA, "cases": cases, "crashCheckpoint": checkpoint,
-            "passed": cases.count == 7 && cases.allSatisfy { $0["passed"] as? Bool == true } && checkpoint["ready"] as? Bool == true]
+            "passed": cases.count == 10 && cases.allSatisfy { $0["passed"] as? Bool == true } && checkpoint["ready"] as? Bool == true]
     }
 
     private static func gateDisconnect(_ context: GateBatchWKContext) async throws {

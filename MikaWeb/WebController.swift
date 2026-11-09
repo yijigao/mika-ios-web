@@ -4366,7 +4366,7 @@ enum TCProbeLogStore {
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
         let script: String
         if rescan {
-            let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": expected.text.isEmpty ? expected.ariaLabel : expected.text, "tag": expected.tag])
+            let data = try JSONSerialization.data(withJSONObject: ["index": action.index, "text": expected.text.isEmpty ? expected.ariaLabel : expected.text, "tag": expected.tag, "href": expected.href])
             let json = String(decoding: data, as: UTF8.self)
             script = """
             (()=>{const a=\(json);
@@ -4375,7 +4375,7 @@ enum TCProbeLogStore {
             const lab=x=>(x.innerText||x.value||x.getAttribute('aria-label')||'').trim();
             const dis=x=>x.disabled===true||x.getAttribute('aria-disabled')==='true';
             const safe=x=>{const hint=[x.type,x.name,x.id,x.placeholder,x.getAttribute('aria-label'),x.getAttribute('alt'),x.autocomplete,...[...(x.labels||[])].map(y=>y.innerText||'')].join(' ');if(/password|验证码|校验码|动态码|一次性|captcha|verification|verify|one.time|otp|security.code|(^|[ _-])(code|pin)($|[ _-])/i.test(hint))throw new Error('敏感字段必须手动输入');const l=[lab(x),x.getAttribute('aria-label')||''].join(' ').toLowerCase();if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');};
-            const tryClick=x=>{safe(x);x.scrollIntoView({block:'center'});x.focus();x.click();return 'clicked';};
+            const tryClick=x=>{safe(x);if((x.href||'')!==a.href)throw new Error('目标元素已变化');x.scrollIntoView({block:'center'});x.focus();x.click();return 'clicked';};
             let node=document.querySelector('[data-mika-idx="'+a.index+'"]');
             if(node&&node.isConnected&&vis(node)&&!dis(node)&&node.tagName.toLowerCase()===a.tag&&(!a.text||norm(lab(node))===norm(a.text)))return tryClick(node);
             const want=norm(a.text);
@@ -4403,6 +4403,7 @@ enum TCProbeLogStore {
               if(anchorOK){
                 const l=[want,anchorOK.getAttribute('aria-label')||'',anchorOK.title||''].join(' ').toLowerCase();
                 if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');
+                if((anchorOK.href||'')!==a.href)throw new Error('目标元素已变化');
                 anchorOK.scrollIntoView({block:'center'});anchorOK.focus();anchorOK.click();return 'clicked';
               }
             }
@@ -4537,11 +4538,14 @@ enum TCProbeLogStore {
     /// 每步都重定位节点并重跑安全词检查（与 click 同口径，未经确认的敏感
     /// 操作照样 throw）；节点中途消失返回 'gone'（多半弹窗已被前序事件
     /// 关掉，成败由随后的存续探针裁决）。坐标取当下包围盒中心（真实坐标）。
-    private func runPointerStep(step: String, action: AgentAction, approved: Bool, tab: BrowserTab) async throws -> String {
+    private func runPointerStep(step: String, action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws -> String {
+        let json = String(decoding: try JSONEncoder().encode(expected), as: UTF8.self)
         let keywords = String(decoding: try JSONSerialization.data(withJSONObject: SafetyPolicy.keywords), as: UTF8.self)
         let script = """
-        (()=>{const e=document.querySelector('[data-mika-idx="\(action.index)"]');
+        (()=>{const expected=\(json),e=document.querySelector('[data-mika-idx="\(action.index)"]');
         if(!e||!e.isConnected)return 'gone';
+        if(e.tagName.toLowerCase()!==expected.tag||!!e.isContentEditable!==!!expected.editable)throw new Error('目标元素已变化');
+        if((e.href||'')!==expected.href)throw new Error('目标元素已变化');
         const l=[(e.innerText||e.value||''),(e.getAttribute('aria-label')||'')].join(' ').toLowerCase();
         if(!\(approved ? "true" : "false")&&\(keywords).some(k=>l.includes(k)))throw new Error('敏感操作未经确认');
         const step='\(step)';
@@ -4568,10 +4572,10 @@ enum TCProbeLogStore {
     /// 完整点按序列：scrollIntoView 后按 spec 顺序派发，步间小间隔
     /// （scroll 后 150ms 落位、其余步间 70ms——匀速即时派发整串时，部分
     /// 网页的状态机会跟不上或直接忽略，分步带间隔更接近真实点按节奏）。
-    private func performPointerSequence(action: AgentAction, approved: Bool, tab: BrowserTab) async throws {
+    private func performPointerSequence(action: AgentAction, expected: PageElement, approved: Bool, tab: BrowserTab) async throws {
         let steps = ["scroll", "pointerover", "pointerdown", "mousedown", "focus", "pointerup", "mouseup", "click"]
         for (offset, step) in steps.enumerated() {
-            let status = try await runPointerStep(step: step, action: action, approved: approved, tab: tab)
+            let status = try await runPointerStep(step: step, action: action, expected: expected, approved: approved, tab: tab)
             if status == "gone" { return }
             try await Task.sleep(for: .milliseconds(offset == 0 ? 150 : 70))
         }
@@ -4591,7 +4595,7 @@ enum TCProbeLogStore {
                     note: "共享关闭预算或 20 秒截止已到", kind: .action))
                 break
             }
-            try await performPointerSequence(action: action, approved: approved, tab: tab)
+            try await performPointerSequence(action: action, expected: expected, approved: approved, tab: tab)
             lastModalAttempts.append(ModalAttemptRecord(method: "pointer-sequence-\(round)", status: .executed,
                                                         note: "完整 pointer/mouse 序列已派发", kind: .action))
             try await Task.sleep(for: .milliseconds(600))

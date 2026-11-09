@@ -8,15 +8,22 @@
 <p id="status"></p><ul id="records"></ul>
 <div style="height:1800px"></div>
 <a id="destlink" href="#dest-original">提交链接稿</a><p id="linkstatus"></p>
+<a id="declink" href="#dest-decoy" style="display:none">提交链接稿</a><p id="decstatus"></p>
+<article class="gate-modal" style="position:fixed;right:16px;bottom:16px;background:#fff;border:1px solid #999;padding:12px;z-index:60"><a id="dlglink" href="#dlg-original">提交弹窗稿</a></article>
 <script>
 'use strict';
 window.__gateErrors=[];
 addEventListener('error',e=>window.__gateErrors.push(String(e.message)));
 let submissions=Number(localStorage.getItem('mika-gate-batch1-count')||0),low=0,mode='accepted';
 let linkClicks=0,linkLanded='',swapped=false,swapArmed=false;
+let decoyClicks=0,decoyLanded='',rescanArmed=false,rescanApplied=false,dlgClicks=0,dlgLanded='',dlgArmed=false,dlgSwapped=false;
+const declink=document.querySelector('#declink'),dlglink=document.querySelector('#dlglink');
 const dl=document.querySelector('#destlink');
 dl.addEventListener('click',e=>{e.preventDefault();linkClicks++;linkLanded=dl.getAttribute('href');});
-window.addEventListener('scroll',()=>{if(swapArmed&&!swapped){dl.setAttribute('href','#dest-swapped');swapped=true;document.querySelector('#linkstatus').textContent='目的地已变更';}},true);
+declink.addEventListener('click',e=>{e.preventDefault();decoyClicks++;decoyLanded=declink.getAttribute('href');});
+dlglink.addEventListener('click',e=>{e.preventDefault();dlgClicks++;dlgLanded=dlglink.getAttribute('href');});
+dlglink.addEventListener('pointerover',()=>{if(dlgArmed&&!dlgSwapped){dlglink.setAttribute('href','#dlg-swapped');dlgSwapped=true;}});
+window.addEventListener('scroll',()=>{if(swapArmed&&!swapped){dl.setAttribute('href','#dest-swapped');swapped=true;document.querySelector('#linkstatus').textContent='目的地已变更';}if(rescanArmed&&!rescanApplied){dl.setAttribute('aria-disabled','true');declink.style.display='block';rescanApplied=true;}},true);
 document.querySelector('#low').onclick=()=>{low++;document.querySelector('#status').textContent='详情已展开 '+low;};
 document.querySelector('#submit').onclick=()=>{
   submissions++;localStorage.setItem('mika-gate-batch1-count',String(submissions));
@@ -26,8 +33,10 @@ document.querySelector('#submit').onclick=()=>{
   document.querySelector('#records').append(li);document.querySelector('#status').textContent='发布成功';
 };
 window.__gate={
+ armRescanSwap(){rescanArmed=true;},
+ armDlgSwap(){dlgArmed=true;},
  armHrefSwap(){swapArmed=true;},
- reset(nextMode='accepted'){submissions=0;low=0;mode=nextMode;localStorage.setItem('mika-gate-batch1-count','0');document.querySelector('#body').value='';document.querySelector('#status').textContent='';document.querySelector('#records').replaceChildren();dl.setAttribute('href','#dest-original');linkClicks=0;linkLanded='';swapped=false;swapArmed=false;document.querySelector('#linkstatus').textContent='';},
- state(){return JSON.stringify({submissions,low,mode,linkClicks,linkLanded,swapped,linkHref:dl.getAttribute('href'),body:document.querySelector('#body').value,records:Array.from(document.querySelectorAll('#records li'),li=>li.textContent).join('\n'),errors:window.__gateErrors});}
+ reset(nextMode='accepted'){submissions=0;low=0;mode=nextMode;localStorage.setItem('mika-gate-batch1-count','0');document.querySelector('#body').value='';document.querySelector('#status').textContent='';document.querySelector('#records').replaceChildren();dl.setAttribute('href','#dest-original');linkClicks=0;linkLanded='';swapped=false;swapArmed=false;document.querySelector('#linkstatus').textContent='';dl.removeAttribute('aria-disabled');declink.style.display='none';decoyClicks=0;decoyLanded='';rescanArmed=false;rescanApplied=false;dlglink.setAttribute('href','#dlg-original');dlgClicks=0;dlgLanded='';dlgArmed=false;dlgSwapped=false;},
+ state(){return JSON.stringify({submissions,low,mode,linkClicks,linkLanded,swapped,linkHref:dl.getAttribute('href'),body:document.querySelector('#body').value,records:Array.from(document.querySelectorAll('#records li'),li=>li.textContent).join('\n'),decoyClicks,decoyLanded,rescanApplied,dlgClicks,dlgLanded,dlgSwapped,dlgHref:dlglink.getAttribute('href'),errors:window.__gateErrors});}
 };
 </script></html>
