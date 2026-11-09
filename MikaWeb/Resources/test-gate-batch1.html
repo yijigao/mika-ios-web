@@ -15,6 +15,7 @@
 window.__gateErrors=[];
 addEventListener('error',e=>window.__gateErrors.push(String(e.message)));
 let submissions=Number(localStorage.getItem('mika-gate-batch1-count')||0),low=0,mode='accepted';
+for(const text of JSON.parse(localStorage.getItem('mika-gate-batch1-records')||'[]')){const li=document.createElement('li');li.textContent=text;document.querySelector('#records').append(li);}
 let linkClicks=0,linkLanded='',swapped=false,swapArmed=false;
 let decoyClicks=0,decoyLanded='',rescanArmed=false,rescanApplied=false,dlgClicks=0,dlgLanded='',dlgArmed=false,dlgSwapped=false;
 const declink=document.querySelector('#declink'),dlglink=document.querySelector('#dlglink');
@@ -30,13 +31,13 @@ document.querySelector('#submit').onclick=()=>{
   if(mode==='rejected'){document.querySelector('#status').textContent='提交失败：内容被拒绝';return;}
   if(mode==='silent')return;
   const li=document.createElement('li');li.textContent=document.querySelector('#body').value;
-  document.querySelector('#records').append(li);document.querySelector('#status').textContent='发布成功';
+  document.querySelector('#records').append(li);localStorage.setItem('mika-gate-batch1-records',JSON.stringify(Array.from(document.querySelectorAll('#records li'),li=>li.textContent)));document.querySelector('#status').textContent='发布成功';
 };
 window.__gate={
  armRescanSwap(){rescanArmed=true;},
  armDlgSwap(){dlgArmed=true;},
  armHrefSwap(){swapArmed=true;},
- reset(nextMode='accepted'){submissions=0;low=0;mode=nextMode;localStorage.setItem('mika-gate-batch1-count','0');document.querySelector('#body').value='';document.querySelector('#status').textContent='';document.querySelector('#records').replaceChildren();dl.setAttribute('href','#dest-original');linkClicks=0;linkLanded='';swapped=false;swapArmed=false;document.querySelector('#linkstatus').textContent='';dl.removeAttribute('aria-disabled');declink.style.display='none';decoyClicks=0;decoyLanded='';rescanArmed=false;rescanApplied=false;dlglink.setAttribute('href','#dlg-original');dlgClicks=0;dlgLanded='';dlgArmed=false;dlgSwapped=false;},
+ reset(nextMode='accepted'){localStorage.removeItem('mika-gate-batch1-records');submissions=0;low=0;mode=nextMode;localStorage.setItem('mika-gate-batch1-count','0');document.querySelector('#body').value='';document.querySelector('#status').textContent='';document.querySelector('#records').replaceChildren();dl.setAttribute('href','#dest-original');linkClicks=0;linkLanded='';swapped=false;swapArmed=false;document.querySelector('#linkstatus').textContent='';dl.removeAttribute('aria-disabled');declink.style.display='none';decoyClicks=0;decoyLanded='';rescanArmed=false;rescanApplied=false;dlglink.setAttribute('href','#dlg-original');dlgClicks=0;dlgLanded='';dlgArmed=false;dlgSwapped=false;},
  state(){return JSON.stringify({submissions,low,mode,linkClicks,linkLanded,swapped,linkHref:dl.getAttribute('href'),body:document.querySelector('#body').value,records:Array.from(document.querySelectorAll('#records li'),li=>li.textContent).join('\n'),decoyClicks,decoyLanded,rescanApplied,dlgClicks,dlgLanded,dlgSwapped,dlgHref:dlglink.getAttribute('href'),errors:window.__gateErrors});}
 };
 </script></html>

@@ -2233,6 +2233,7 @@ struct OpenStall {
                                 }
                             }
                             try await checkpoint(token)
+                            await reconcileBlockingOutcomes(trigger: "post-navigation")
                             record(action)
                             loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.url, outcome: "ok")
                             try await Task.sleep(for: .milliseconds(500))
@@ -2357,6 +2358,9 @@ struct OpenStall {
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: action.action, outcome: "invalid-action")
                             }
                             if executedOK {
+                                if ["navigate", "open_new_tab"].contains(action.action) {
+                                    await reconcileBlockingOutcomes(trigger: "post-navigation")
+                                }
                                 let target = action.action == "navigate" ? action.url : (action.action == "scroll" ? action.direction : (action.action == "set_site_mode" ? action.mode : "\(Int(action.seconds))"))
                                 loopFingerprint = LoopDetector.fingerprint(action: action.action, target: target, outcome: "ok")
                                 // 卡点逐项验收记账（F2）：站点模式切换真实
@@ -4404,7 +4408,7 @@ struct OpenStall {
         guard !executionReceiptsDecodeFailed else { throw MikaError("派发回执无法解码，已停止动作") }
         let readOnlyOrNavigation: Set<String> = ["navigate", "scroll", "wait", "open_new_tab",
             "rung-navigation", "dialog-leave-navigation", "dialog-return-navigation",
-            "zhihu-readback-navigation", "recovery-reload", "dialog-reload"]
+            "zhihu-readback-navigation", "readback-navigation", "recovery-reload", "dialog-reload"]
         let host = URL(string: pageURL)?.host ?? ""
         let unresolvedOutcome = outcomeLedger.contains { record in
             record.unresolved && record.actionID != Optional(identifier) &&
@@ -4460,7 +4464,7 @@ struct OpenStall {
             "set_site_mode", "use_skill", "upload_file", "generate_cover", "done", "ask_user",
             "rung-reveal-click", "rung-navigation", "dialog-reload", "dialog-save-click",
             "dialog-leave-navigation", "dialog-return-navigation", "recovery-reload",
-            "zhihu-readback-navigation", "zhihu-publish"]
+            "zhihu-readback-navigation", "readback-navigation", "zhihu-publish"]
         return known.contains(name) ? name : "unrecognized"
     }
     private func record(_ action: AgentAction, suffix: String = "") {
@@ -5027,6 +5031,95 @@ struct OpenStall {
     }
 
     // MARK: - 动作后核验（正式回写与防重放）
+
+    /// Independent readback only; navigation is the sole production trigger.
+    private func reconcileBlockingOutcomes(trigger: String) async {
+        let taskID = conversationTaskID ?? runSessionID
+        let token = generation
+        let host = web.executionTab.webView.url?.host ?? ""
+        let receipts = executionReceipts.filter { $0.taskID == taskID && $0.blocksDependencies }
+        let records = outcomeLedger.filter {
+            $0.unresolved && ($0.taskID == taskID || ($0.taskID == nil && $0.host == host))
+        }
+        guard !receipts.isEmpty || !records.isEmpty else { return }
+        func bound(_ raw: String, to expected: String) -> Bool {
+            guard let actual = URL(string: raw), let target = URL(string: expected) else { return false }
+            if actual.isFileURL || target.isFileURL { return actual.absoluteString == target.absoluteString }
+            return actual.scheme == target.scheme && actual.host == target.host && actual.path == target.path
+        }
+        for outcome in records {
+            guard token == generation, !Task.isCancelled else { return }
+            var readbackEntry: ReadbackTabRegistry.Entry?
+            var captured: WebController.SettledCapture?
+            if bound(web.executionTab.webView.url?.absoluteString ?? "", to: outcome.pageURL) {
+                captured = await web.settledCapture()
+            } else {
+                do {
+                    let sourceID = web.executionTab.id
+                    let tab = try await auditedDispatch(name: "readback-navigation", pageURL: outcome.pageURL) {
+                        try web.openTabForExecution(urlString: outcome.pageURL)
+                    }
+                    let previous = readbackTabs.readbackTab(forTask: taskID).flatMap { readbackTabs.entries[$0] }
+                    if let oldID = readbackTabs.register(tabID: tab.id, ownerTaskID: taskID,
+                                                       sourceTabID: sourceID, purpose: "readback"),
+                       let previous, previous.tabID == oldID {
+                        replacedReadbackTabIDs.insert(oldID)
+                        await recycleReadbackTab(previous, for: taskID, expectedGeneration: token, excluding: [tab.id])
+                    }
+                    readbackEntry = readbackTabs.entries[tab.id]
+                    captured = await web.settledCapture()
+                } catch { /* No evidence: preserve both ledger and receipts. */ }
+            }
+            if let entry = readbackEntry {
+                await recycleReadbackTab(entry, for: taskID, expectedGeneration: token)
+            }
+            guard token == generation, !Task.isCancelled else { return }
+            guard let capture = captured, !capture.finalCaptureSkipped,
+                  bound(capture.after.url, to: outcome.pageURL),
+                  !outcome.contentPrefix.isEmpty,
+                  ElementDescriptor.norm(capture.after.text).contains(outcome.contentPrefix) else {
+                _ = appendExecutionAudit(event: "reconciliation-insufficient", actionID: outcome.actionID ?? outcome.id,
+                                         pageURL: outcome.pageURL, evidenceRef: outcome.id.uuidString)
+                continue
+            }
+            let verification = ActionVerifier.makeRecord(sessionID: runSessionID.uuidString,
+                outcomeRecordID: outcome.id, actionLabel: outcome.elementLabel, pageURL: capture.after.url,
+                result: .init(verdict: .verified,
+                    evidence: ["reconciliation trigger=\(trigger) evidenceURL=\(capture.after.url); contentPrefix=\(outcome.contentPrefix)"],
+                    weakEvidence: []), settled: capture.settled)
+            guard VerificationLogStore.shared.append(verification),
+                  let index = outcomeLedger.firstIndex(where: { $0.id == outcome.id && $0.unresolved }) else { continue }
+            let original = outcomeLedger[index]
+            if outcomeLedger[index].dispatchState == nil || outcomeLedger[index].dispatchState == .unknown {
+                outcomeLedger[index].dispatchState = .sent
+            }
+            outcomeLedger[index].verificationVerdict = .verified
+            outcomeLedger[index].verificationEvidenceID = verification.id
+            outcomeLedger[index].statusNote = "已核实（独立回读对账）"
+            guard saveOutcomeLedger() else {
+                if let current = outcomeLedger.firstIndex(where: { $0.id == original.id }) {
+                    outcomeLedger[current] = original
+                } else { outcomeLedger.append(original) }
+                continue
+            }
+            guard appendExecutionAudit(event: "reconciliation-verified", actionID: outcome.actionID ?? outcome.id,
+                                       pageURL: capture.after.url, evidenceRef: verification.id.uuidString) else {
+                if let current = outcomeLedger.firstIndex(where: { $0.id == original.id }) {
+                    outcomeLedger[current] = original
+                } else { outcomeLedger.append(original) }
+                _ = saveOutcomeLedger()
+                continue
+            }
+            if let actionID = outcome.actionID {
+                for receipt in executionReceipts.filter({
+                    $0.taskID == taskID && $0.actionID == actionID && $0.blocksDependencies
+                }) {
+                    _ = updateExecutionReceipt(id: receipt.id, state: .sent,
+                                               evidence: verification.id.uuidString, verdict: .verified)
+                }
+            }
+        }
+    }
 
     /// 台账落记后随即运行的独立核验：settle 采样取新鲜证据 →
     /// ActionVerifier 三值判定 → 记录 append 落盘 verification-log
@@ -7642,9 +7735,9 @@ extension AgentEngine {
               let object = try? JSONSerialization.jsonObject(with: data) else { return NSNull() }
         return object
     }
-    private static func gateAction(_ name: String, index: Int = -1, text: String = "") throws -> AgentAction {
+    private static func gateAction(_ name: String, index: Int = -1, text: String = "", url: String = "") throws -> AgentAction {
         let data = try JSONSerialization.data(withJSONObject: ["action": name, "index": index,
-            "text": text, "summary": "受控检查结束，结果见回执", "reason": "gate batch1 controlled WK driver"])
+            "text": text, "url": url, "summary": "受控检查结束，结果见回执", "reason": "gate batch1 controlled WK driver"])
         return try JSONDecoder().decode(AgentAction.self, from: data)
     }
     private static func gateContext(_ label: String, reset: Bool = true,
@@ -7735,7 +7828,8 @@ extension AgentEngine {
     func verifyGateBatch1WK() async -> [String: Any] {
         try? FileManager.default.createDirectory(at: Self.gateBatchDirectory, withIntermediateDirectories: true)
         let ids = ["normal_execution", "denial", "approval_expiry", "target_drift", "post_validation_change",
-                   "duplicate_request", "post_dispatch_disconnect", "log_failure", "rescan_relocation_swap", "pointer_sequence_swap"]
+                   "duplicate_request", "post_dispatch_disconnect", "log_failure", "rescan_relocation_swap", "pointer_sequence_swap",
+                   "model_driven_recovery", "model_driven_recovery_insufficient"]
         var cases: [[String: Any]] = []
         for id in ids {
             var context: GateBatchWKContext?
@@ -7778,6 +7872,87 @@ extension AgentEngine {
                         Self.gateCheck("receipt existed durably before dispatch returned", preparedBeforeReturn),
                         Self.gateCheck("only verified result reaches success ledger", c.engine.outcomeLedger.count == 1 && c.engine.outcomeLedger.first?.verificationVerdict == .verified && c.engine.taskClaims.last?.status == .verified),
                         Self.gateCheck("one approval for submission; none for low risk clicks", Self.gateAudit(c).filter { $0["event"] as? String == "authorization-requested" }.count == 1)]
+                case "model_driven_recovery", "model_driven_recovery_insufficient":
+                    // Stage A creates the record through the real production input/approval/verification chain.
+                    _ = try await Self.gateRun(c, label: "正文", text: Self.gateBatchBody)
+                    try await Self.gateRequest(c)
+                    c.engine.confirm(execute: true)
+                    try await Self.gateWaitWorker(c.engine)
+                    let submitted = try await Self.gateState(c)
+                    guard let original = c.engine.outcomeLedger.last,
+                          original.verificationVerdict == .verified,
+                          submitted["submissions"] as? Int == 1,
+                          submitted["records"] as? String == Self.gateBatchBody else {
+                        throw MikaError("Recovery setup did not produce a real verified submission")
+                    }
+                    details["stageA"] = try await Self.gateEvidence(c)
+                    // Explicit scenario setup, never a reconciliation writeback or disconnect hook.
+                    var legacy = original
+                    legacy.taskID = nil; legacy.actionID = nil; legacy.dispatchState = nil
+                    legacy.verificationVerdict = nil; legacy.statusNote = "已提交（待核查）"
+                    if id == "model_driven_recovery_insufficient" {
+                        legacy.contentPrefix = "从未提交过的对账反例正文"
+                    }
+                    c.engine.outcomeLedger[c.engine.outcomeLedger.count - 1] = legacy
+                    guard c.engine.saveOutcomeLedger() else { throw MikaError("Legacy scenario setup could not persist") }
+                    details["scenarioSetup"] = ["method": "production verified record reshaped to legacy nil taskID/actionID/dispatchState/verificationVerdict; statusNote pending",
+                                                "before": Self.gateJSON(original), "after": Self.gateJSON(legacy)]
+                    let recovered = try await Self.gateContext(id + "-new-task", reset: false)
+                    context = recovered
+                    guard recovered.engine.outcomeLedger.contains(where: { $0.id == legacy.id && $0.unresolved }),
+                          recovered.engine.conversationTaskID != original.taskID else {
+                        throw MikaError("New task did not load unresolved legacy record")
+                    }
+                    let page = try await recovered.web.state()
+                    guard let low = page.elements.first(where: { $0.text == "展开详情" }) else {
+                        throw MikaError("Recovery low risk target missing")
+                    }
+                    let click = try Self.gateAction("click", index: low.index)
+                    let navigation = try Self.gateAction("navigate", url: legacy.pageURL)
+                    let engine = recovered.engine
+                    engine.controlledActions = id == "model_driven_recovery"
+                        ? [click] : [navigation, click]
+                    engine.controlledActionCursor = 0
+                    engine.startInSession(engine.runSessionID, local: nil, task: engine.goal,
+                                          startingID: engine.conversationTaskID)
+                    try await Self.gateWaitWorker(engine)
+                    let blocked = try await Self.gateState(recovered)
+                    let guardFailed: Bool = {
+                        if case .failed(let message) = engine.status { return message.contains("本任务有未决副作用") }
+                        return false
+                    }()
+                    checks.append(Self.gateCheck("production loop dependent click fails with unresolved guard; low effect remains zero",
+                        guardFailed && blocked["low"] as? Int == 0 && blocked["submissions"] as? Int == 1))
+                    details["firstLoop"] = try await Self.gateEvidence(recovered)
+                    if id == "model_driven_recovery" {
+                        checks.append(Self.gateCheck("loop entry alone never reconciles legacy record",
+                            engine.outcomeLedger.contains { $0.id == legacy.id && $0.unresolved } &&
+                            !Self.gateAudit(recovered).contains {
+                                $0["event"] as? String == "reconciliation-verified" && $0["actionID"] as? String == legacy.id.uuidString
+                            }))
+                        engine.controlledActions = [navigation, click, try Self.gateAction("done")]
+                        engine.controlledActionCursor = 0
+                        engine.resume()
+                        try await Self.gateWaitWorker(engine)
+                        let after = try await Self.gateState(recovered)
+                        let done: Bool = { if case .done = engine.status { return true }; return false }()
+                        checks += [Self.gateCheck("post-navigation production reconciliation verifies the original legacy record",
+                            engine.outcomeLedger.contains { $0.id == legacy.id && $0.verificationVerdict == .verified } &&
+                            Self.gateAudit(recovered).contains { $0["event"] as? String == "reconciliation-verified" && $0["actionID"] as? String == legacy.id.uuidString }),
+                            Self.gateCheck("resume executes low risk click once, never replays submission, and closes with done",
+                                after["low"] as? Int == 1 && after["submissions"] as? Int == 1 && done && engine.controlledActionCursor == 3)]
+                    } else {
+                        let audit = Self.gateAudit(recovered)
+                        let insufficient = audit.contains { $0["event"] as? String == "reconciliation-insufficient" && $0["evidenceRef"] as? String == legacy.id.uuidString }
+                        let verified = audit.contains { $0["event"] as? String == "reconciliation-verified" && $0["actionID"] as? String == legacy.id.uuidString }
+                        checks.append(Self.gateCheck("absent prefix leaves record and receipts untouched with insufficient audit only",
+                            insufficient && !verified && engine.outcomeLedger.contains {
+                                $0.id == legacy.id && $0.unresolved && $0.taskID == nil && $0.actionID == nil &&
+                                $0.dispatchState == nil && $0.verificationVerdict == nil &&
+                                $0.verificationEvidenceID == legacy.verificationEvidenceID && $0.statusNote == legacy.statusNote
+                            } && engine.controlledActionCursor == 2))
+                    }
+                    details["productionLoop"] = try await Self.gateEvidence(recovered)
                 case "denial":
                     try await Self.gateRequest(c)
                     c.engine.confirm(execute: false)
@@ -8012,7 +8187,7 @@ extension AgentEngine {
         return ["schemaVersion": 1, "round": 1, "runtime": "WKWebView",
             "environment": Self.gateBatchEnvironment, "driver": "bundled fixture + production engine + simulator CLI",
             "buildSHA": AgentTraceStore.buildSHA, "cases": cases, "crashCheckpoint": checkpoint,
-            "passed": cases.count == 10 && cases.allSatisfy { $0["passed"] as? Bool == true } && checkpoint["ready"] as? Bool == true]
+            "passed": cases.count == 12 && cases.allSatisfy { $0["passed"] as? Bool == true } && checkpoint["ready"] as? Bool == true]
     }
 
     private static func gateDisconnect(_ context: GateBatchWKContext) async throws {
